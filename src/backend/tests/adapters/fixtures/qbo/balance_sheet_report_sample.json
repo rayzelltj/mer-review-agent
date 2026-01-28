@@ -1,0 +1,78 @@
+{
+  "Header": {
+    "ReportName": "BalanceSheet",
+    "Currency": "USD",
+    "EndPeriod": "2016-10-31"
+  },
+  "Columns": {
+    "Column": [
+      {
+        "ColType": "Account",
+        "MetaData": [{ "Name": "ColKey", "Value": "account" }]
+      },
+      {
+        "ColType": "Money",
+        "ColTitle": "Total",
+        "MetaData": [{ "Name": "ColKey", "Value": "total" }]
+      }
+    ]
+  },
+  "Rows": {
+    "Row": [
+      {
+        "Header": { "ColData": [{ "value": "ASSETS" }, { "value": "" }] },
+        "type": "Section",
+        "Rows": {
+          "Row": [
+            {
+              "Header": { "ColData": [{ "value": "Bank Accounts" }, { "value": "" }] },
+              "type": "Section",
+              "Rows": {
+                "Row": [
+                  {
+                    "type": "Data",
+                    "ColData": [
+                      { "id": "35", "value": "Checking" },
+                      { "value": "1,350.55" }
+                    ]
+                  },
+                  {
+                    "type": "Data",
+                    "ColData": [
+                      { "id": "4", "value": "Undeposited Funds" },
+                      { "value": "2117.52" }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "Header": { "ColData": [{ "value": "LIABILITIES AND EQUITY" }, { "value": "" }] },
+        "type": "Section",
+        "Rows": {
+          "Row": [
+            {
+              "Header": { "ColData": [{ "value": "Equity" }, { "value": "" }] },
+              "type": "Section",
+              "Rows": {
+                "Row": [
+                  {
+                    "type": "Data",
+                    "ColData": [
+                      { "value": "Net Income" },
+                      { "value": "2440.27" }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
+

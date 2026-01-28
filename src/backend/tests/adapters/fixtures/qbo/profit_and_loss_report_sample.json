@@ -1,0 +1,57 @@
+{
+  "Header": {
+    "ReportName": "ProfitAndLoss",
+    "StartPeriod": "2015-06-01",
+    "EndPeriod": "2015-06-30",
+    "Currency": "USD"
+  },
+  "Columns": {
+    "Column": [
+      {
+        "ColType": "Account",
+        "MetaData": [{ "Name": "ColKey", "Value": "account" }]
+      },
+      {
+        "ColType": "Money",
+        "MetaData": [{ "Name": "ColKey", "Value": "total" }]
+      }
+    ]
+  },
+  "Rows": {
+    "Row": [
+      {
+        "Header": { "ColData": [{ "value": "Income" }, { "value": "" }] },
+        "type": "Section",
+        "group": "Income",
+        "Summary": {
+          "ColData": [
+            { "value": "Total Income" },
+            { "value": "325.00" }
+          ]
+        },
+        "Rows": {
+          "Row": [
+            {
+              "type": "Data",
+              "ColData": [
+                { "id": "54", "value": "Pest Control Services" },
+                { "value": "-100.00" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "group": "NetIncome",
+        "type": "Section",
+        "Summary": {
+          "ColData": [
+            { "value": "Net Income" },
+            { "value": "325.00" }
+          ]
+        }
+      }
+    ]
+  }
+}
+

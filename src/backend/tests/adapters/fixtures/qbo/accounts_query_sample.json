@@ -1,0 +1,9 @@
+{
+  "QueryResponse": {
+    "Account": [
+      { "Id": "35", "Name": "Checking", "AccountType": "Bank", "AccountSubType": "Checking" },
+      { "Id": "4", "Name": "Undeposited Funds", "AccountType": "Other Current Asset", "AccountSubType": "UndepositedFunds" }
+    ]
+  }
+}
+

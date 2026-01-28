@@ -21,9 +21,9 @@ Config model: `ZeroBalanceRuleConfig`
 - `default_threshold`
 - `missing_data_policy` — when a configured account is missing from the Balance Sheet snapshot
 - `unconfigured_threshold_policy` — status to emit for **non-zero** balances when no thresholds are configured (TBD business policy)
-  - Default: `WARN`
+  - Default: `NEEDS_REVIEW`
 - `amount_quantize` (optional)
-- Severity mapping: same defaults as `BS-CLEARING-ACCOUNTS-ZERO`
+- Severity (fixed mapping from status): same as `BS-CLEARING-ACCOUNTS-ZERO`
 
 ### Threshold derivation (TBD)
 Acceptable variance policy is not defined yet. Current placeholder supports:
@@ -60,5 +60,4 @@ Acceptable variance policy is not defined yet. Current placeholder supports:
 | Non-zero outside variance | FAIL / HIGH |
 | Account not configured | NEEDS_REVIEW |
 | Account missing from snapshot | NEEDS_REVIEW (or NOT_APPLICABLE if configured) |
-| Threshold unconfigured and non-zero | `unconfigured_threshold_policy` (default WARN) |
-
+| Threshold unconfigured and non-zero | `unconfigured_threshold_policy` (default NEEDS_REVIEW) |

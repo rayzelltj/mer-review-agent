@@ -11,7 +11,7 @@ This rule is **adapter-friendly**: it evaluates `ReconciliationSnapshot`s and do
   - `statement_end_date`
   - `statement_ending_balance`
   - `book_balance_as_of_statement_end`
-- `BalanceSheetSnapshot` at `period_end` to determine which accounts must be covered
+- `BalanceSheetSnapshot` at `period_end` to infer bank/credit card scope (by `type` / `subtype`)
 - `ClientRulesConfig` for this rule
 
 ## Inputs (optional)
@@ -20,8 +20,10 @@ None (tie-out is exact match; optional quantization may be configured)
 ## Config (knobs)
 Config model: `BankReconciledThroughPeriodEndRuleConfig`
 - `enabled`
-- `expected_accounts[]` (required; sourced from client maintenance bank/cc list)
-  - missing any expected account snapshot triggers `missing_data_policy`
+- `include_accounts[]` / `exclude_accounts[]` (optional overrides)
+  - used to include/exclude specific accounts from the inferred bank/cc scope
+- `expected_accounts[]` (back-compat explicit list)
+  - if provided, it is treated as an explicit include list (and inference is skipped)
 - `require_statement_end_date_gte_period_end` (default true)
   - if true, any snapshot with `statement_end_date < period_end` fails
 - `require_statement_balance_matches_attachment` (default true)
@@ -35,7 +37,8 @@ Config model: `BankReconciledThroughPeriodEndRuleConfig`
 - NOT_APPLICABLE: `enabled == false`
 - NEEDS_REVIEW:
   - no reconciliation snapshots provided, **or**
-  - expected account snapshot missing (when `expected_accounts` configured), **or**
+  - unable to infer bank/cc scope because Balance Sheet account `type`/`subtype` are missing (when no explicit list is provided), **or**
+  - expected account snapshot missing (when `expected_accounts` or `include_accounts` are configured), **or**
   - per-snapshot required fields missing and `missing_data_policy == NEEDS_REVIEW`
 - FAIL (coverage): `require_statement_end_date_gte_period_end == true` AND `statement_end_date < period_end`
 - PASS/FAIL (tie-out):
@@ -49,7 +52,8 @@ Config model: `BankReconciledThroughPeriodEndRuleConfig`
 Overall status is the worst across evaluated snapshots.
 
 ## Edge cases
-- Scope is driven by `expected_accounts[]` (client maintenance), not by Balance Sheet type/subtype inference.
+- Default scope is inferred from Balance Sheet account `type` / `subtype`.
+- If account `type` / `subtype` are missing, the rule returns `NEEDS_REVIEW` rather than guessing by name.
 
 ## Output expectations
 - One `details[]` entry per reconciliation snapshot evaluated.

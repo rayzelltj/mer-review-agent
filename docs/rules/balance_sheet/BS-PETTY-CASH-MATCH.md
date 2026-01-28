@@ -49,6 +49,6 @@ If the supporting document is non-existent/unavailable for the period → `NEEDS
 | Scenario | Expected |
 |---|---|
 | Support exists and matches | PASS / INFO |
-| Support missing/unavailable | NOT_APPLICABLE / INFO |
+| Support missing/unavailable | NEEDS_REVIEW / MEDIUM |
 | Any difference | FAIL / HIGH |
-| QBO account missing | NEEDS_REVIEW (or NOT_APPLICABLE if configured) |
+| QBO account missing | NOT_APPLICABLE / INFO |

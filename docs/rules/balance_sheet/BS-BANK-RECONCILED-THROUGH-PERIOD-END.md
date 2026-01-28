@@ -10,19 +10,21 @@ If bank/credit card accounts are not reconciled through month end, cash and liab
 Current implementation is adapter-friendly and uses structured reconciliation snapshots (not a QBO “reconciliation report” API).
 
 Required:
-- QBO Balance Sheet snapshot as-of `period_end` to determine bank/cc accounts in-scope (when types are available)
+- QBO Balance Sheet snapshot as-of `period_end` to infer bank/cc accounts in-scope (by `type`/`subtype`)
 - `ReconciliationSnapshot[]` for each in-scope account, typically derived from:
   - QBO reconciliation exports/reports, plus statement artifacts
 - `period_end` date
 
 Optional:
-None (client maintenance and statement attachments are required for this rule)
+None (statement attachments are required when `require_statement_balance_matches_attachment` is enabled)
 
 ## Config parameters
 Config model: `BankReconciledThroughPeriodEndRuleConfig`
 - `enabled`
-- `expected_accounts[]` (required)
-  - Must come from client maintenance “accounts reconciliation” list and be mapped to stable `account_ref`s
+- `include_accounts[]` / `exclude_accounts[]` (optional overrides)
+  - Include/exclude specific accounts from the inferred bank/cc scope
+- `expected_accounts[]` (back-compat explicit list)
+  - If provided, treated as an explicit include list (inference is skipped)
 - `require_statement_end_date_gte_period_end` (default true)
   - If true, `statement_end_date < period_end` → FAIL
 - `require_book_balance_as_of_period_end_ties_to_balance_sheet` (default true)
@@ -35,17 +37,22 @@ Config model: `BankReconciledThroughPeriodEndRuleConfig`
   - Evidence must include `meta.account_ref` and `amount`; optionally `statement_end_date` (if provided and differs → FAIL)
 - `missing_data_policy` (default NEEDS_REVIEW)
 - `amount_quantize` (optional)
-- Severity mapping (defaults): PASS INFO / FAIL HIGH / NEEDS_REVIEW MED / NOT_APPLICABLE INFO
+- Severity (fixed mapping from status): PASS INFO / WARN LOW / FAIL HIGH / NEEDS_REVIEW MED / NOT_APPLICABLE INFO
 
 ### Business-intent gaps (TBD)
 The written intent mentions additional checks that are not fully implemented yet:
-1. Expected bank/cc account list/number sourced from client maintenance sheet (beyond `expected_accounts[]`)
+1. If a client-maintained “accounts requiring reconciliation” list is required as a control, that needs a separate rule/check.
 2. Balance Sheet balance ties to register balance as-of period end via a clarified policy (partial support exists via optional check)
 
 ## Evaluation logic (step-by-step)
 1. If `enabled == false` → `NOT_APPLICABLE`
 2. Determine required account refs:
-   - Use `expected_accounts[]` from client maintenance (required); if missing → `NEEDS_REVIEW`
+   - Default: infer bank/cc scope from Balance Sheet `type`/`subtype`
+     - If `type`/`subtype` are missing → `NEEDS_REVIEW` (do not guess by name)
+   - Apply overrides:
+     - include `include_accounts[]`
+     - exclude `exclude_accounts[]`
+   - Back-compat: if `expected_accounts[]` is provided, use it as the explicit include list (skip inference)
 3. For each required account:
    - If no reconciliation snapshot found → `missing_data_policy`
    - Select the latest snapshot by `statement_end_date`

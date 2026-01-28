@@ -13,6 +13,7 @@ from ..models import (
     RuleStatus,
     Severity,
     StatusOrdering,
+    severity_for_status,
 )
 from ..registry import register_rule
 from ..rule import Rule
@@ -38,28 +39,37 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NOT_APPLICABLE,
-                severity=Severity.INFO,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
                 summary="Rule disabled by client configuration.",
             )
 
-        # Per business policy: the expected bank/cc account list must come from client maintenance.
-        # The adapter layer should map maintenance rows to stable `account_ref`s.
-        if not cfg.expected_accounts:
+        required_refs, scope_detail = self._determine_scope(ctx, cfg)
+        if required_refs is None:
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NEEDS_REVIEW,
-                severity=cfg.default_severity,
+                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
                 summary=(
-                    f"Expected bank/credit card accounts not configured for {ctx.period_end.isoformat()}; "
-                    "cannot determine reconciliation scope."
+                    f"Cannot determine bank/credit card reconciliation scope for {ctx.period_end.isoformat()}; "
+                    "account type/subtype data is missing."
                 ),
-                human_action="Provide client maintenance bank/credit card list and map it to expected_accounts[].",
+                details=[scope_detail] if scope_detail is not None else [],
+                human_action="Ensure the adapter provides Balance Sheet account type/subtype to infer bank/cc scope.",
             )
 
-        required_refs = list(cfg.expected_accounts)
+        if not required_refs:
+            return RuleResult(
+                rule_id=self.rule_id,
+                rule_title=self.rule_title,
+                best_practices_reference=self.best_practices_reference,
+                sources=self.sources,
+                status=RuleStatus.NOT_APPLICABLE,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
+                summary=f"No bank/credit card accounts in-scope as of {ctx.period_end.isoformat()}.",
+            )
 
         ordering = StatusOrdering.default()
 
@@ -104,13 +114,7 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
             details.append(detail)
 
         overall = ordering.worst(statuses)
-        severity = {
-            RuleStatus.PASS: cfg.pass_severity,
-            RuleStatus.WARN: cfg.warn_severity,
-            RuleStatus.FAIL: cfg.fail_severity,
-            RuleStatus.NEEDS_REVIEW: cfg.default_severity,
-            RuleStatus.NOT_APPLICABLE: cfg.not_applicable_severity,
-        }[overall]
+        severity = severity_for_status(overall)
 
         exemplar = next((d for d in details if d.values.get("status") == overall.value), None)
         if overall == RuleStatus.PASS:
@@ -343,23 +347,50 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
         )
 
     def _is_bank_or_credit_card(self, acct: AccountBalance) -> bool:
-        """
-        Decide whether a Balance Sheet account should be included in the bank/cc reconciliation rule.
-
-        Preference order:
-        - Use structured `type` / `subtype` when provided by the adapter.
-        - If missing, fall back to conservative name matching (credit-card only).
-        """
+        """Decide whether a Balance Sheet account should be included in bank/cc scope (type/subtype only)."""
         type_l = (acct.type or "").strip().lower()
         subtype_l = (acct.subtype or "").strip().lower()
-        if type_l or subtype_l:
-            if "bank" in type_l or "bank" in subtype_l:
-                return True
-            if "credit" in type_l or "credit" in subtype_l:
-                return True
-            if "card" in type_l or "card" in subtype_l:
-                return True
+        if not (type_l or subtype_l):
             return False
+        if "bank" in type_l or "bank" in subtype_l:
+            return True
+        if "credit" in type_l or "credit" in subtype_l:
+            return True
+        if "card" in type_l or "card" in subtype_l:
+            return True
+        return False
 
-        name_l = (acct.name or "").lower()
-        return ("credit card" in name_l) or ("creditcard" in name_l)
+    def _determine_scope(
+        self, ctx: RuleContext, cfg: BankReconciledThroughPeriodEndRuleConfig
+    ) -> tuple[list[str] | None, RuleResultDetail | None]:
+        exclude = list(cfg.exclude_accounts or [])
+
+        # Back-compat: if `expected_accounts[]` is provided, treat it as the explicit scope list (skip inference).
+        if cfg.expected_accounts:
+            refs = [r for r in cfg.expected_accounts if r not in set(exclude)]
+            return refs, None
+
+        # Default: infer scope from Balance Sheet account type/subtype; if any types are missing, flag for review.
+        missing_type_refs: list[str] = []
+        inferred: list[str] = []
+        for acct in ctx.balance_sheet.accounts:
+            if not ((acct.type or "").strip() or (acct.subtype or "").strip()):
+                missing_type_refs.append(acct.account_ref)
+                continue
+            if self._is_bank_or_credit_card(acct):
+                inferred.append(acct.account_ref)
+
+        if missing_type_refs:
+            return None, RuleResultDetail(
+                key="scope",
+                message="Cannot infer bank/cc scope because some Balance Sheet accounts are missing type/subtype.",
+                values={
+                    "period_end": ctx.period_end.isoformat(),
+                    "missing_type_account_refs": missing_type_refs[:20],
+                    "missing_type_account_count": len(missing_type_refs),
+                    "status": RuleStatus.NEEDS_REVIEW.value,
+                },
+            )
+
+        refs = sorted((set(inferred) | set(cfg.include_accounts or [])) - set(exclude))
+        return refs, None

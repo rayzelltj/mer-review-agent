@@ -25,6 +25,17 @@ class Severity(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+def severity_for_status(status: "RuleStatus") -> Severity:
+    # Fixed mapping (firm policy): status already encodes urgency; severity is a stable derivative for sorting/triage.
+    return {
+        RuleStatus.PASS: Severity.INFO,
+        RuleStatus.WARN: Severity.LOW,
+        RuleStatus.FAIL: Severity.HIGH,
+        RuleStatus.NEEDS_REVIEW: Severity.MEDIUM,
+        RuleStatus.NOT_APPLICABLE: Severity.INFO,
+    }[status]
+
+
 class MissingDataPolicy(str, Enum):
     NEEDS_REVIEW = "NEEDS_REVIEW"
     NOT_APPLICABLE = "NOT_APPLICABLE"
@@ -139,4 +150,3 @@ class StatusOrdering:
         if not statuses:
             return RuleStatus.NOT_APPLICABLE
         return max(statuses, key=lambda s: self.order.get(s, 0))
-

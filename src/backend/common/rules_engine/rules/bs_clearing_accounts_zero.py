@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..config import AccountThresholdOverride, ZeroBalanceRuleConfig
 from ..context import RuleContext, compute_allowed_variance, quantize_amount
-from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering
+from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
 
@@ -25,7 +25,7 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NOT_APPLICABLE,
-                severity=Severity.INFO,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
                 summary="Rule disabled by client configuration.",
             )
 
@@ -51,7 +51,7 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NEEDS_REVIEW,
-                severity=cfg.default_severity,
+                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
                 summary=f"No clearing accounts configured for period end {ctx.period_end.isoformat()}.",
                 human_action=(
                     "Configure clearing account refs for this client and set acceptable variances per account "
@@ -125,13 +125,7 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
 
         overall = ordering.worst(statuses)
         n_accounts = len(accounts_to_eval)
-        severity = {
-            RuleStatus.PASS: cfg.pass_severity,
-            RuleStatus.WARN: cfg.warn_severity,
-            RuleStatus.FAIL: cfg.fail_severity,
-            RuleStatus.NEEDS_REVIEW: cfg.default_severity,
-            RuleStatus.NOT_APPLICABLE: cfg.not_applicable_severity,
-        }[overall]
+        severity = severity_for_status(overall)
 
         exemplar = next((d for d in details if d.values.get("status") == overall.value), None)
         if overall == RuleStatus.PASS:

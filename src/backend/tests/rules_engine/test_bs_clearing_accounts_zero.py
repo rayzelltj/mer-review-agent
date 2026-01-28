@@ -79,8 +79,8 @@ def test_clearing_accounts_name_inference_when_enabled(make_balance_sheet, make_
         ]
     )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    # With no thresholds configured, non-zero balances default to WARN (unconfigured_threshold_policy).
-    assert res.status == RuleStatus.WARN
+    # With no thresholds configured, non-zero balances default to NEEDS_REVIEW (unconfigured_threshold_policy).
+    assert res.status == RuleStatus.NEEDS_REVIEW
     evaluated_keys = {d.key for d in res.details}
     assert evaluated_keys == {"A1", "A2"}
     assert any(d.values.get("threshold_configured") is False for d in res.details)

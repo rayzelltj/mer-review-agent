@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..config import PettyCashMatchRuleConfig
 from ..context import RuleContext, quantize_amount
-from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity
+from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
 
@@ -24,7 +24,7 @@ class BS_PETTY_CASH_MATCH(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NOT_APPLICABLE,
-                severity=Severity.INFO,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
                 summary="Rule disabled by client configuration.",
             )
 
@@ -35,7 +35,7 @@ class BS_PETTY_CASH_MATCH(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NEEDS_REVIEW,
-                severity=cfg.default_severity,
+                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
                 summary=f"Petty cash account not configured for period end {ctx.period_end.isoformat()}.",
                 human_action="Configure the petty cash account ref for this client.",
             )
@@ -48,7 +48,7 @@ class BS_PETTY_CASH_MATCH(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NOT_APPLICABLE,
-                severity=cfg.not_applicable_severity,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
                 summary=f"Petty cash account not found in balance sheet snapshot as of {ctx.period_end.isoformat()}.",
                 details=[
                     RuleResultDetail(
@@ -72,7 +72,7 @@ class BS_PETTY_CASH_MATCH(Rule):
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
                 status=RuleStatus.NEEDS_REVIEW,
-                severity=cfg.default_severity,
+                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
                 summary=(
                     f"Missing petty cash supporting document amount for {ctx.period_end.isoformat()}; cannot verify."
                 ),
@@ -86,11 +86,11 @@ class BS_PETTY_CASH_MATCH(Rule):
 
         if diff == 0:
             status = RuleStatus.PASS
-            severity = cfg.pass_severity
+            severity = severity_for_status(status)
             summary = f"Petty cash matches exactly as of {ctx.period_end.isoformat()}."
         else:
             status = RuleStatus.FAIL
-            severity = cfg.fail_severity
+            severity = severity_for_status(status)
             summary = f"Petty cash does not match support as of {ctx.period_end.isoformat()} (diff {diff})."
 
         human_action = None

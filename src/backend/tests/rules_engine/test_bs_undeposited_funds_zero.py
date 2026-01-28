@@ -57,7 +57,7 @@ def test_undeposited_funds_fail_outside_threshold(make_balance_sheet, make_profi
     assert res.severity == Severity.HIGH
 
 
-def test_undeposited_funds_warn_when_threshold_unconfigured(make_balance_sheet, make_ctx):
+def test_undeposited_funds_needs_review_when_threshold_unconfigured(make_balance_sheet, make_ctx):
     rule_cfg = {
         "BS-UNDEPOSITED-FUNDS-ZERO": {
             "accounts": [{"account_ref": "U1", "account_name": "Undeposited Funds"}]
@@ -65,6 +65,6 @@ def test_undeposited_funds_warn_when_threshold_unconfigured(make_balance_sheet, 
     }
     bs = make_balance_sheet(accounts=[{"account_ref": "U1", "name": "Undeposited Funds", "balance": "1"}])
     res = BS_UNDEPOSITED_FUNDS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.WARN
-    assert res.severity == Severity.LOW
+    assert res.status == RuleStatus.NEEDS_REVIEW
+    assert res.severity == Severity.MEDIUM
     assert res.details[0].values.get("threshold_configured") is False

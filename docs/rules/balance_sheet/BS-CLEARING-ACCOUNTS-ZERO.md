@@ -24,13 +24,14 @@ Config model: `ZeroBalanceRuleConfig` (`common.rules_engine.config`)
   - `NEEDS_REVIEW` (default) or `NOT_APPLICABLE`
 - `allow_name_inference` — if true and `accounts[]` is empty, infer accounts by `name` containing `"clearing"` (case-insensitive)
 - `unconfigured_threshold_policy` — status to emit for **non-zero** balances when no thresholds are configured (TBD business policy)
-  - Default: `WARN`
+  - Default: `NEEDS_REVIEW`
 - `amount_quantize` (optional) — Decimal quantization for comparisons (e.g. `"0.01"` for cents)
-- Severity mapping (defaults)
-  - PASS → `pass_severity` (default `INFO`)
-  - WARN → `warn_severity` (default `LOW`)
-  - FAIL → `fail_severity` (default `HIGH`)
-  - NEEDS_REVIEW → `default_severity` (default `MEDIUM`)
+- Severity (fixed mapping from status)
+  - PASS → INFO
+  - WARN → LOW
+  - FAIL → HIGH
+  - NEEDS_REVIEW → MEDIUM
+  - NOT_APPLICABLE → INFO
 
 ### Threshold derivation (TBD)
 `VarianceThreshold` is currently `max(floor_amount, abs(revenue_total) * pct_of_revenue)`.
@@ -87,4 +88,3 @@ Reasonable options to decide later:
 | No accounts configured | `accounts[]` empty and inference off | NEEDS_REVIEW |
 | Name inference on | `allow_name_inference=true` and multiple “clearing” names | Evaluates matched accounts only |
 | Rounding boundary | `amount_quantize="0.01"`, balance `0.004` | PASS |
-

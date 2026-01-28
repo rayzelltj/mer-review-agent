@@ -79,6 +79,7 @@ def make_reconciliation_snapshot(period_end):
         statement_ending_balance=None,
         book_balance_as_of_statement_end=None,
         book_balance_as_of_period_end=None,
+        meta=None,
         source: str = "fixture",
     ) -> ReconciliationSnapshot:
         return ReconciliationSnapshot(
@@ -89,6 +90,7 @@ def make_reconciliation_snapshot(period_end):
             book_balance_as_of_statement_end=book_balance_as_of_statement_end,
             book_balance_as_of_period_end=book_balance_as_of_period_end,
             source=source,
+            meta=meta or {},
         )
 
     return _make

@@ -1,4 +1,4 @@
-# BS-PETTY-CASH-MATCH — Petty cash matches between MER and client supporting doc
+# BS-PETTY-CASH-MATCH — Petty cash matches between Balance Sheet and client supporting doc
 
 ## Best Practice Reference
 Petty cash

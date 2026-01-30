@@ -1,4 +1,4 @@
-# BS-PETTY-CASH-MATCH — Petty cash matches between QBO and supporting document
+# BS-PETTY-CASH-MATCH — Petty cash matches between QBO Balance Sheet and supporting document
 
 ## Intent
 Petty cash on the Balance Sheet should match the client’s petty cash supporting documentation at period end.

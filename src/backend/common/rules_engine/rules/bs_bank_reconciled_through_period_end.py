@@ -43,8 +43,8 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 summary="Rule disabled by client configuration.",
             )
 
-        required_refs, scope_detail = self._determine_scope(ctx, cfg)
-        if required_refs is None:
+        inferred_refs, infer_detail = self._infer_scope_from_balance_sheet(ctx)
+        if inferred_refs is None and not cfg.expected_accounts:
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
@@ -56,10 +56,11 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                     f"Cannot determine bank/credit card reconciliation scope for {ctx.period_end.isoformat()}; "
                     "account type/subtype data is missing."
                 ),
-                details=[scope_detail] if scope_detail is not None else [],
+                details=[infer_detail] if infer_detail is not None else [],
                 human_action="Ensure the adapter provides Balance Sheet account type/subtype to infer bank/cc scope.",
             )
 
+        required_refs = self._determine_scope(ctx, cfg, inferred_refs or [])
         if not required_refs:
             return RuleResult(
                 rule_id=self.rule_id,
@@ -78,6 +79,16 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
         bs_balance_by_ref = {a.account_ref: a.balance for a in ctx.balance_sheet.accounts}
         statuses: list[RuleStatus] = []
         details: list[RuleResultDetail] = []
+        if infer_detail is not None:
+            statuses.append(RuleStatus.NEEDS_REVIEW)
+            details.append(infer_detail)
+
+        scope_check_status, scope_check_detail = self._check_maintenance_count(
+            ctx, cfg, inferred_refs
+        )
+        if scope_check_status is not None and scope_check_detail is not None:
+            statuses.append(scope_check_status)
+            details.append(scope_check_detail)
 
         for account_ref in required_refs:
             account_name = name_by_ref.get(account_ref, "")
@@ -123,10 +134,16 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 "and tie out exactly."
             )
         elif overall == RuleStatus.FAIL and exemplar:
-            summary = (
-                f"Account '{exemplar.values.get('account_name','')}' is not reconciled through period end "
-                f"or fails tie-out as of {ctx.period_end.isoformat()}."
-            )
+            if exemplar.key == "scope_count":
+                summary = (
+                    "Maintenance bank/cc account count does not match Balance Sheet bank/cc count "
+                    f"as of {ctx.period_end.isoformat()}."
+                )
+            else:
+                summary = (
+                    f"Account '{exemplar.values.get('account_name','')}' is not reconciled through period end "
+                    f"or fails tie-out as of {ctx.period_end.isoformat()}."
+                )
         elif overall == RuleStatus.NEEDS_REVIEW:
             summary = f"Missing data prevented evaluation for one or more accounts as of {ctx.period_end.isoformat()}."
         else:
@@ -135,8 +152,9 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
         human_action = None
         if overall in (RuleStatus.WARN, RuleStatus.FAIL, RuleStatus.NEEDS_REVIEW):
             human_action = (
-                "Verify reconciliation status through MER period end, confirm statement ending balances, "
-                "and tie out register/book balances; explain or correct any variances."
+                "Verify reconciliation status through MER period end, confirm statement ending balances against "
+                "bank statements, and tie out register/book balances to the Balance Sheet; explain or correct "
+                "any variances."
             )
 
         return RuleResult(
@@ -242,7 +260,8 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
         statement_balance_matches_bs_status: RuleStatus | None = None
         statement_balance_matches_bs_diff: Decimal | None = None
 
-        if cfg.require_book_balance_as_of_period_end_ties_to_balance_sheet:
+        # Required per policy: register balance as of period end must match Balance Sheet.
+        if True:
             if balance_sheet_balance is None:
                 period_end_status = missing_status
             elif rec.book_balance_as_of_period_end is None:
@@ -268,7 +287,8 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 )
             statuses.append(statement_balance_matches_bs_status)
 
-        if cfg.require_statement_balance_matches_attachment:
+        # Required per policy: statement ending balance must match attachment (bank statement/activity statement).
+        if True:
             evidence_item = None
             for item in ctx.evidence.items:
                 if item.evidence_type != cfg.statement_balance_attachment_evidence_type:
@@ -314,7 +334,7 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                     "book_balance_as_of_statement_end": str(statement_end_q),
                     "statement_tie_difference": str(statement_diff),
                     "statement_tie_status": statement_status.value,
-                    "require_book_balance_as_of_period_end_ties_to_balance_sheet": cfg.require_book_balance_as_of_period_end_ties_to_balance_sheet,
+                    "require_book_balance_as_of_period_end_ties_to_balance_sheet": True,
                     "balance_sheet_balance": str(quantize_amount(balance_sheet_balance, cfg.amount_quantize))
                     if balance_sheet_balance is not None
                     else None,
@@ -332,7 +352,7 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                     "statement_balance_matches_balance_sheet_status": statement_balance_matches_bs_status.value
                     if statement_balance_matches_bs_status is not None
                     else None,
-                    "require_statement_balance_matches_attachment": cfg.require_statement_balance_matches_attachment,
+                    "require_statement_balance_matches_attachment": True,
                     "statement_balance_attachment_evidence_type": cfg.statement_balance_attachment_evidence_type,
                     "attachment_statement_end_date": attachment_statement_end_date.isoformat()
                     if attachment_statement_end_date is not None
@@ -360,16 +380,9 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
             return True
         return False
 
-    def _determine_scope(
-        self, ctx: RuleContext, cfg: BankReconciledThroughPeriodEndRuleConfig
+    def _infer_scope_from_balance_sheet(
+        self, ctx: RuleContext
     ) -> tuple[list[str] | None, RuleResultDetail | None]:
-        exclude = list(cfg.exclude_accounts or [])
-
-        # Back-compat: if `expected_accounts[]` is provided, treat it as the explicit scope list (skip inference).
-        if cfg.expected_accounts:
-            refs = [r for r in cfg.expected_accounts if r not in set(exclude)]
-            return refs, None
-
         # Default: infer scope from Balance Sheet account type/subtype; if any types are missing, flag for review.
         missing_type_refs: list[str] = []
         inferred: list[str] = []
@@ -392,5 +405,83 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 },
             )
 
-        refs = sorted((set(inferred) | set(cfg.include_accounts or [])) - set(exclude))
-        return refs, None
+        return sorted(inferred), None
+
+    def _determine_scope(
+        self,
+        ctx: RuleContext,
+        cfg: BankReconciledThroughPeriodEndRuleConfig,
+        inferred_refs: list[str],
+    ) -> list[str]:
+        exclude = list(cfg.exclude_accounts or [])
+
+        # Back-compat: if `expected_accounts[]` is provided, treat it as the explicit scope list.
+        if cfg.expected_accounts:
+            return sorted([r for r in cfg.expected_accounts if r not in set(exclude)])
+
+        refs = sorted((set(inferred_refs) | set(cfg.include_accounts or [])) - set(exclude))
+        return refs
+
+    def _check_maintenance_count(
+        self,
+        ctx: RuleContext,
+        cfg: BankReconciledThroughPeriodEndRuleConfig,
+        inferred_refs: list[str] | None,
+    ) -> tuple[RuleStatus | None, RuleResultDetail | None]:
+        """
+        Compare maintenance list count to inferred bank/cc accounts from the Balance Sheet.
+        """
+        if not cfg.expected_accounts:
+            return None, None
+
+        if inferred_refs is None:
+            return (
+                RuleStatus.NEEDS_REVIEW,
+                RuleResultDetail(
+                    key="scope_count",
+                    message="Cannot compare maintenance list to Balance Sheet bank/cc count (missing type/subtype).",
+                    values={
+                        "period_end": ctx.period_end.isoformat(),
+                        "maintenance_account_count": len(cfg.expected_accounts),
+                        "status": RuleStatus.NEEDS_REVIEW.value,
+                    },
+                ),
+            )
+
+        maintenance_refs = list(cfg.expected_accounts)
+        inferred_set = set(inferred_refs)
+        maintenance_set = set(maintenance_refs)
+
+        missing_in_bs = sorted(maintenance_set - inferred_set)
+        extra_in_bs = sorted(inferred_set - maintenance_set)
+
+        if len(maintenance_refs) != len(inferred_refs):
+            return (
+                RuleStatus.FAIL,
+                RuleResultDetail(
+                    key="scope_count",
+                    message="Maintenance bank/cc account count does not match Balance Sheet bank/cc count.",
+                    values={
+                        "period_end": ctx.period_end.isoformat(),
+                        "maintenance_account_count": len(maintenance_refs),
+                        "balance_sheet_bank_cc_count": len(inferred_refs),
+                        "missing_in_balance_sheet": missing_in_bs[:20],
+                        "extra_in_balance_sheet": extra_in_bs[:20],
+                        "status": RuleStatus.FAIL.value,
+                    },
+                ),
+            )
+
+        return (
+            RuleStatus.PASS,
+            RuleResultDetail(
+                key="scope_count",
+                message="Maintenance bank/cc account count matches Balance Sheet bank/cc count.",
+                values={
+                    "period_end": ctx.period_end.isoformat(),
+                    "maintenance_account_count": len(maintenance_refs),
+                    "balance_sheet_bank_cc_count": len(inferred_refs),
+                    "status": RuleStatus.PASS.value,
+                },
+            ),
+        )

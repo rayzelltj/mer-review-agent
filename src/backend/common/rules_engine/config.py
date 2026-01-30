@@ -59,10 +59,11 @@ class BankReconciledThroughPeriodEndRuleConfig(RuleConfigBase):
     # Back-compat: older configs used `expected_accounts` as the explicit list of accounts to evaluate.
     expected_accounts: List[str] = Field(default_factory=list)
     require_statement_end_date_gte_period_end: bool = True
-    # Register balance as of period end must tie to the Balance Sheet balance (exact match).
+    # NOTE: Register balance as of period end must tie to the Balance Sheet (required by policy).
+    # This flag is retained for backward compatibility but is always enforced by the rule.
     require_book_balance_as_of_period_end_ties_to_balance_sheet: bool = True
-    # Statement ending balance must match a statement artifact/attachment (exact match).
-    # Evidence items are expected to provide `statement_end_date`, `amount`, and `meta["account_ref"]`.
+    # NOTE: Statement ending balance must match a statement artifact/attachment (required by policy).
+    # This flag is retained for backward compatibility but is always enforced by the rule.
     require_statement_balance_matches_attachment: bool = True
     statement_balance_attachment_evidence_type: str = "statement_balance_attachment"
     # Statement ending balance (reconciliation report) must match the Balance Sheet balance (exact match).

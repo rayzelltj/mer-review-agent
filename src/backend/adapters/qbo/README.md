@@ -43,6 +43,8 @@ Supported shapes:
 - Extracts **Total Income** as `totals["revenue"]` using:
   - Primary: `group == "Income"` summary value
   - Fallback: summary label `Total Income`
+- If `summarize_by_month=True`, selects the **MER month column** based on `Header.EndPeriod`
+  (errors if the month column is missing).
 
 This total feeds variance-based rules (e.g., Undeposited Funds / Clearing thresholds).
 

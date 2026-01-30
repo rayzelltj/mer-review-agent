@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import calendar
+import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -75,6 +77,31 @@ def _find_column_index(report: dict[str, Any], col_key: str) -> int | None:
     return None
 
 
+def _find_month_column_index(report: dict[str, Any], period_end: date) -> int | None:
+    cols = report.get("Columns", {}).get("Column")
+    if not isinstance(cols, list):
+        return None
+    target_year = str(period_end.year)
+    short = calendar.month_abbr[period_end.month]
+    long = calendar.month_name[period_end.month]
+    patterns = [
+        re.compile(rf"^{re.escape(short)}\.?\s+{target_year}$", re.IGNORECASE),
+        re.compile(rf"^{re.escape(long)}\s+{target_year}$", re.IGNORECASE),
+    ]
+    for idx, col in enumerate(cols):
+        if not isinstance(col, dict):
+            continue
+        title = col.get("ColTitle")
+        if not isinstance(title, str):
+            continue
+        title = title.strip()
+        if not title:
+            continue
+        if any(p.match(title) for p in patterns):
+            return idx
+    return None
+
+
 @dataclass(frozen=True)
 class PnLTotal:
     key: str
@@ -133,6 +160,7 @@ def profit_and_loss_snapshot_from_report(
     *,
     revenue_group: str = "Income",
     revenue_label: str = "Total Income",
+    summarize_by_month: bool = False,
 ) -> ProfitAndLossSnapshot:
     """
     Convert a QBO Report Service ProfitAndLoss JSON payload into a ProfitAndLossSnapshot.
@@ -159,10 +187,19 @@ def profit_and_loss_snapshot_from_report(
 
     total_col = _find_column_index(report, "total")
     total_col = 1 if total_col is None else total_col
+    value_col = total_col
 
-    revenue = _extract_total_by_group(report, group=revenue_group, total_col=total_col)
+    if summarize_by_month:
+        month_col = _find_month_column_index(report, end)
+        if month_col is None:
+            raise QBOProfitAndLossAdapterError(
+                f"Monthly column for {end.strftime('%b %Y')} not found in report columns."
+            )
+        value_col = month_col
+
+    revenue = _extract_total_by_group(report, group=revenue_group, total_col=value_col)
     if revenue is None:
-        revenue = _extract_total_by_label(report, label=revenue_label, total_col=total_col)
+        revenue = _extract_total_by_label(report, label=revenue_label, total_col=value_col)
 
     totals: dict[str, Decimal] = {}
     if revenue is not None:
@@ -174,4 +211,3 @@ def profit_and_loss_snapshot_from_report(
         currency=currency,
         totals=totals,
     )
-

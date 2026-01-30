@@ -24,6 +24,7 @@ def build_qbo_snapshots(
     accounts_payload: dict[str, Any] | None = None,
     realm_id: str | None = None,
     include_rows_without_id: bool = False,
+    pnl_summarize_by_month: bool = False,
 ) -> QBOAdapterOutputs:
     """
     Convenience helper that assembles canonical snapshots from raw QBO payloads.
@@ -43,7 +44,9 @@ def build_qbo_snapshots(
         include_rows_without_id=include_rows_without_id,
     )
     pnl = (
-        profit_and_loss_snapshot_from_report(profit_and_loss_report)
+        profit_and_loss_snapshot_from_report(
+            profit_and_loss_report, summarize_by_month=pnl_summarize_by_month
+        )
         if profit_and_loss_report is not None
         else None
     )
@@ -52,4 +55,3 @@ def build_qbo_snapshots(
         profit_and_loss=pnl,
         account_type_map=account_type_map,
     )
-

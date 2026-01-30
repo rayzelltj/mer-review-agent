@@ -175,14 +175,14 @@ def test_bank_reconciled_needs_review_when_cannot_infer_accounts_without_types(
     res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
         make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
     )
-    assert res.status == RuleStatus.PASS
+    assert res.status == RuleStatus.NEEDS_REVIEW
 
 
 def test_bank_reconciled_expected_accounts_are_enforced(make_balance_sheet, make_ctx):
     rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B2"]}}
     bs = make_balance_sheet(accounts=[])
     res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.NEEDS_REVIEW
+    assert res.status == RuleStatus.FAIL
 
 
 def test_bank_reconciled_infers_scope_by_type_when_no_explicit_list(
@@ -235,13 +235,12 @@ def test_bank_reconciled_exclude_overrides_inferred_scope(make_balance_sheet, ma
     assert res.status == RuleStatus.NOT_APPLICABLE
 
 
-def test_bank_reconciled_period_end_tie_out_optional_check(
+def test_bank_reconciled_period_end_tie_out_is_required(
     make_balance_sheet, make_reconciliation_snapshot, make_ctx
 ):
     rule_cfg = {
         "BS-BANK-RECONCILED-THROUGH-PERIOD-END": {
             "expected_accounts": ["B1"],
-            "require_book_balance_as_of_period_end_ties_to_balance_sheet": True,
         }
     }
     bs = make_balance_sheet(accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "100"}])
@@ -269,6 +268,28 @@ def test_bank_reconciled_period_end_tie_out_optional_check(
         make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
     )
     assert res.status == RuleStatus.FAIL
+
+
+def test_bank_reconciled_needs_review_when_attachment_missing(
+    make_balance_sheet, make_reconciliation_snapshot, make_ctx
+):
+    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1"]}}
+    bs = make_balance_sheet(
+        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
+    )
+    recs = (
+        make_reconciliation_snapshot(
+            account_ref="B1",
+            account_name="Checking",
+            statement_ending_balance="5000",
+            book_balance_as_of_statement_end="5000",
+            book_balance_as_of_period_end="5000",
+        ),
+    )
+    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
+        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=EvidenceBundle(items=[]), client_rules=rule_cfg)
+    )
+    assert res.status == RuleStatus.NEEDS_REVIEW
 
 
 def test_bank_reconciled_fail_when_statement_tie_has_any_difference(

@@ -23,12 +23,6 @@ Use `evidence_bundle_from_manifest()` with a manifest shaped like:
       "amount": "250.00",
       "as_of_date": "2025-11-30",
       "uri": "fixture://petty_cash_support_placeholder"
-    },
-    {
-      "evidence_type": "plooto_instant_live_balance",
-      "amount": "0.00",
-      "as_of_date": "2025-11-30",
-      "uri": "fixture://plooto_instant_placeholder"
     }
   ]
 }

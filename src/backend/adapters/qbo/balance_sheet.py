@@ -91,6 +91,7 @@ def balance_sheet_snapshot_from_report(
     realm_id: str | None = None,
     account_types: dict[str, QBOAccountTypeInfo] | None = None,
     include_rows_without_id: bool = False,
+    include_summary_totals: bool = False,
 ) -> BalanceSheetSnapshot:
     """
     Convert a QBO Report Service BalanceSheet JSON payload into a BalanceSheetSnapshot.
@@ -100,6 +101,8 @@ def balance_sheet_snapshot_from_report(
     - Uses Header.EndPeriod as the snapshot as-of date.
     - Extracts only "Data" rows where the account column includes an `id` (QBO Account Id).
       Rows without an id (e.g., "Net Income") are excluded by default because they are not stable account identifiers.
+    - If `include_summary_totals` is True, summary rows with labels containing "Total" are included as
+      `report::Total ...` accounts.
     - Optionally enriches each account with type/subtype from a Chart of Accounts mapping.
       (Bank/CC inference in rules requires type/subtype to be present.)
     """
@@ -128,49 +131,79 @@ def balance_sheet_snapshot_from_report(
         raise QBOBalanceSheetAdapterError("Report.Rows missing or invalid.")
 
     for row in _iter_rows(rows):
-        if row.get("type") != "Data":
-            continue
-        coldata = row.get("ColData")
-        if not isinstance(coldata, list):
-            continue
-        if account_col >= len(coldata) or total_col >= len(coldata):
-            continue
-
-        acct_cell = coldata[account_col]
-        total_cell = coldata[total_col]
-        if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
-            continue
-
-        acct_id = acct_cell.get("id")
-        acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
-        if not isinstance(acct_id, str) or not acct_id.strip():
-            if not include_rows_without_id:
+        if row.get("type") == "Data":
+            coldata = row.get("ColData")
+            if not isinstance(coldata, list):
                 continue
-            # Non-account rows are included only when explicitly requested.
-            acct_id = f"report::{acct_name}".strip() or "report::unknown"
+            if account_col >= len(coldata) or total_col >= len(coldata):
+                continue
 
-        bal = _parse_decimal(total_cell.get("value"))
-        if bal is None:
-            # Skip rows where the total cannot be parsed to a number.
+            acct_cell = coldata[account_col]
+            total_cell = coldata[total_col]
+            if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
+                continue
+
+            acct_id = acct_cell.get("id")
+            acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
+            if not isinstance(acct_id, str) or not acct_id.strip():
+                if not include_rows_without_id:
+                    continue
+                # Non-account rows are included only when explicitly requested.
+                acct_id = f"report::{acct_name}".strip() or "report::unknown"
+
+            bal = _parse_decimal(total_cell.get("value"))
+            if bal is None:
+                # Skip rows where the total cannot be parsed to a number.
+                continue
+
+            account_ref = acct_id.strip()
+            if realm_id:
+                account_ref = f"qbo::{realm_id}::{account_ref}"
+
+            type_info = None
+            if account_types and isinstance(acct_cell.get("id"), str):
+                type_info = account_types.get(acct_cell["id"])
+
+            accounts.append(
+                {
+                    "account_ref": account_ref,
+                    "name": acct_name,
+                    "type": (type_info.account_type if type_info else "") or "",
+                    "subtype": (type_info.account_subtype if type_info else "") or "",
+                    "balance": str(bal),
+                }
+            )
             continue
 
-        account_ref = acct_id.strip()
-        if realm_id:
-            account_ref = f"qbo::{realm_id}::{account_ref}"
-
-        type_info = None
-        if account_types and isinstance(acct_cell.get("id"), str):
-            type_info = account_types.get(acct_cell["id"])
-
-        accounts.append(
-            {
-                "account_ref": account_ref,
-                "name": acct_name,
-                "type": (type_info.account_type if type_info else "") or "",
-                "subtype": (type_info.account_subtype if type_info else "") or "",
-                "balance": str(bal),
-            }
-        )
+        if include_summary_totals and isinstance(row.get("Summary"), dict):
+            summary = row["Summary"].get("ColData")
+            if not isinstance(summary, list):
+                continue
+            if account_col >= len(summary) or total_col >= len(summary):
+                continue
+            acct_cell = summary[account_col]
+            total_cell = summary[total_col]
+            if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
+                continue
+            acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
+            if "total" not in (acct_name or "").lower():
+                continue
+            bal = _parse_decimal(total_cell.get("value"))
+            if bal is None:
+                continue
+            acct_id = f"report::{acct_name}".strip() or "report::unknown"
+            account_ref = acct_id
+            if realm_id:
+                account_ref = f"qbo::{realm_id}::{account_ref}"
+            accounts.append(
+                {
+                    "account_ref": account_ref,
+                    "name": acct_name,
+                    "type": "",
+                    "subtype": "",
+                    "balance": str(bal),
+                }
+            )
 
     return BalanceSheetSnapshot(
         as_of_date=as_of,

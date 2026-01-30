@@ -14,7 +14,7 @@ class QBOAccountTypeInfo:
     account_subtype: str = ""
 
 
-def account_type_map_from_accounts_payload(payload: dict[str, Any]) -> dict[str, QBOAccountTypeInfo]:
+def account_type_map_from_accounts_payload(payload: Any) -> dict[str, QBOAccountTypeInfo]:
     """
     Build a mapping from QBO Account Id -> (AccountType, AccountSubType).
 
@@ -22,19 +22,23 @@ def account_type_map_from_accounts_payload(payload: dict[str, Any]) -> dict[str,
     - {"QueryResponse": {"Account": [ ... ]}}   (select * from Account)
     - {"Account": [ ... ]}                      (list)
     - {"Account": { ... }}                      (single account read)
+    - [ { ... }, { ... } ]                      (raw list of accounts)
     """
-    if not isinstance(payload, dict):
-        raise QBOAccountsAdapterError("Accounts payload must be a JSON object.")
+    if not isinstance(payload, (dict, list)):
+        raise QBOAccountsAdapterError("Accounts payload must be a JSON object or list of accounts.")
 
     accounts: list[dict[str, Any]] = []
-    if isinstance(payload.get("QueryResponse"), dict) and isinstance(
-        payload["QueryResponse"].get("Account"), list
-    ):
-        accounts = [a for a in payload["QueryResponse"]["Account"] if isinstance(a, dict)]
-    elif isinstance(payload.get("Account"), list):
-        accounts = [a for a in payload["Account"] if isinstance(a, dict)]
-    elif isinstance(payload.get("Account"), dict):
-        accounts = [payload["Account"]]
+    if isinstance(payload, list):
+        accounts = [a for a in payload if isinstance(a, dict)]
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("QueryResponse"), dict) and isinstance(
+            payload["QueryResponse"].get("Account"), list
+        ):
+            accounts = [a for a in payload["QueryResponse"]["Account"] if isinstance(a, dict)]
+        elif isinstance(payload.get("Account"), list):
+            accounts = [a for a in payload["Account"] if isinstance(a, dict)]
+        elif isinstance(payload.get("Account"), dict):
+            accounts = [payload["Account"]]
 
     out: dict[str, QBOAccountTypeInfo] = {}
     for acct in accounts:
@@ -46,4 +50,3 @@ def account_type_map_from_accounts_payload(payload: dict[str, Any]) -> dict[str,
             account_subtype=str(acct.get("AccountSubType") or ""),
         )
     return out
-

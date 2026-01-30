@@ -5,17 +5,22 @@ from adapters.mock_evidence import evidence_bundle_from_manifest, reconciliation
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "mock_evidence"
-BLACKBIRD_FIXTURES = Path(__file__).parent / "fixtures" / "blackbird_fabrics" / "2025-11-30"
+BLACKBIRD_FIXTURES = (
+    Path(__file__).parents[1]
+    / "rules_engine"
+    / "fixtures"
+    / "blackbird_fabrics"
+    / "2025-11-30"
+)
 
 
 def test_evidence_bundle_from_manifest_parses_items():
     manifest = json.loads((FIXTURE_DIR / "manifest.json").read_text(encoding="utf-8"))
     bundle = evidence_bundle_from_manifest(manifest)
-    assert len(bundle.items) == 4
+    assert len(bundle.items) == 3
     types = {item.evidence_type for item in bundle.items}
     assert "statement_balance_attachment" in types
     assert "petty_cash_support" in types
-    assert "plooto_instant_live_balance" in types
 
 
 def test_reconciliation_snapshot_from_report_maps_balances():

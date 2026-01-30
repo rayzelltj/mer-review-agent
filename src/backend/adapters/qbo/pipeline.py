@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from common.rules_engine.models import BalanceSheetSnapshot, ProfitAndLossSnapshot
+from common.rules_engine.models import BalanceSheetSnapshot, EvidenceBundle, ProfitAndLossSnapshot
 
 from .accounts import QBOAccountTypeInfo, account_type_map_from_accounts_payload
+from .aging_reports import aging_report_to_evidence
 from .balance_sheet import balance_sheet_snapshot_from_report
 from .profit_and_loss import profit_and_loss_snapshot_from_report
 
@@ -24,6 +25,7 @@ def build_qbo_snapshots(
     accounts_payload: dict[str, Any] | None = None,
     realm_id: str | None = None,
     include_rows_without_id: bool = False,
+    include_summary_totals: bool = False,
     pnl_summarize_by_month: bool = False,
 ) -> QBOAdapterOutputs:
     """
@@ -42,6 +44,7 @@ def build_qbo_snapshots(
         realm_id=realm_id,
         account_types=account_type_map,
         include_rows_without_id=include_rows_without_id,
+        include_summary_totals=include_summary_totals,
     )
     pnl = (
         profit_and_loss_snapshot_from_report(
@@ -55,3 +58,25 @@ def build_qbo_snapshots(
         profit_and_loss=pnl,
         account_type_map=account_type_map,
     )
+
+
+def build_qbo_aging_evidence(
+    *,
+    ap_summary_report: dict[str, Any] | None = None,
+    ap_detail_report: dict[str, Any] | None = None,
+    ar_summary_report: dict[str, Any] | None = None,
+    ar_detail_report: dict[str, Any] | None = None,
+) -> EvidenceBundle:
+    """
+    Convert QBO AP/AR aging reports into EvidenceItems for subledger reconciliation and aging rules.
+    """
+    items = []
+    if ap_summary_report is not None:
+        items += aging_report_to_evidence(ap_summary_report, report_type="ap", report_kind="summary")
+    if ap_detail_report is not None:
+        items += aging_report_to_evidence(ap_detail_report, report_type="ap", report_kind="detail")
+    if ar_summary_report is not None:
+        items += aging_report_to_evidence(ar_summary_report, report_type="ar", report_kind="summary")
+    if ar_detail_report is not None:
+        items += aging_report_to_evidence(ar_detail_report, report_type="ar", report_kind="detail")
+    return EvidenceBundle(items=items)

@@ -14,7 +14,7 @@ evidence pipeline, and end-to-end flow. It is meant to be updated as you add rea
 - [x] Mock evidence adapters (JSON fixtures → EvidenceBundle/ReconciliationSnapshot)
 - [ ] **Connectors** (QBO OAuth + API fetch, Google Drive fetch, uploads, email, etc.)
 - [ ] **File extraction** layer (PDF/text extraction, OCR, CSV/Sheets parsing)
-- [ ] **Evidence normalization** for real bank statements, petty cash docs, Plooto screenshots
+- [ ] **Evidence normalization** for real bank statements, petty cash docs
 - [ ] **UI output** for rule results and evidence traceability
 
 ---
@@ -56,12 +56,30 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] **BS-CLEARING-ACCOUNTS-ZERO**
   - Zero-balance rule with name inference (`clearing`)
   - Tests: PASS / WARN / FAIL / NEEDS_REVIEW
+- [x] **BS-PLOOTO-CLEARING-ZERO**
+  - Control check: Plooto Clearing must be exactly zero
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
 - [x] **BS-PETTY-CASH-MATCH**
   - Compares petty cash support evidence vs Balance Sheet
   - Tests: PASS / FAIL / NEEDS_REVIEW
+- [x] **BS-AP-SUBLEDGER-RECONCILES**
+  - AP aging summary + detail totals reconcile to Balance Sheet
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-AR-SUBLEDGER-RECONCILES**
+  - AR aging summary + detail totals reconcile to Balance Sheet
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-AP-AR-ITEMS-OLDER-THAN-60-DAYS**
+  - Flags AP/AR items older than 60 days and summary/detail discrepancies
+  - Tests: PASS / NEEDS_REVIEW
+- [x] **BS-LOAN-BALANCE-MATCH**
+  - Matches loan balance to loan schedule support
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-INVESTMENT-BALANCE-MATCH**
+  - Matches investment balance to statement support
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
 - [x] **BS-PLOOTO-INSTANT-BALANCE-DISCLOSURE**
-  - Requires Plooto live balance evidence as-of period end
-  - Tests: PASS / FAIL / NEEDS_REVIEW
+  - Disclosure-only check from Balance Sheet (no evidence required)
+  - Tests: PASS / WARN / NEEDS_REVIEW / NOT_APPLICABLE
 
 ---
 
@@ -80,7 +98,6 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 **Evidence adapters (real data) — missing**
 - [ ] Bank statement/activity statement parsing (PDF/CSV/Sheets)
 - [ ] Petty cash support parsing (PDF/Image/Sheet)
-- [ ] Plooto Instant evidence parsing (screenshot/PDF export)
 
 ---
 
@@ -94,9 +111,36 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] `petty_cash_support`
   - Required fields: `amount`
   - Used by: Petty cash match rule
-- [x] `plooto_instant_live_balance`
+- [x] `loan_schedule_balance`
   - Required fields: `amount`, `as_of_date`
-  - Used by: Plooto Instant balance rule
+  - Used by: Loan balance match rule
+- [x] `investment_statement_balance`
+  - Required fields: `amount`, `as_of_date`
+  - Used by: Investment balance match rule
+- [x] `ap_aging_summary_total`
+  - Required fields: `amount`, `as_of_date`
+  - Used by: AP subledger reconciles rule
+- [x] `ap_aging_detail_total`
+  - Required fields: `amount`, `as_of_date`
+  - Used by: AP subledger reconciles rule
+- [x] `ar_aging_summary_total`
+  - Required fields: `amount`, `as_of_date`
+  - Used by: AR subledger reconciles rule
+- [x] `ar_aging_detail_total`
+  - Required fields: `amount`, `as_of_date`
+  - Used by: AR subledger reconciles rule
+- [x] `ap_aging_summary_over_60`
+  - Required fields: `amount`, `as_of_date`, `meta.items[]`
+  - Used by: AP/AR items older than 60 days rule
+- [x] `ap_aging_detail_over_60`
+  - Required fields: `amount`, `as_of_date`, `meta.items[]`
+  - Used by: AP/AR items older than 60 days rule
+- [x] `ar_aging_summary_over_60`
+  - Required fields: `amount`, `as_of_date`, `meta.items[]`
+  - Used by: AP/AR items older than 60 days rule
+- [x] `ar_aging_detail_over_60`
+  - Required fields: `amount`, `as_of_date`, `meta.items[]`
+  - Used by: AP/AR items older than 60 days rule
 
 **Missing**
 - [ ] Structured evidence for other balance sheet rules (if added later)
@@ -119,7 +163,8 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] Evidence manifest (mock)
 - [x] Petty cash support placeholder (mock)
 - [ ] Real petty cash support sample (PDF/scan/Sheet)
-- [ ] Real Plooto Instant evidence sample (screenshot/export)
+- [ ] Loan schedule example (Sheet/PDF)
+- [ ] Investment statement example (PDF)
 
 ---
 
@@ -152,13 +197,14 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [ ] Actual reconciliation export format(s) from QBO and/or client systems
 - [ ] Bank statement formats (PDF/CSV/Sheets) per bank/provider
 - [ ] Petty cash support examples
-- [ ] Plooto Instant balance evidence example(s)
+ - [ ] Loan schedule examples (loan amortization schedule or lender statement)
+ - [ ] Investment statement examples (bank/broker statements)
 
 ---
 
 ## 10) Next actions (recommended order)
 
-1. **Collect real evidence samples** (petty cash, bank statements, Plooto live balance)
+1. **Collect real evidence samples** (petty cash, bank statements)
 2. **Build extraction adapters** (PDF/CSV/Sheets → normalized evidence)
 3. **Implement connectors** (QBO + Google Drive)
 4. **Wire end-to-end run** (connectors → adapters → rules → UI)

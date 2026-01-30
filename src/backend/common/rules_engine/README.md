@@ -24,6 +24,17 @@ All of these can be created from:
 - real QBO reports later (adapter layer), or
 - JSON fixtures/sample data for deterministic unit tests.
 
+### Parsing vs. Logic (What Does What)
+
+- **Rules engine = pure logic.** It does **no parsing** and **no I/O**. It only consumes typed inputs
+  (snapshots, evidence, config) and applies accounting logic.
+- **Adapters = parsing/normalization.** QBO adapters and evidence adapters transform raw exports, APIs, and files
+  into the canonical models the rules engine expects.
+
+If you have raw files (PDFs/CSVs/screenshots), they should be parsed in adapters and turned into:
+- `BalanceSheetSnapshot`, `ProfitAndLossSnapshot` (`common.rules_engine.models`)
+- `EvidenceBundle` / `EvidenceItem` (`common.rules_engine.models`)
+
 ### Outputs
 
 Each rule returns a `RuleResult`:
@@ -97,6 +108,51 @@ uv run pytest -q tests/rules_engine
 ```
 
 `tests/conftest.py` ensures `src/backend` is on `sys.path` so imports like `import common...` work.
+
+### How the rule tests work (exact flow)
+
+1) **Fixtures build canonical inputs**:
+   - `tests/rules_engine/conftest.py` defines helpers like `make_balance_sheet`, `make_ctx`, and `period_end`.
+2) **Each test assembles inputs**:
+   - Example: `tests/rules_engine/test_bs_plooto_instant_balance_disclosure.py` creates a Balance Sheet snapshot
+     and a `ClientRulesConfig` payload.
+3) **The rule is executed directly**:
+   - Tests call `BS_PLOOTO_INSTANT_BALANCE_DISCLOSURE().evaluate(ctx)` or
+     `BS_PLOOTO_CLEARING_ZERO().evaluate(ctx)`.
+4) **Assertions check status/severity/details**:
+   - The `RuleResult` fields are validated against expected business logic.
+
+Rule tests are intentionally **unit-level** and **pure**: no adapters and no parsing.
+
+### Adding new rule tests
+
+1) Create a new test file under `tests/rules_engine/` (mirror the rule id/name).
+2) Use fixtures from `tests/rules_engine/conftest.py`:
+   - `make_balance_sheet(...)`
+   - `make_ctx(...)`
+   - `period_end`
+3) Instantiate the rule class and call `.evaluate(ctx)`.
+4) Assert on:
+   - `RuleResult.status` and `RuleResult.severity`
+   - `RuleResult.summary` and `RuleResult.details` as needed
+
+Example pattern (see `tests/rules_engine/test_bs_plooto_clearing_zero.py`).
+
+### Adding new evidence fixtures (for adapters/tests)
+
+The rules engine itself does **not** parse evidence. Evidence is parsed by adapters.
+
+For mock evidence fixtures:
+- Add items to `tests/adapters/fixtures/mock_evidence/manifest.json`
+- The adapter `adapters/mock_evidence/evidence_bundle_from_manifest` reads that file into an `EvidenceBundle`
+- Tests for the adapter live in `tests/adapters/test_mock_evidence.py`
+- See `adapters/mock_evidence/README.md` for the manifest shape
+
+If you need a new evidence type:
+1) Define the expected fields in `common.rules_engine.models.EvidenceItem`.
+2) Update the adapter that parses raw files into `EvidenceItem`.
+3) Add fixture examples in `tests/adapters/fixtures/`.
+4) Add adapter tests under `tests/adapters/`.
 
 ## Rule Catalog (Tracking All Rules)
 

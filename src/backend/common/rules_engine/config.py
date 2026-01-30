@@ -91,12 +91,83 @@ class PlootoInstantBalanceDisclosureRuleConfig(RuleConfigBase):
     account_ref: str = ""
     account_name: str = ""
 
-    # Evidence item representing the Plooto Instant live balance as of period end (e.g., screenshot/export/manual extraction).
-    evidence_type: str = "plooto_instant_live_balance"
+    # Optional name matcher for inference when account_ref isn't configured.
+    account_name_match: str = "Plooto Instant"
+    allow_name_inference: bool = True
 
-    # If true, require the evidence item's `as_of_date` to equal `RuleContext.period_end`.
-    # Date mismatches should be flagged for review (per policy).
+    # Deprecated: evidence fields retained for backward compatibility with older configs.
+    evidence_type: str = "plooto_instant_live_balance"
     require_evidence_as_of_date_match_period_end: bool = True
+
+
+class PlootoClearingZeroRuleConfig(RuleConfigBase):
+    # QBO Balance Sheet account ref that represents Plooto Clearing in the books.
+    account_ref: str = ""
+    account_name: str = ""
+    account_name_match: str = "Plooto Clearing"
+    allow_name_inference: bool = True
+
+
+class LoanBalanceMatchRuleConfig(RuleConfigBase):
+    # QBO Balance Sheet account ref that represents the loan balance in the books.
+    account_ref: str = ""
+    account_name: str = ""
+    account_name_match: str = "loan"
+    allow_name_inference: bool = True
+
+    # Evidence item representing the outstanding balance from the loan schedule.
+    evidence_type: str = "loan_schedule_balance"
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class InvestmentBalanceMatchRuleConfig(RuleConfigBase):
+    # QBO Balance Sheet account ref that represents the investment balance in the books.
+    account_ref: str = ""
+    account_name: str = ""
+    account_name_match: str = "investment"
+    allow_name_inference: bool = True
+
+    # Evidence item representing the closing balance from the investment statement.
+    evidence_type: str = "investment_statement_balance"
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class ApSubledgerReconcilesRuleConfig(RuleConfigBase):
+    # QBO Balance Sheet account refs to include in the AP total.
+    account_refs: List[str] = Field(default_factory=list)
+    account_name_match: str = "accounts payable"
+    allow_name_inference: bool = True
+
+    # Evidence items representing totals from QBO AP aging reports.
+    summary_evidence_type: str = "ap_aging_summary_total"
+    detail_evidence_type: str = "ap_aging_detail_total"
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class ArSubledgerReconcilesRuleConfig(RuleConfigBase):
+    # QBO Balance Sheet account refs to include in the AR total.
+    account_refs: List[str] = Field(default_factory=list)
+    account_name_match: str = "accounts receivable"
+    allow_name_inference: bool = True
+
+    # Evidence items representing totals from QBO AR aging reports.
+    summary_evidence_type: str = "ar_aging_summary_total"
+    detail_evidence_type: str = "ar_aging_detail_total"
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class ApArItemsOlderThan60DaysRuleConfig(RuleConfigBase):
+    # Evidence types for AP/AR aging reports (summary + detail).
+    ap_summary_evidence_type: str = "ap_aging_summary_over_60"
+    ap_detail_evidence_type: str = "ap_aging_detail_over_60"
+    ar_summary_evidence_type: str = "ar_aging_summary_over_60"
+    ar_detail_evidence_type: str = "ar_aging_detail_over_60"
+
+    # If true, require evidence `as_of_date` to equal `RuleContext.period_end`.
+    require_evidence_as_of_date_match_period_end: bool = True
+
+    # Threshold in days for "older than".
+    age_threshold_days: int = 60
 
 
 class ClientRulesConfig(BaseModel):

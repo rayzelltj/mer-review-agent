@@ -68,6 +68,7 @@ It returns `QBOAdapterOutputs` containing the canonical snapshots and the accoun
 For each report, it emits:
 - `<ap|ar>_aging_<summary|detail>_total`
 - `<ap|ar>_aging_<summary|detail>_over_60` (with item-level `meta.items[]`)
+- `<ap|ar>_aging_detail_rows` (detail rows with `open_balance` in `meta.items[]`)
 
 Example:
 

@@ -71,6 +71,12 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] **BS-AP-AR-ITEMS-OLDER-THAN-60-DAYS**
   - Flags AP/AR items older than 60 days and summary/detail discrepancies
   - Tests: PASS / NEEDS_REVIEW
+- [x] **BS-AP-AR-NEGATIVE-OPEN-ITEMS**
+  - Flags negative open balances in AP/AR aging detail
+  - Tests: PASS / NEEDS_REVIEW
+- [x] **BS-AP-AR-INTERCOMPANY-OR-SHAREHOLDER-PAID**
+  - Flags intercompany balances that are missing/mismatched in counterpart Balance Sheets
+  - Tests: PASS / NEEDS_REVIEW
 - [x] **BS-LOAN-BALANCE-MATCH**
   - Matches loan balance to loan schedule support
   - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
@@ -141,6 +147,15 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] `ar_aging_detail_over_60`
   - Required fields: `amount`, `as_of_date`, `meta.items[]`
   - Used by: AP/AR items older than 60 days rule
+- [x] `ap_aging_detail_rows`
+  - Required fields: `amount`, `as_of_date`, `meta.items[]`
+  - Used by: AP/AR negative open items rule
+- [x] `ar_aging_detail_rows`
+  - Required fields: `amount`, `as_of_date`, `meta.items[]`
+  - Used by: AP/AR negative open items rule
+- [x] `intercompany_balance_sheet`
+  - Required fields: `as_of_date`, `meta.items[]`
+  - Used by: Intercompany/shareholder paid rule
 
 **Missing**
 - [ ] Structured evidence for other balance sheet rules (if added later)

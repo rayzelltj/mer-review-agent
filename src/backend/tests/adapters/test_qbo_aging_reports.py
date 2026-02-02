@@ -27,8 +27,10 @@ def test_ap_aging_detail_to_evidence():
     items = aging_report_to_evidence(report, report_type="ap", report_kind="detail")
     total = next(i for i in items if i.evidence_type == "ap_aging_detail_total")
     over = next(i for i in items if i.evidence_type == "ap_aging_detail_over_60")
+    rows = next(i for i in items if i.evidence_type == "ap_aging_detail_rows")
     assert str(total.amount) == "52157.70"
     assert str(over.amount) == "-123.66"
+    assert rows.meta.get("items")
 
 
 def test_ar_aging_summary_to_evidence():
@@ -45,5 +47,7 @@ def test_ar_aging_detail_to_evidence():
     items = aging_report_to_evidence(report, report_type="ar", report_kind="detail")
     total = next(i for i in items if i.evidence_type == "ar_aging_detail_total")
     over = next(i for i in items if i.evidence_type == "ar_aging_detail_over_60")
+    rows = next(i for i in items if i.evidence_type == "ar_aging_detail_rows")
     assert str(total.amount) == "0.00"
     assert str(over.amount) == "0"
+    assert rows.meta.get("items") is not None

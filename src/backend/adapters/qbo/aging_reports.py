@@ -218,6 +218,7 @@ def aging_report_to_evidence(
     prefix = "ap" if report_type == "ap" else "ar"
     total_type = f"{prefix}_aging_{report_kind}_total"
     over_type = f"{prefix}_aging_{report_kind}_over_60"
+    rows_type = f"{prefix}_aging_{report_kind}_rows"
 
     total_item = EvidenceItem(
         evidence_type=total_type,
@@ -238,4 +239,30 @@ def aging_report_to_evidence(
         },
     )
 
-    return [total_item, over_item]
+    items = [total_item, over_item]
+
+    if report_kind == "detail":
+        detail_items = []
+        for r in rows:
+            detail_items.append(
+                {
+                    "name": r["name"],
+                    "open_balance": str(r["total"]),
+                    "current": str(r["current"]),
+                    "1_30": str(r["1_30"]),
+                    "31_60": str(r["31_60"]),
+                    "61_90": str(r["61_90"]),
+                    "91_over": str(r["91_over"]),
+                }
+            )
+        items.append(
+            EvidenceItem(
+                evidence_type=rows_type,
+                source="qbo_report",
+                as_of_date=as_of,
+                amount=str(grand["total"]),
+                meta={"currency": currency, "items": detail_items},
+            )
+        )
+
+    return items

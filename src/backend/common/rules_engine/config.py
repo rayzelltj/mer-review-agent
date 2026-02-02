@@ -170,6 +170,28 @@ class ApArItemsOlderThan60DaysRuleConfig(RuleConfigBase):
     age_threshold_days: int = 60
 
 
+class ApArNegativeOpenItemsRuleConfig(RuleConfigBase):
+    ap_detail_rows_evidence_type: str = "ap_aging_detail_rows"
+    ar_detail_rows_evidence_type: str = "ar_aging_detail_rows"
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class ApArIntercompanyOrShareholderPaidRuleConfig(RuleConfigBase):
+    # Evidence bundle of intercompany balances from other entities' Balance Sheets.
+    evidence_type: str = "intercompany_balance_sheet"
+
+    # Match patterns for intercompany accounts in the local Balance Sheet.
+    name_patterns: List[str] = Field(
+        default_factory=lambda: ["due to", "due from", "intercompany", "inter-company"]
+    )
+
+    # If true, only evaluate non-zero balances.
+    non_zero_only: bool = True
+
+    # Require evidence as-of date to match period end.
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
 class ClientRulesConfig(BaseModel):
     """Client-specific configuration for all rules.
 

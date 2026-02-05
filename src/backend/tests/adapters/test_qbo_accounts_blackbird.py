@@ -4,7 +4,10 @@ from pathlib import Path
 from adapters.qbo.accounts import account_type_map_from_accounts_payload
 
 
-FIXTURE_DIR = Path(__file__).parents[4] / "BlackBird Fabrics 2025-12-31"
+FIXTURE_DIR = (
+    Path(__file__).parents[2]
+    / "tests/rules_engine/fixtures/blackbird_fabrics/2025-12-31"
+)
 
 
 def _load(name: str):

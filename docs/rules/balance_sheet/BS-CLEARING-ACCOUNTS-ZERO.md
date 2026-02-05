@@ -22,7 +22,7 @@ Config model: `ZeroBalanceRuleConfig` (`common.rules_engine.config`)
 - `default_threshold` — used when an account override has no `threshold`
 - `missing_data_policy` — when a configured account is missing from the Balance Sheet snapshot
   - `NEEDS_REVIEW` (default) or `NOT_APPLICABLE`
-- `allow_name_inference` — if true and `accounts[]` is empty, infer accounts by `name` containing `"clearing"` (case-insensitive)
+- If `accounts[]` is empty, accounts are inferred by `name` containing `"clearing"` (case-insensitive)
 - `unconfigured_threshold_policy` — status to emit for **non-zero** balances when no thresholds are configured (TBD business policy)
   - Default: `NEEDS_REVIEW`
 - `amount_quantize` (optional) — Decimal quantization for comparisons (e.g. `"0.01"` for cents)
@@ -46,8 +46,7 @@ Reasonable options to decide later:
 1. If `enabled == false` → `NOT_APPLICABLE`
 2. Determine accounts to evaluate:
    - If `accounts[]` provided → use it
-   - Else if `allow_name_inference == true` → infer accounts by name match
-   - Else → `NEEDS_REVIEW` (no configured accounts)
+   - Else → infer accounts by name match
 3. For each account:
    - If account missing from Balance Sheet snapshot → `missing_data_policy`
    - Quantize amounts if `amount_quantize` configured
@@ -85,6 +84,5 @@ Reasonable options to decide later:
 | Non-zero within variance | balance <= allowed | WARN / LOW |
 | Non-zero outside variance | balance > allowed | FAIL / HIGH |
 | Missing configured account | account_ref not in snapshot | NEEDS_REVIEW (or NOT_APPLICABLE if configured) |
-| No accounts configured | `accounts[]` empty and inference off | NEEDS_REVIEW |
-| Name inference on | `allow_name_inference=true` and multiple “clearing” names | Evaluates matched accounts only |
+| No accounts found | `accounts[]` empty and no names containing “clearing” | NEEDS_REVIEW |
 | Rounding boundary | `amount_quantize="0.01"`, balance `0.004` | PASS |

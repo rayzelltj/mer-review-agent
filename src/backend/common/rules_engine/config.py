@@ -192,6 +192,79 @@ class ApArIntercompanyOrShareholderPaidRuleConfig(RuleConfigBase):
     require_evidence_as_of_date_match_period_end: bool = True
 
 
+class ApArYearEndBatchAdjustmentsRuleConfig(RuleConfigBase):
+    ap_detail_rows_evidence_type: str = "ap_aging_detail_rows"
+    ar_detail_rows_evidence_type: str = "ar_aging_detail_rows"
+    require_evidence_as_of_date_match_period_end: bool = True
+    name_patterns: List[str] = Field(
+        default_factory=lambda: [
+            "yer supplier",
+            "year-end review",
+            "ye adj",
+            "year end",
+            "y/e",
+        ]
+    )
+
+
+class IntercompanyBalancesReconcileRuleConfig(RuleConfigBase):
+    evidence_type: str = "intercompany_balance_sheet"
+    name_patterns: List[str] = Field(
+        default_factory=lambda: [
+            "intercompany loan",
+            "due to",
+            "due from",
+            "loan from",
+            "loan to",
+            "shareholder loan",
+        ]
+    )
+    non_zero_only: bool = True
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class WorkingPaperReconcilesRuleConfig(RuleConfigBase):
+    evidence_type: str = "working_paper_balance"
+    name_patterns: List[str] = Field(
+        default_factory=lambda: ["prepaid", "deferred revenue", "accrual"]
+    )
+    require_evidence_as_of_date_match_period_end: bool = True
+
+
+class TaxFilingsUpToDateRuleConfig(RuleConfigBase):
+    tax_agencies_evidence_type: str = "tax_agencies"
+    tax_returns_evidence_type: str = "tax_returns"
+    exclude_agency_name_patterns: List[str] = Field(
+        default_factory=lambda: ["no tax agency"]
+    )
+    delinquent_status: RuleStatus = RuleStatus.FAIL
+
+
+class TaxPayableAndSuspenseReconcileRuleConfig(RuleConfigBase):
+    tax_agencies_evidence_type: str = "tax_agencies"
+    tax_returns_evidence_type: str = "tax_returns"
+    tax_payments_evidence_type: str = "tax_payments"
+    delinquent_status: RuleStatus = RuleStatus.FAIL
+    account_name_patterns: List[str] = Field(
+        default_factory=lambda: [
+            "gst/hst payable",
+            "gst/hst suspense",
+            "gst/hst suspence",
+            "gst payable",
+            "gst suspense",
+            "gst suspence",
+            "hst payable",
+            "hst suspense",
+            "hst suspence",
+            "pst payable",
+            "pst suspense",
+            "pst suspence",
+            "sales tax",
+        ]
+    )
+    refund_grace_days: int = 60
+
+
 class ClientRulesConfig(BaseModel):
     """Client-specific configuration for all rules.
 

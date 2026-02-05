@@ -33,9 +33,11 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
         used_name_inference = False
         if cfg.accounts:
             accounts_to_eval = list(cfg.accounts)
-        elif cfg.allow_name_inference:
+        else:
             used_name_inference = True
             for acct in ctx.balance_sheet.accounts:
+                if acct.account_ref.startswith("report::"):
+                    continue
                 if "clearing" in (acct.name or "").lower():
                     accounts_to_eval.append(
                         AccountThresholdOverride(
@@ -52,10 +54,10 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                 sources=self.sources,
                 status=RuleStatus.NEEDS_REVIEW,
                 severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
-                summary=f"No clearing accounts configured for period end {ctx.period_end.isoformat()}.",
+                summary=f"No clearing accounts found for period end {ctx.period_end.isoformat()}.",
                 human_action=(
-                    "Configure clearing account refs for this client and set acceptable variances per account "
-                    "(recommended)."
+                    "Configure clearing account refs for this client or confirm they do not exist, then set "
+                    "acceptable variances per account (recommended)."
                 ),
             )
 

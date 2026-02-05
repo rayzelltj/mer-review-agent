@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..config import ZeroBalanceRuleConfig
+from ..config import AccountThresholdOverride, ZeroBalanceRuleConfig
 from ..context import RuleContext, compute_allowed_variance, quantize_amount
 from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
 from ..registry import register_rule
@@ -29,7 +29,24 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                 summary="Rule disabled by client configuration.",
             )
 
-        if not cfg.accounts:
+        accounts_to_eval: list[AccountThresholdOverride] = []
+        used_name_inference = False
+        if cfg.accounts:
+            accounts_to_eval = list(cfg.accounts)
+        else:
+            used_name_inference = True
+            for acct in ctx.balance_sheet.accounts:
+                if acct.account_ref.startswith("report::"):
+                    continue
+                if "undeposited" in (acct.name or "").lower():
+                    accounts_to_eval.append(
+                        AccountThresholdOverride(
+                            account_ref=acct.account_ref,
+                            account_name=acct.name,
+                        )
+                    )
+
+        if not accounts_to_eval:
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
@@ -37,8 +54,10 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                 sources=self.sources,
                 status=RuleStatus.NEEDS_REVIEW,
                 severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
-                summary=f"Undeposited Funds account not configured for period end {ctx.period_end.isoformat()}.",
-                human_action="Configure the Undeposited Funds account ref for this client.",
+                summary=f"No Undeposited Funds accounts found for period end {ctx.period_end.isoformat()}.",
+                human_action=(
+                    "Configure the Undeposited Funds account ref for this client or confirm it does not exist."
+                ),
             )
 
         revenue_total = ctx.get_revenue_total()
@@ -49,9 +68,11 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
         default_threshold_configured = (cfg.default_threshold.floor_amount != 0) or (
             cfg.default_threshold.pct_of_revenue != 0
         )
-        has_any_threshold = default_threshold_configured or any(a.threshold is not None for a in cfg.accounts)
+        has_any_threshold = default_threshold_configured or any(
+            a.threshold is not None for a in accounts_to_eval
+        )
 
-        for acct_cfg in cfg.accounts:
+        for acct_cfg in accounts_to_eval:
             bal = ctx.get_account_balance(acct_cfg.account_ref)
             if bal is None:
                 statuses.append(missing_status)
@@ -98,6 +119,7 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                         "threshold_pct_of_revenue": str(threshold.pct_of_revenue),
                         "status": status.value,
                         "threshold_configured": threshold_configured,
+                        "inferred_by_name_match": used_name_inference,
                     },
                 )
             )
@@ -134,6 +156,8 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                     f"{human_action} Note: no acceptable variance was configured (TBD); "
                     "set thresholds (floor and/or % of revenue)."
                 )
+            if used_name_inference:
+                human_action = f"{human_action} Note: accounts were inferred by name match ('undeposited')."
 
         return RuleResult(
             rule_id=self.rule_id,

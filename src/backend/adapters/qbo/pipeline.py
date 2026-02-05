@@ -9,6 +9,7 @@ from .accounts import QBOAccountTypeInfo, account_type_map_from_accounts_payload
 from .aging_reports import aging_report_to_evidence
 from .balance_sheet import balance_sheet_snapshot_from_report
 from .profit_and_loss import profit_and_loss_snapshot_from_report
+from .tax import tax_agencies_to_evidence, tax_payments_to_evidence, tax_returns_to_evidence
 
 
 @dataclass(frozen=True)
@@ -79,4 +80,23 @@ def build_qbo_aging_evidence(
         items += aging_report_to_evidence(ar_summary_report, report_type="ar", report_kind="summary")
     if ar_detail_report is not None:
         items += aging_report_to_evidence(ar_detail_report, report_type="ar", report_kind="detail")
+    return EvidenceBundle(items=items)
+
+
+def build_qbo_tax_evidence(
+    *,
+    tax_agencies_payload: list[dict[str, Any]] | None = None,
+    tax_returns_payload: list[dict[str, Any]] | None = None,
+    tax_payments_payload: list[dict[str, Any]] | None = None,
+) -> EvidenceBundle:
+    """
+    Convert QBO TaxAgency/TaxReturn/TaxPayment payloads into EvidenceItems for tax rules.
+    """
+    items = []
+    if tax_agencies_payload is not None:
+        items.append(tax_agencies_to_evidence(tax_agencies_payload))
+    if tax_returns_payload is not None:
+        items.append(tax_returns_to_evidence(tax_returns_payload))
+    if tax_payments_payload is not None:
+        items.append(tax_payments_to_evidence(tax_payments_payload))
     return EvidenceBundle(items=items)

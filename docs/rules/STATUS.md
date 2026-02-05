@@ -77,6 +77,12 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] **BS-AP-AR-INTERCOMPANY-OR-SHAREHOLDER-PAID**
   - Flags intercompany balances that are missing/mismatched in counterpart Balance Sheets
   - Tests: PASS / NEEDS_REVIEW
+- [x] **BS-AP-AR-YEAR_END_BATCH_ADJUSTMENTS**
+  - Flags generic year-end batch adjustment names in AP/AR aging detail
+  - Tests: PASS / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-INTERCOMPANY-BALANCES-RECONCILE**
+  - Intercompany loan balances reconcile across related companies
+  - Tests: PASS / NEEDS_REVIEW / NOT_APPLICABLE
 - [x] **BS-LOAN-BALANCE-MATCH**
   - Matches loan balance to loan schedule support
   - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
@@ -85,6 +91,15 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
   - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
 - [x] **BS-PLOOTO-INSTANT-BALANCE-DISCLOSURE**
   - Disclosure-only check from Balance Sheet (no evidence required)
+  - Tests: PASS / WARN / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-WORKING-PAPER-RECONCILES**
+  - Working paper balances reconcile to Balance Sheet
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-TAX-FILINGS-UP-TO-DATE**
+  - Sales tax filings completed through most recent period
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-TAX-PAYABLE-AND-SUSPENSE-RECONCILE-TO-RETURN**
+  - Tax payable/suspense reconcile to most recent return
   - Tests: PASS / WARN / NEEDS_REVIEW / NOT_APPLICABLE
 
 ---
@@ -156,6 +171,18 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] `intercompany_balance_sheet`
   - Required fields: `as_of_date`, `meta.items[]`
   - Used by: Intercompany/shareholder paid rule
+- [x] `working_paper_balance`
+  - Required fields: `amount`, `as_of_date`
+  - Used by: Working paper reconciles rule
+- [x] `tax_agencies`
+  - Required fields: `meta.items[]`
+  - Used by: Tax filings up to date, tax payable/suspense reconcile
+- [x] `tax_returns`
+  - Required fields: `meta.items[]`
+  - Used by: Tax filings up to date, tax payable/suspense reconcile
+- [x] `tax_payments`
+  - Required fields: `meta.items[]`
+  - Used by: Tax payable/suspense reconcile
 
 **Missing**
 - [ ] Structured evidence for other balance sheet rules (if added later)

@@ -4,7 +4,10 @@ from pathlib import Path
 from adapters.qbo.aging_reports import aging_report_to_evidence
 
 
-FIXTURE_DIR = Path(__file__).parents[4] / "BlackBird Fabrics 2025-12-31"
+FIXTURE_DIR = (
+    Path(__file__).parents[2]
+    / "tests/rules_engine/fixtures/blackbird_fabrics/2025-12-31"
+)
 
 
 def _load(name: str):

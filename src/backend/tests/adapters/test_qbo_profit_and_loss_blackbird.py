@@ -21,3 +21,5 @@ def test_profit_and_loss_blackbird_parses_revenue_and_dates():
     assert snapshot.period_end.isoformat() == "2025-12-31"
     assert snapshot.currency == "CAD"
     assert str(snapshot.totals["revenue"]) == "1576382.88"
+    assert str(snapshot.totals["income_line:Sales - Etsy"]) == "11269.18"
+    assert str(snapshot.totals["income_line:Sales - Etsy - Discounts/Refunds"]) == "-33.58"

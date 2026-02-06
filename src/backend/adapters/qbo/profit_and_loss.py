@@ -155,6 +155,44 @@ def _extract_total_by_label(
     return None
 
 
+def _extract_income_line_totals(
+    report: dict[str, Any], *, group: str, total_col: int
+) -> list[PnLTotal]:
+    rows = report.get("Rows")
+    if not isinstance(rows, dict):
+        return []
+    income_rows = None
+    for row in rows.get("Row", []) if isinstance(rows.get("Row"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("group") == group:
+            income_rows = row.get("Rows")
+            break
+    if not isinstance(income_rows, dict):
+        return []
+
+    totals: dict[str, Decimal] = {}
+    for row in _iter_rows(income_rows):
+        if row.get("type") != "Data":
+            continue
+        coldata = row.get("ColData")
+        if not isinstance(coldata, list) or total_col >= len(coldata):
+            continue
+        name_cell = coldata[0]
+        value_cell = coldata[total_col]
+        if not isinstance(name_cell, dict) or not isinstance(value_cell, dict):
+            continue
+        name = (name_cell.get("value") or "").strip()
+        if not name:
+            continue
+        value = _parse_decimal(value_cell.get("value"))
+        if value is None:
+            continue
+        totals[name] = totals.get(name, Decimal("0")) + value
+
+    return [PnLTotal(key=k, amount=v) for k, v in totals.items()]
+
+
 def profit_and_loss_snapshot_from_report(
     report: dict[str, Any],
     *,
@@ -204,6 +242,9 @@ def profit_and_loss_snapshot_from_report(
     totals: dict[str, Decimal] = {}
     if revenue is not None:
         totals["revenue"] = revenue
+    income_lines = _extract_income_line_totals(report, group=revenue_group, total_col=value_col)
+    for item in income_lines:
+        totals[f"income_line:{item.key}"] = item.amount
 
     return ProfitAndLossSnapshot(
         period_start=start,

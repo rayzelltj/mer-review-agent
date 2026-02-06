@@ -1,6 +1,8 @@
 from decimal import Decimal
 
-from common.rules_engine.models import RuleStatus, Severity
+from decimal import Decimal
+
+from common.rules_engine.models import ProfitAndLossSnapshot, RuleStatus, Severity
 from common.rules_engine.rules.bs_clearing_accounts_zero import BS_CLEARING_ACCOUNTS_ZERO
 
 
@@ -96,3 +98,22 @@ def test_clearing_accounts_rounding_boundary_quantizes(make_balance_sheet, make_
     bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Clearing", "balance": "0.004"}])
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
     assert res.status == RuleStatus.PASS
+
+
+def test_clearing_accounts_platform_revenue_threshold(make_balance_sheet, make_ctx, period_end):
+    rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {}}
+    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Etsy Clearing", "balance": "50"}])
+    pnl = ProfitAndLossSnapshot(
+        period_start=period_end,
+        period_end=period_end,
+        currency="USD",
+        totals={
+            "revenue": Decimal("1000"),
+            "income_line:Sales - Etsy": Decimal("1000"),
+        },
+    )
+    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
+        make_ctx(balance_sheet=bs, client_rules=rule_cfg, profit_and_loss=pnl)
+    )
+    assert res.status == RuleStatus.WARN
+    assert res.details[0].values["threshold_source"] == "platform_revenue"

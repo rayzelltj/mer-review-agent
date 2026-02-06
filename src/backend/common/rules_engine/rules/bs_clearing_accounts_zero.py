@@ -1,10 +1,48 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from ..config import AccountThresholdOverride, ZeroBalanceRuleConfig
 from ..context import RuleContext, compute_allowed_variance, quantize_amount
 from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
+
+
+def _platform_revenue_from_pnl(
+    pnl, account_name: str
+) -> tuple[Decimal | None, list[str]]:
+    if pnl is None or not account_name:
+        return None, []
+    stopwords = {
+        "clearing",
+        "account",
+        "accounts",
+        "bank",
+        "funds",
+        "undeposited",
+        "fund",
+    }
+    tokens = [
+        t.strip().lower()
+        for t in account_name.replace("-", " ").replace("/", " ").split()
+        if t.strip()
+    ]
+    tokens = [t for t in tokens if t not in stopwords and len(t) >= 3]
+    if not tokens:
+        return None, []
+
+    total = Decimal("0")
+    matched = False
+    for key, amount in (pnl.totals or {}).items():
+        if not isinstance(key, str) or not key.startswith("income_line:"):
+            continue
+        line_name = key.split("income_line:", 1)[1].lower()
+        if any(t in line_name for t in tokens):
+            total += amount
+            matched = True
+
+    return (total if matched else None), tokens
 
 
 @register_rule
@@ -92,7 +130,19 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
 
             threshold = acct_cfg.threshold or cfg.default_threshold
             threshold_configured = default_threshold_configured or (acct_cfg.threshold is not None)
-            allowed = compute_allowed_variance(threshold=threshold, revenue_total=revenue_total)
+            platform_revenue = None
+            platform_tokens: list[str] = []
+            if acct_cfg.threshold is None:
+                platform_revenue, platform_tokens = _platform_revenue_from_pnl(
+                    ctx.profit_and_loss, acct_cfg.account_name
+                )
+            if platform_revenue is not None:
+                allowed = (abs(platform_revenue) * Decimal("0.10")).copy_abs()
+                threshold_configured = True
+                threshold_source = "platform_revenue"
+            else:
+                allowed = compute_allowed_variance(threshold=threshold, revenue_total=revenue_total)
+                threshold_source = "configured" if threshold_configured else "unconfigured"
             bal_q = quantize_amount(bal, cfg.amount_quantize)
             abs_bal = abs(bal_q)
             allowed_q = quantize_amount(allowed, cfg.amount_quantize)
@@ -121,6 +171,9 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                         "status": status.value,
                         "threshold_configured": threshold_configured,
                         "inferred_by_name_match": used_name_inference,
+                        "threshold_source": threshold_source,
+                        "platform_revenue": str(platform_revenue) if platform_revenue is not None else None,
+                        "platform_tokens": platform_tokens,
                     },
                 )
             )

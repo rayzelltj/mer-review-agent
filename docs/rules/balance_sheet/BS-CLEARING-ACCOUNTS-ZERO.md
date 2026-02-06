@@ -35,6 +35,8 @@ Config model: `ZeroBalanceRuleConfig` (`common.rules_engine.config`)
 
 ### Threshold derivation (TBD)
 `VarianceThreshold` is currently `max(floor_amount, abs(revenue_total) * pct_of_revenue)`.
+When the account name matches an ecommerce platform, the default threshold is
+`10%` of the corresponding platform sales (Income lines in P&L).
 This is a placeholder mechanism; acceptable variance should be explicitly set per client/account (KYC/SOP).
 
 Reasonable options to decide later:
@@ -70,6 +72,9 @@ Reasonable options to decide later:
   - `threshold_floor_amount`, `threshold_pct_of_revenue`
   - `threshold_configured` (bool)
   - `inferred_by_name_match` (bool)
+  - `threshold_source` (configured/platform_revenue/unconfigured)
+  - `platform_revenue` (if inferred)
+  - `platform_tokens` (tokens used to match P&L income lines)
   - per-account `status`
 
 ## Edge cases

@@ -1,7 +1,5 @@
 from decimal import Decimal
 
-from decimal import Decimal
-
 from common.rules_engine.models import ProfitAndLossSnapshot, RuleStatus, Severity
 from common.rules_engine.rules.bs_clearing_accounts_zero import BS_CLEARING_ACCOUNTS_ZERO
 
@@ -23,7 +21,16 @@ def test_clearing_accounts_zero_pass_warn_fail_severity(
     }
 
     # PASS
-    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Clearing - Payroll", "balance": "0"}])
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Clearing - Payroll",
+                "type": "Bank",
+                "balance": "0",
+            }
+        ]
+    )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
         make_ctx(balance_sheet=bs, profit_and_loss=pnl, client_rules=rule_cfg)
     )
@@ -32,7 +39,16 @@ def test_clearing_accounts_zero_pass_warn_fail_severity(
     assert period_end.isoformat() in res.summary
 
     # WARN (allowed = max(50, 100000*0.001=100) => 100)
-    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Clearing - Payroll", "balance": "80"}])
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Clearing - Payroll",
+                "type": "Bank",
+                "balance": "80",
+            }
+        ]
+    )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
         make_ctx(balance_sheet=bs, profit_and_loss=pnl, client_rules=rule_cfg)
     )
@@ -42,7 +58,16 @@ def test_clearing_accounts_zero_pass_warn_fail_severity(
     assert "80" in res.summary
 
     # FAIL
-    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Clearing - Payroll", "balance": "120"}])
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Clearing - Payroll",
+                "type": "Bank",
+                "balance": "120",
+            }
+        ]
+    )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
         make_ctx(balance_sheet=bs, profit_and_loss=pnl, client_rules=rule_cfg)
     )
@@ -66,7 +91,16 @@ def test_clearing_accounts_missing_account_needs_review(make_balance_sheet, make
 
 def test_clearing_accounts_needs_review_when_not_configured(make_balance_sheet, make_ctx):
     rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {}}
-    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Payroll Clearing", "balance": "10"}])
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Payroll Clearing",
+                "type": "Bank",
+                "balance": "10",
+            }
+        ]
+    )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
     assert res.status == RuleStatus.NEEDS_REVIEW
 
@@ -75,8 +109,8 @@ def test_clearing_accounts_name_inference_when_enabled(make_balance_sheet, make_
     rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {"allow_name_inference": True}}
     bs = make_balance_sheet(
         accounts=[
-            {"account_ref": "A1", "name": "Payroll Clearing", "balance": "0"},
-            {"account_ref": "A2", "name": "Other clearing", "balance": "10"},
+            {"account_ref": "A1", "name": "Payroll Clearing", "type": "Bank", "balance": "0"},
+            {"account_ref": "A2", "name": "Other clearing", "type": "Fixed Asset", "balance": "10"},
             {"account_ref": "A3", "name": "Cash", "balance": "999"},
         ]
     )
@@ -84,7 +118,7 @@ def test_clearing_accounts_name_inference_when_enabled(make_balance_sheet, make_
     # With no thresholds configured, non-zero balances default to NEEDS_REVIEW (unconfigured_threshold_policy).
     assert res.status == RuleStatus.NEEDS_REVIEW
     evaluated_keys = {d.key for d in res.details}
-    assert evaluated_keys == {"A1", "A2"}
+    assert evaluated_keys == {"A1"}
     assert any(d.values.get("threshold_configured") is False for d in res.details)
 
 
@@ -95,14 +129,32 @@ def test_clearing_accounts_rounding_boundary_quantizes(make_balance_sheet, make_
             "amount_quantize": "0.01",
         }
     }
-    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Clearing", "balance": "0.004"}])
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Clearing",
+                "type": "Bank",
+                "balance": "0.004",
+            }
+        ]
+    )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
     assert res.status == RuleStatus.PASS
 
 
 def test_clearing_accounts_platform_revenue_threshold(make_balance_sheet, make_ctx, period_end):
     rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {}}
-    bs = make_balance_sheet(accounts=[{"account_ref": "A1", "name": "Etsy Clearing", "balance": "50"}])
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Etsy Clearing",
+                "type": "Bank",
+                "balance": "50",
+            }
+        ]
+    )
     pnl = ProfitAndLossSnapshot(
         period_start=period_end,
         period_end=period_end,

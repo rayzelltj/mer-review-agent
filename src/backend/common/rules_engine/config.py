@@ -44,6 +44,18 @@ class ZeroBalanceRuleConfig(RuleConfigBase):
     unconfigured_threshold_policy: RuleStatus = RuleStatus.NEEDS_REVIEW
 
 
+class ClearingAccountsZeroRuleConfig(ZeroBalanceRuleConfig):
+    # QBO account types considered "current assets" for sales clearing accounts.
+    current_asset_types: List[str] = Field(
+        default_factory=lambda: [
+            "Bank",
+            "Accounts Receivable",
+            "Other Current Asset",
+            "Cash and Cash Equivalents",
+        ]
+    )
+
+
 class PettyCashMatchRuleConfig(RuleConfigBase):
     account_ref: str = ""
     account_name: str = ""
@@ -229,6 +241,18 @@ class WorkingPaperReconcilesRuleConfig(RuleConfigBase):
         default_factory=lambda: ["prepaid", "deferred revenue", "accrual"]
     )
     require_evidence_as_of_date_match_period_end: bool = True
+
+
+class NonSalesClearingAccountsZeroRuleConfig(RuleConfigBase):
+    name_patterns: List[str] = Field(default_factory=lambda: ["clearing"])
+    current_asset_types: List[str] = Field(
+        default_factory=lambda: [
+            "Bank",
+            "Accounts Receivable",
+            "Other Current Asset",
+            "Cash and Cash Equivalents",
+        ]
+    )
 
 
 class TaxFilingsUpToDateRuleConfig(RuleConfigBase):

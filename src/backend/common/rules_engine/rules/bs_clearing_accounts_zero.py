@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from ..config import AccountThresholdOverride, ZeroBalanceRuleConfig
+from ..config import AccountThresholdOverride, ClearingAccountsZeroRuleConfig
 from ..context import RuleContext, compute_allowed_variance, quantize_amount
 from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
 from ..registry import register_rule
@@ -45,16 +45,23 @@ def _platform_revenue_from_pnl(
     return (total if matched else None), tokens
 
 
+def _is_current_asset_type(account_type: str, current_asset_types: list[str]) -> bool:
+    if not account_type:
+        return False
+    lowered = account_type.lower()
+    return any(lowered == t.lower() for t in current_asset_types)
+
+
 @register_rule
 class BS_CLEARING_ACCOUNTS_ZERO(Rule):
     rule_id = "BS-CLEARING-ACCOUNTS-ZERO"
-    rule_title = "Clearing accounts should be zero at period end"
-    best_practices_reference = "Clearing accounts (a $0 balance)"
+    rule_title = "Sales clearing accounts should be within threshold at period end"
+    best_practices_reference = "Clearing accounts (sales clearing tolerance)"
     sources = ["QBO"]
-    config_model = ZeroBalanceRuleConfig
+    config_model = ClearingAccountsZeroRuleConfig
 
     def evaluate(self, ctx: RuleContext) -> RuleResult:
-        cfg = ctx.client_config.get_rule_config(self.rule_id, ZeroBalanceRuleConfig)
+        cfg = ctx.client_config.get_rule_config(self.rule_id, ClearingAccountsZeroRuleConfig)
         missing_status = RuleStatus(cfg.missing_data_policy.value)
         if not cfg.enabled:
             return RuleResult(
@@ -69,14 +76,44 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
 
         accounts_to_eval: list[AccountThresholdOverride] = []
         used_name_inference = False
+        type_unknown: list[AccountThresholdOverride] = []
+        skipped_non_current: list[AccountThresholdOverride] = []
+        account_by_ref = {acct.account_ref: acct for acct in ctx.balance_sheet.accounts}
         if cfg.accounts:
-            accounts_to_eval = list(cfg.accounts)
+            for acct_cfg in cfg.accounts:
+                acct = account_by_ref.get(acct_cfg.account_ref)
+                if acct is None:
+                    accounts_to_eval.append(acct_cfg)
+                    continue
+                if not acct.type:
+                    type_unknown.append(acct_cfg)
+                    continue
+                if _is_current_asset_type(acct.type, cfg.current_asset_types):
+                    accounts_to_eval.append(acct_cfg)
+                else:
+                    skipped_non_current.append(acct_cfg)
         else:
             used_name_inference = True
             for acct in ctx.balance_sheet.accounts:
                 if acct.account_ref.startswith("report::"):
                     continue
                 if "clearing" in (acct.name or "").lower():
+                    if not acct.type:
+                        type_unknown.append(
+                            AccountThresholdOverride(
+                                account_ref=acct.account_ref,
+                                account_name=acct.name,
+                            )
+                        )
+                        continue
+                    if not _is_current_asset_type(acct.type, cfg.current_asset_types):
+                        skipped_non_current.append(
+                            AccountThresholdOverride(
+                                account_ref=acct.account_ref,
+                                account_name=acct.name,
+                            )
+                        )
+                        continue
                     accounts_to_eval.append(
                         AccountThresholdOverride(
                             account_ref=acct.account_ref,
@@ -84,15 +121,44 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                         )
                     )
 
+        if type_unknown:
+            return RuleResult(
+                rule_id=self.rule_id,
+                rule_title=self.rule_title,
+                best_practices_reference=self.best_practices_reference,
+                sources=self.sources,
+                status=missing_status,
+                severity=severity_for_status(missing_status),
+                summary=(
+                    "Clearing accounts found but missing account type/subtype; cannot "
+                    "classify sales vs non-sales clearing accounts."
+                ),
+                details=[
+                    RuleResultDetail(
+                        key=acct.account_ref,
+                        message="Clearing account missing account type; cannot classify.",
+                        values={
+                            "account_name": acct.account_name,
+                            "period_end": ctx.period_end.isoformat(),
+                            "status": missing_status.value,
+                        },
+                    )
+                    for acct in type_unknown
+                ],
+                human_action="Provide account types (via Chart of Accounts) for clearing accounts.",
+            )
+
         if not accounts_to_eval:
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
-                status=RuleStatus.NEEDS_REVIEW,
-                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
-                summary=f"No clearing accounts found for period end {ctx.period_end.isoformat()}.",
+                status=RuleStatus.NOT_APPLICABLE,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
+                summary=(
+                    f"No sales clearing accounts found for period end {ctx.period_end.isoformat()}."
+                ),
                 human_action=(
                     "Configure clearing account refs for this client or confirm they do not exist, then set "
                     "acceptable variances per account (recommended)."

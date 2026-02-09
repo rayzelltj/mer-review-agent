@@ -54,8 +54,11 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
   - Zero-balance rule with configured thresholds
   - Tests: PASS / WARN / FAIL / NEEDS_REVIEW
 - [x] **BS-CLEARING-ACCOUNTS-ZERO**
-  - Zero-balance rule with name inference (`clearing`)
-  - Tests: PASS / WARN / FAIL / NEEDS_REVIEW
+  - Sales clearing accounts (Current Assets) with platform threshold tolerance
+  - Tests: PASS / WARN / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
+- [x] **BS-CLEARING-ACCOUNTS-NON-SALES-ZERO**
+  - Non-sales clearing accounts must be exactly zero
+  - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE
 - [x] **BS-PLOOTO-CLEARING-ZERO**
   - Control check: Plooto Clearing must be exactly zero
   - Tests: PASS / FAIL / NEEDS_REVIEW / NOT_APPLICABLE

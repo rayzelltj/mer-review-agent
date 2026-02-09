@@ -1,10 +1,11 @@
-# BS-CLEARING-ACCOUNTS-ZERO — Clearing accounts should be zero at period end
+# BS-CLEARING-ACCOUNTS-ZERO — Sales clearing accounts should be within tolerance at period end
 
 ## Best Practice Reference
-Clearing accounts (a $0 balance)
+Clearing accounts (sales clearing tolerance)
 
 ## Why it matters
-Clearing accounts should “wash out” at month end; lingering balances can indicate posting errors, timing issues, or unreconciled activity that misstates the Balance Sheet.
+Sales clearing accounts (typically in Current Assets) should “wash out” at month end or remain within a tolerance tied
+to platform sales; lingering balances can indicate posting errors, timing issues, or unreconciled activity.
 
 ## Sources & required data
 - QBO Balance Sheet snapshot as-of `period_end`
@@ -13,7 +14,7 @@ Clearing accounts should “wash out” at month end; lingering balances can ind
 - (Optional) P&L revenue total for `% of revenue` tolerances
 
 ## Config parameters
-Config model: `ZeroBalanceRuleConfig` (`common.rules_engine.config`)
+Config model: `ClearingAccountsZeroRuleConfig` (`common.rules_engine.config`)
 - `enabled` (bool)
 - `accounts[]` (list)
   - `account_ref` (required) — stable identifier from adapter/QBO
@@ -22,7 +23,9 @@ Config model: `ZeroBalanceRuleConfig` (`common.rules_engine.config`)
 - `default_threshold` — used when an account override has no `threshold`
 - `missing_data_policy` — when a configured account is missing from the Balance Sheet snapshot
   - `NEEDS_REVIEW` (default) or `NOT_APPLICABLE`
-- If `accounts[]` is empty, accounts are inferred by `name` containing `"clearing"` (case-insensitive)
+- `current_asset_types` — account types treated as sales clearing
+- If `accounts[]` is empty, accounts are inferred by `name` containing `"clearing"` (case-insensitive) **and**
+  account type in `current_asset_types`
 - `unconfigured_threshold_policy` — status to emit for **non-zero** balances when no thresholds are configured (TBD business policy)
   - Default: `NEEDS_REVIEW`
 - `amount_quantize` (optional) — Decimal quantization for comparisons (e.g. `"0.01"` for cents)
@@ -47,8 +50,8 @@ Reasonable options to decide later:
 ## Evaluation logic (step-by-step)
 1. If `enabled == false` → `NOT_APPLICABLE`
 2. Determine accounts to evaluate:
-   - If `accounts[]` provided → use it
-   - Else → infer accounts by name match
+   - If `accounts[]` provided → use it (only current-asset clearing accounts are in scope)
+   - Else → infer accounts by name match **and** current-asset account type
 3. For each account:
    - If account missing from Balance Sheet snapshot → `missing_data_policy`
    - Quantize amounts if `amount_quantize` configured
@@ -81,6 +84,8 @@ Reasonable options to decide later:
 - Negative balances: evaluated using `abs(balance)`
 - Revenue missing: `pct_of_revenue` component treated as 0
 - Amount rounding: only applied when `amount_quantize` is set (otherwise exact Decimal comparisons)
+- Accounts missing type/subtype data are flagged as NEEDS_REVIEW (cannot classify sales vs non-sales).
+- Non-sales clearing accounts are handled by `BS-CLEARING-ACCOUNTS-NON-SALES-ZERO`.
 
 ## Test matrix
 | Scenario | Setup | Expected |
@@ -89,5 +94,5 @@ Reasonable options to decide later:
 | Non-zero within variance | balance <= allowed | WARN / LOW |
 | Non-zero outside variance | balance > allowed | FAIL / HIGH |
 | Missing configured account | account_ref not in snapshot | NEEDS_REVIEW (or NOT_APPLICABLE if configured) |
-| No accounts found | `accounts[]` empty and no names containing “clearing” | NEEDS_REVIEW |
+| No accounts found | no sales clearing accounts | NOT_APPLICABLE |
 | Rounding boundary | `amount_quantize="0.01"`, balance `0.004` | PASS |

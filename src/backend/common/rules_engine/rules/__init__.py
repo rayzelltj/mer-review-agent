@@ -12,6 +12,7 @@ from .bs_ap_subledger_reconciles import BS_AP_SUBLEDGER_RECONCILES
 from .bs_ar_subledger_reconciles import BS_AR_SUBLEDGER_RECONCILES
 from .bs_clearing_accounts_zero import BS_CLEARING_ACCOUNTS_ZERO
 from .bs_clearing_accounts_non_sales_zero import BS_CLEARING_ACCOUNTS_NON_SALES_ZERO
+from .bs_balance_unchanged_prior_month import BS_BALANCE_UNCHANGED_PRIOR_MONTH
 from .bs_investment_balance_match import BS_INVESTMENT_BALANCE_MATCH
 from .bs_loan_balance_match import BS_LOAN_BALANCE_MATCH
 from .bs_plooto_clearing_zero import BS_PLOOTO_CLEARING_ZERO
@@ -32,6 +33,7 @@ from .bs_tax_payable_and_suspense_reconcile_to_return import (
 __all__ = [
     "BS_CLEARING_ACCOUNTS_ZERO",
     "BS_CLEARING_ACCOUNTS_NON_SALES_ZERO",
+    "BS_BALANCE_UNCHANGED_PRIOR_MONTH",
     "BS_LOAN_BALANCE_MATCH",
     "BS_INVESTMENT_BALANCE_MATCH",
     "BS_AP_AR_ITEMS_OLDER_THAN_60_DAYS",

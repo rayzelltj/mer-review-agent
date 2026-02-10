@@ -18,6 +18,7 @@ from .models import (
 class RuleContext:
     period_end: date
     balance_sheet: BalanceSheetSnapshot
+    prior_balance_sheets: tuple[BalanceSheetSnapshot, ...] = ()
     profit_and_loss: Optional[ProfitAndLossSnapshot] = None
     evidence: EvidenceBundle = field(default_factory=EvidenceBundle)
     reconciliations: tuple[ReconciliationSnapshot, ...] = ()

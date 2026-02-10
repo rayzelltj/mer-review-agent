@@ -28,6 +28,60 @@ def _parse_decimal(value: Any) -> Decimal | None:
     return None
 
 
+LOAN_DIRECTION_KEYWORDS = [
+    ("intercompany loan", "intercompany_loan"),
+    ("inter-company loan", "intercompany_loan"),
+    ("loan from", "loan_from"),
+    ("loan to", "loan_to"),
+    ("shareholder loan", "intercompany_loan"),
+    ("due from", "due_from"),
+    ("due to", "due_to"),
+    ("loan", "intercompany_loan"),
+]
+
+LOAN_DIRECTION_MAP = {
+    "due_from": "due_to",
+    "due_to": "due_from",
+    "loan_from": "loan_to",
+    "loan_to": "loan_from",
+    "intercompany_loan": "intercompany_loan",
+}
+
+
+def _expected_counterparty_direction(
+    direction: str | None,
+    mapping: dict[str, str],
+) -> str | None:
+    if direction is None:
+        return None
+    return mapping.get(direction)
+
+
+def _extract_counterparty(name: str, patterns: list[str]) -> str:
+    lower = name.lower()
+    for p in patterns:
+        idx = lower.find(p)
+        if idx != -1:
+            candidate = name[idx + len(p) :].strip()
+            if candidate:
+                return candidate
+    return name
+
+
+def _classify_direction(
+    name: str,
+    patterns: list[str],
+    keywords: list[tuple[str, str]],
+) -> tuple[str | None, str]:
+    lower = name.lower()
+    for token, kind in keywords:
+        idx = lower.find(token)
+        if idx != -1:
+            candidate = name[idx + len(token) :].strip()
+            return kind, candidate or name
+    return None, _extract_counterparty(name, patterns)
+
+
 @register_rule
 class BS_INTERCOMPANY_BALANCES_RECONCILE(Rule):
     rule_id = "BS-INTERCOMPANY-BALANCES-RECONCILE"
@@ -126,31 +180,69 @@ class BS_INTERCOMPANY_BALANCES_RECONCILE(Rule):
                 human_action="Provide intercompany loan balances from counterpart Balance Sheets.",
             )
 
-        counterpart_map: dict[str, Decimal] = {}
+        counterpart_balances: dict[tuple[str, str], Decimal] = {}
+        counterparty_kinds: dict[str, set[str]] = {}
         for item in counterpart_items:
             if not isinstance(item, dict):
                 continue
-            counterparty = str(item.get("counterparty") or item.get("company") or "").strip()
+            account_name = str(item.get("account_name") or "").strip()
+            kind, extracted_cp = (
+                _classify_direction(account_name, patterns, LOAN_DIRECTION_KEYWORDS)
+                if account_name
+                else (None, "")
+            )
+            counterparty = str(
+                item.get("company") or item.get("entity") or item.get("counterparty") or ""
+            ).strip()
+            if not counterparty:
+                counterparty = extracted_cp
             amt = _parse_decimal(item.get("balance"))
             if not counterparty or amt is None:
                 continue
-            counterpart_map[counterparty.lower()] = amt
+            if kind is None:
+                counterparty_kinds.setdefault(counterparty.lower(), set()).add("unknown")
+                continue
+            counterpart_balances[(counterparty.lower(), kind)] = amt
+            counterparty_kinds.setdefault(counterparty.lower(), set()).add(kind)
 
         mismatches = []
         details = []
         for acct in intercompany_loans:
             name = acct["account_name"]
             bal = quantize_amount(acct["balance"], cfg.amount_quantize)
-            counterparty = self._extract_counterparty(name, patterns)
-            cp_balance = counterpart_map.get((counterparty or "").lower())
+            direction, counterparty = _classify_direction(
+                name, patterns, LOAN_DIRECTION_KEYWORDS
+            )
+            expected_direction = _expected_counterparty_direction(
+                direction, LOAN_DIRECTION_MAP
+            )
+            counterparty_key = (counterparty or "").lower()
+            cp_balance = None
+            mismatch_reason = None
+            found_direction = None
+            if expected_direction is None:
+                mismatch_reason = "direction_unknown"
+            else:
+                cp_balance = counterpart_balances.get(
+                    (counterparty_key, expected_direction)
+                )
+                if cp_balance is None:
+                    kinds = counterparty_kinds.get(counterparty_key)
+                    if kinds:
+                        found_direction = sorted(kinds)[0]
+                        mismatch_reason = "direction_mismatch"
+                    else:
+                        mismatch_reason = "missing_counterparty_balance"
             if cp_balance is None:
                 mismatches.append(
                     {
                         "account_name": name,
                         "balance": str(bal),
                         "counterparty": counterparty,
+                        "expected_direction": expected_direction,
+                        "counterparty_direction": found_direction,
                         "counterparty_balance": None,
-                        "reason": "missing_counterparty_balance",
+                        "reason": mismatch_reason or "missing_counterparty_balance",
                     }
                 )
             else:
@@ -161,6 +253,8 @@ class BS_INTERCOMPANY_BALANCES_RECONCILE(Rule):
                             "account_name": name,
                             "balance": str(bal),
                             "counterparty": counterparty,
+                            "expected_direction": expected_direction,
+                            "counterparty_direction": expected_direction,
                             "counterparty_balance": str(cp_q),
                             "reason": "amount_mismatch",
                         }
@@ -177,6 +271,8 @@ class BS_INTERCOMPANY_BALANCES_RECONCILE(Rule):
                         "period_end": ctx.period_end.isoformat(),
                         "balance": str(bal),
                         "counterparty": counterparty,
+                        "expected_direction": expected_direction,
+                        "counterparty_direction": found_direction or expected_direction,
                         "counterparty_balance": str(cp_balance) if cp_balance is not None else None,
                         "status": detail_status,
                     },
@@ -222,11 +318,4 @@ class BS_INTERCOMPANY_BALANCES_RECONCILE(Rule):
         )
 
     def _extract_counterparty(self, name: str, patterns: list[str]) -> str:
-        lower = name.lower()
-        for p in patterns:
-            idx = lower.find(p)
-            if idx != -1:
-                candidate = name[idx + len(p) :].strip()
-                if candidate:
-                    return candidate
-        return name
+        return _extract_counterparty(name, patterns)

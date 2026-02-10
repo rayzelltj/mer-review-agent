@@ -144,6 +144,10 @@ class InvestmentBalanceMatchRuleConfig(RuleConfigBase):
     require_evidence_as_of_date_match_period_end: bool = True
 
 
+class BalanceUnchangedPriorMonthRuleConfig(RuleConfigBase):
+    include_zero_balances: bool = True
+
+
 class ApSubledgerReconcilesRuleConfig(RuleConfigBase):
     # QBO Balance Sheet account refs to include in the AP total.
     account_refs: List[str] = Field(default_factory=list)
@@ -224,11 +228,10 @@ class IntercompanyBalancesReconcileRuleConfig(RuleConfigBase):
     name_patterns: List[str] = Field(
         default_factory=lambda: [
             "intercompany loan",
-            "due to",
-            "due from",
             "loan from",
             "loan to",
             "shareholder loan",
+            "loan",
         ]
     )
     non_zero_only: bool = True
@@ -238,7 +241,7 @@ class IntercompanyBalancesReconcileRuleConfig(RuleConfigBase):
 class WorkingPaperReconcilesRuleConfig(RuleConfigBase):
     evidence_type: str = "working_paper_balance"
     name_patterns: List[str] = Field(
-        default_factory=lambda: ["prepaid", "deferred revenue", "accrual"]
+        default_factory=lambda: ["prepaid", "unearned", "deferred", "deferred revenue", "accrual"]
     )
     require_evidence_as_of_date_match_period_end: bool = True
 
@@ -262,6 +265,22 @@ class TaxFilingsUpToDateRuleConfig(RuleConfigBase):
         default_factory=lambda: ["no tax agency"]
     )
     delinquent_status: RuleStatus = RuleStatus.FAIL
+    account_name_patterns: List[str] = Field(
+        default_factory=lambda: [
+            "gst/hst payable",
+            "gst/hst suspense",
+            "gst/hst suspence",
+            "gst payable",
+            "gst suspense",
+            "gst suspence",
+            "hst payable",
+            "hst suspense",
+            "hst suspence",
+            "pst payable",
+            "pst suspense",
+            "pst suspence",
+        ]
+    )
 
 
 class TaxPayableAndSuspenseReconcileRuleConfig(RuleConfigBase):
@@ -283,7 +302,6 @@ class TaxPayableAndSuspenseReconcileRuleConfig(RuleConfigBase):
             "pst payable",
             "pst suspense",
             "pst suspence",
-            "sales tax",
         ]
     )
     refund_grace_days: int = 60

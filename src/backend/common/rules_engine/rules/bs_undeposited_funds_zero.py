@@ -1,10 +1,42 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from ..config import AccountThresholdOverride, ZeroBalanceRuleConfig
 from ..context import RuleContext, compute_allowed_variance, quantize_amount
 from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
+
+
+def _platform_revenue_from_pnl(
+    pnl, account_name: str
+) -> tuple[Decimal | None, list[str]]:
+    if pnl is None or not account_name:
+        return None, []
+    stopwords = {
+        "undeposited"
+    }
+    tokens = [
+        t.strip().lower()
+        for t in account_name.replace("-", " ").replace("/", " ").split()
+        if t.strip()
+    ]
+    tokens = [t for t in tokens if t not in stopwords and len(t) >= 3]
+    if not tokens:
+        return None, []
+
+    total = Decimal("0")
+    matched = False
+    for key, amount in (pnl.totals or {}).items():
+        if not isinstance(key, str) or not key.startswith("income_line:"):
+            continue
+        line_name = key.split("income_line:", 1)[1].lower()
+        if any(t in line_name for t in tokens):
+            total += amount
+            matched = True
+
+    return (total if matched else None), tokens
 
 
 @register_rule
@@ -91,12 +123,29 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
 
             threshold = acct_cfg.threshold or cfg.default_threshold
             threshold_configured = default_threshold_configured or (acct_cfg.threshold is not None)
-            allowed = compute_allowed_variance(threshold=threshold, revenue_total=revenue_total)
+            platform_revenue, platform_tokens = _platform_revenue_from_pnl(
+                ctx.profit_and_loss, acct_cfg.account_name
+            )
+            if platform_revenue is not None:
+                allowed = (abs(platform_revenue) * Decimal("0.10")).copy_abs()
+                threshold_configured = True
+                threshold_source = "platform_revenue"
+                platform_missing = False
+            else:
+                allowed = compute_allowed_variance(
+                    threshold=threshold, revenue_total=revenue_total
+                )
+                threshold_source = (
+                    "configured" if threshold_configured else "unconfigured"
+                )
+                platform_missing = len(platform_tokens) == 0
             bal_q = quantize_amount(bal, cfg.amount_quantize)
             abs_bal = abs(bal_q)
             allowed_q = quantize_amount(allowed, cfg.amount_quantize)
 
-            if abs_bal == 0:
+            if platform_missing:
+                status = RuleStatus.NEEDS_REVIEW
+            elif abs_bal == 0:
                 status = RuleStatus.PASS
             elif not threshold_configured:
                 status = cfg.unconfigured_threshold_policy
@@ -115,11 +164,17 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                         "abs_balance": str(abs_bal),
                         "allowed_variance": str(allowed_q),
                         "revenue_total": str(revenue_total) if revenue_total is not None else None,
+                        "platform_revenue": str(platform_revenue)
+                        if platform_revenue is not None
+                        else None,
+                        "platform_tokens": platform_tokens,
                         "threshold_floor_amount": str(threshold.floor_amount),
                         "threshold_pct_of_revenue": str(threshold.pct_of_revenue),
                         "status": status.value,
                         "threshold_configured": threshold_configured,
                         "inferred_by_name_match": used_name_inference,
+                        "threshold_source": threshold_source,
+                        "platform_name_missing": platform_missing,
                     },
                 )
             )
@@ -151,6 +206,11 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                 "Verify undeposited items, deposit timing, and explain any non-zero balance at period end; "
                 "adjust tolerance if warranted."
             )
+            if any(d.values.get("platform_name_missing") for d in details):
+                human_action = (
+                    "Undeposited Funds account name is generic; add the sales platform name "
+                    "(e.g., Shopify) to apply platform-based thresholds."
+                )
             if not has_any_threshold and overall != RuleStatus.PASS:
                 human_action = (
                     f"{human_action} Note: no acceptable variance was configured (TBD); "

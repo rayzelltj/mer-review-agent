@@ -112,6 +112,7 @@ class BS_INVESTMENT_BALANCE_MATCH(Rule):
 
         evidence_item = ctx.evidence.first(cfg.evidence_type)
         if evidence_item is None or evidence_item.amount is None:
+            bs_q = quantize_amount(accounts_to_eval[0][2], cfg.amount_quantize)
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
@@ -122,6 +123,21 @@ class BS_INVESTMENT_BALANCE_MATCH(Rule):
                 summary=(
                     f"Missing investment statement balance for {ctx.period_end.isoformat()}; cannot verify."
                 ),
+                details=[
+                    RuleResultDetail(
+                        key=accounts_to_eval[0][0],
+                        message="Investment balance needs statement evidence to verify.",
+                        values={
+                            "account_name": accounts_to_eval[0][1],
+                            "period_end": ctx.period_end.isoformat(),
+                            "bs_balance": str(bs_q),
+                            "evidence_type": cfg.evidence_type,
+                            "status": RuleStatus.NEEDS_REVIEW.value,
+                            "inferred_by_name_match": used_name_inference,
+                            "missing_evidence": True,
+                        },
+                    )
+                ],
                 evidence_used=[evidence_item] if evidence_item else [],
                 human_action="Request/attach the investment statement (or extracted balance) as of period end.",
             )

@@ -86,6 +86,11 @@ def _expected_period_end(
         current = next_end
 
 
+def _name_matches(name: str, patterns: list[str]) -> bool:
+    lowered = name.lower()
+    return any(pat in lowered for pat in patterns)
+
+
 @register_rule
 class BS_TAX_FILINGS_UP_TO_DATE(Rule):
     rule_id = "BS-TAX-FILINGS-UP-TO-DATE"
@@ -285,6 +290,26 @@ class BS_TAX_FILINGS_UP_TO_DATE(Rule):
         if overall_status == missing_status:
             summary = "Missing or incomplete tax return data; cannot verify filings."
 
+        account_details: list[RuleResultDetail] = []
+        account_patterns = [p.lower() for p in (cfg.account_name_patterns or [])]
+        if account_patterns:
+            for acct in ctx.balance_sheet.accounts:
+                if acct.account_ref.startswith("report::"):
+                    continue
+                if not acct.name or not _name_matches(acct.name, account_patterns):
+                    continue
+                account_details.append(
+                    RuleResultDetail(
+                        key=acct.account_ref,
+                        message="Sales tax filing cadence evaluated for related tax account.",
+                        values={
+                            "account_name": acct.name,
+                            "period_end": ctx.period_end.isoformat(),
+                            "status": overall_status.value,
+                        },
+                    )
+                )
+
         return RuleResult(
             rule_id=self.rule_id,
             rule_title=self.rule_title,
@@ -293,7 +318,7 @@ class BS_TAX_FILINGS_UP_TO_DATE(Rule):
             status=overall_status,
             severity=severity_for_status(overall_status),
             summary=summary,
-            details=details,
+            details=details + account_details,
             evidence_used=[agencies_item, returns_item],
             human_action=(
                 "File missing sales tax returns and document filing periods."

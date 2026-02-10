@@ -23,6 +23,15 @@ def _account_ref_from_name(name: str) -> str:
     return f"name::{name}"
 
 
+def _attachment_detail(result):
+    if not result.details:
+        return None
+    return next(
+        (detail for detail in result.details if detail.values.get("attachment_status") is not None),
+        None,
+    )
+
+
 def test_blackbird_paypal_aud_reconciliation_matches_attachment():
     period_end = date(2025, 11, 30)
     rec_report = _load_json("reconciliation_report_paypal_aud.json")
@@ -98,7 +107,9 @@ def test_blackbird_paypal_aud_reconciliation_matches_attachment():
         )
     )
     assert res.status == RuleStatus.PASS
-    assert res.details and res.details[0].values.get("attachment_status") == RuleStatus.PASS.value
+    attachment_detail = _attachment_detail(res)
+    assert attachment_detail is not None
+    assert attachment_detail.values.get("attachment_status") == RuleStatus.PASS.value
 
 
 def test_blackbird_paypal_cad_reconciliation_matches_attachment():
@@ -174,7 +185,9 @@ def test_blackbird_paypal_cad_reconciliation_matches_attachment():
         )
     )
     assert res.status == RuleStatus.PASS
-    assert res.details and res.details[0].values.get("attachment_status") == RuleStatus.PASS.value
+    attachment_detail = _attachment_detail(res)
+    assert attachment_detail is not None
+    assert attachment_detail.values.get("attachment_status") == RuleStatus.PASS.value
 
 
 def test_blackbird_attachment_mismatch_fails():

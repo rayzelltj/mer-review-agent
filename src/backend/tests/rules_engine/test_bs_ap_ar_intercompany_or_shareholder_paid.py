@@ -20,7 +20,15 @@ def test_intercompany_pass_when_balances_match(make_balance_sheet, make_ctx, per
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company B", "balance": "-1000"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company B",
+                            "account_name": "Due from Company A",
+                            "balance": "-1000",
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -45,7 +53,15 @@ def test_intercompany_needs_review_when_missing_counterparty(make_balance_sheet,
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company B", "balance": "500"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company B",
+                            "account_name": "Due to Company A",
+                            "balance": "500",
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -69,7 +85,15 @@ def test_intercompany_needs_review_when_mismatch(make_balance_sheet, make_ctx, p
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company D", "balance": "500"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company D",
+                            "account_name": "Intercompany Company A",
+                            "balance": "500",
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -102,7 +126,15 @@ def test_intercompany_not_applicable_when_no_accounts(make_balance_sheet, make_c
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company B", "balance": "1000"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company B",
+                            "account_name": "Due from Company A",
+                            "balance": "1000",
+                        }
+                    ]
+                },
             )
         ]
     )

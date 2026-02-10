@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 
 from common.rules_engine.context import RuleContext
@@ -29,7 +30,7 @@ def test_tax_filings_up_to_date_blackbird(period_end, make_balance_sheet):
     )
 
     result = BS_TAX_FILINGS_UP_TO_DATE().evaluate(ctx)
-    assert result.status in {RuleStatus.FAIL, RuleStatus.NEEDS_REVIEW}
+    assert result.status == RuleStatus.PASS
 
 
 def test_tax_filing_expected_period_end_quarterly():

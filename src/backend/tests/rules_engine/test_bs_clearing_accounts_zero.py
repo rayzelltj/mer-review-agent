@@ -106,10 +106,15 @@ def test_clearing_accounts_needs_review_when_not_configured(make_balance_sheet, 
 
 
 def test_clearing_accounts_name_inference_when_enabled(make_balance_sheet, make_ctx):
-    rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {"allow_name_inference": True}}
+    rule_cfg = {
+        "BS-CLEARING-ACCOUNTS-ZERO": {
+            "allow_name_inference": True,
+            "unconfigured_threshold_policy": "NEEDS_REVIEW",
+        }
+    }
     bs = make_balance_sheet(
         accounts=[
-            {"account_ref": "A1", "name": "Payroll Clearing", "type": "Bank", "balance": "0"},
+            {"account_ref": "A1", "name": "Payroll Clearing", "type": "Bank", "balance": "10"},
             {"account_ref": "A2", "name": "Other clearing", "type": "Fixed Asset", "balance": "10"},
             {"account_ref": "A3", "name": "Cash", "balance": "999"},
         ]

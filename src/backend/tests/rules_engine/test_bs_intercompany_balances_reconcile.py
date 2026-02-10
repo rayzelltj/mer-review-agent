@@ -18,7 +18,15 @@ def test_intercompany_loan_pass_when_balances_match(make_balance_sheet, make_ctx
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company B", "balance": "-1000"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company B",
+                            "account_name": "Intercompany Loan Company A",
+                            "balance": "-1000",
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -43,7 +51,15 @@ def test_intercompany_loan_needs_review_when_missing_counterparty(make_balance_s
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company B", "balance": "500"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company B",
+                            "account_name": "Loan to Company A",
+                            "balance": "500",
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -67,7 +83,15 @@ def test_intercompany_loan_needs_review_when_mismatch(make_balance_sheet, make_c
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company D", "balance": "500"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company D",
+                            "account_name": "Due from Company A (Loan)",
+                            "balance": "500",
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -87,7 +111,15 @@ def test_intercompany_loan_not_applicable_when_no_accounts(make_balance_sheet, m
                 source="fixture",
                 as_of_date=period_end,
                 amount="0",
-                meta={"items": [{"counterparty": "Company B", "balance": "1000"}]},
+                meta={
+                    "items": [
+                        {
+                            "company": "Company B",
+                            "account_name": "Intercompany Loan Company A",
+                            "balance": "1000",
+                        }
+                    ]
+                },
             )
         ]
     )

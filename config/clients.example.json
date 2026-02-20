@@ -1,0 +1,14 @@
+{
+  "clients": {
+    "example_client": {
+      "realm_id": "000000000000000",
+      "counterparties": [],
+      "drive": {
+        "root_folder_id": "",
+        "evidence_manifest_file_id": "",
+        "include_items_from_all_drives": false,
+        "supports_all_drives": true
+      }
+    }
+  }
+}

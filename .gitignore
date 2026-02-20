@@ -465,3 +465,12 @@ data/sample_code/
 # Bicep local files
 *.local*.bicepparam
 *.local*.parameters.json
+
+# Local/client-specific config and generated artifacts (do not commit)
+config/clients.json
+src/backend/config/client_aliases.json
+src/backend/.qbo_tokens.json
+data/reports/
+data/snapshots/
+docs/_discovery/
+src/backend/tests/rules_engine/fixtures/

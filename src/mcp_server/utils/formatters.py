@@ -39,7 +39,8 @@ def format_mcp_response(
     standard_instructions = (
         "Instructions: returning the output of this function call verbatim "
         "to the user in markdown. Then write AGENT SUMMARY: and then include "
-        "a summary of what you did."
+        "a summary of what you did. Never replace URLs with placeholders; copy "
+        "any URL values exactly as returned."
     )
     response_parts.append(standard_instructions)
 

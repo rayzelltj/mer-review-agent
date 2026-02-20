@@ -13,6 +13,7 @@ from services.hr_service import HRService
 from services.marketing_service import MarketingService
 from services.product_service import ProductService
 from services.tech_support_service import TechSupportService
+from services.finance_service import FinanceService
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +27,7 @@ factory.register_service(HRService())
 factory.register_service(TechSupportService())
 factory.register_service(MarketingService())
 factory.register_service(ProductService())
+factory.register_service(FinanceService())
 
 
 

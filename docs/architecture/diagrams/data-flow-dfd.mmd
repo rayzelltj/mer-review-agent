@@ -1,0 +1,98 @@
+## DFD Level 0 (Context)
+
+```mermaid
+flowchart LR
+  %% External Entities
+  U[End User (Browser)]
+  QBO[Intuit QuickBooks Online]
+  DRIVE[Google Drive (Optional)]
+
+  %% MACAE as a single process
+  MACAE((MACAE System))
+
+  %% Data stores / managed services
+  COSMOS[(Cosmos DB)]
+  SEARCH[(Azure AI Search)]
+  STORAGE[(Blob Storage)]
+  AIFOUNDRY[(Azure AI Foundry / OpenAI)]
+  KV[(Key Vault)]
+  MON[(Azure Monitor)]
+
+  %% Flows
+  U -->|"task input, approvals"| MACAE
+  MACAE -->|"UI responses, streamed status"| U
+
+  MACAE -->|"OAuth2 + REST"| QBO
+  QBO -->|"accounting data"| MACAE
+
+  MACAE -->|"OAuth2 + REST"| DRIVE
+  DRIVE -->|"documents/evidence"| MACAE
+
+  MACAE <-->|"state, configs, tokens"| COSMOS
+  MACAE <-->|"index/query"| SEARCH
+  MACAE <-->|"dataset files"| STORAGE
+  MACAE -->|"model/agent calls"| AIFOUNDRY
+  MACAE -->|"secret references"| KV
+  MACAE -->|"logs/traces/metrics"| MON
+```
+
+## DFD Level 1 (Decomposition)
+
+```mermaid
+flowchart LR
+  %% External Entities
+  U[End User (Browser)]
+  Entra[Microsoft Entra ID]
+  QBO[Intuit QBO]
+  DRIVE[Google Drive (Optional)]
+
+  %% Processes
+  P1[1. Frontend Web App\nReact UI + /config]
+  P2[2. Backend API + Orchestrator\nFastAPI + agent_framework]
+  P3[3. MCP Tool Server\nFastMCP /mcp]
+  P4[4. AI Foundry Agents + Models\nAI Services + Project]
+  P5[5. Post-Deploy Seeding\nUpload team configs + index datasets]
+
+  %% Data Stores / Managed Services
+  D1[(Cosmos DB\nmemory + plans + tokens)]
+  D2[(Azure AI Search\nindexes)]
+  D3[(Blob Storage\ncontainers)]
+  D4[(Key Vault\nsecrets)]
+  MON[(Log Analytics + App Insights)]
+
+  %% User interactions
+  U -->|HTTPS| P1
+  P1 -->|API calls + websocket| P2
+  P2 -->|status streaming| P1
+
+  %% Optional user auth
+  P1 -->|OIDC/OAuth2 (TBD)| Entra
+  P2 -->|JWT validation (TBD)| Entra
+
+  %% Orchestration and tools
+  P2 -->|MCP tool calls\nx-user-auth-token + Authorization| P3
+  P3 -->|Finance/QBO fan-out calls\nBearer token| P2
+
+  %% AI + data access
+  P2 -->|agent/model calls (MI)| P4
+  P2 <--> D1
+  P2 <--> D2
+  P2 <--> D3
+  P2 --> D4
+
+  %% External integrations
+  P2 -->|OAuth2 + REST| QBO
+  P2 -->|OAuth2 + REST| DRIVE
+
+  %% Post-deploy scripts
+  P5 -->|upload team JSON| P2
+  P5 -->|read blobs| D3
+  P5 -->|index docs| D2
+
+  %% Observability
+  P1 --> MON
+  P2 --> MON
+  P3 --> MON
+  P4 --> MON
+```
+

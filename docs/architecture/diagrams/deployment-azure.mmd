@@ -1,0 +1,88 @@
+```mermaid
+flowchart LR
+  %% Azure Deployment Topology (repo-derived from infra/main.bicep)
+
+  subgraph RG["Azure Resource Group (name: TBD)"]
+    direction LR
+
+    subgraph Identity["Identity"]
+      UAMI["User Assigned Managed Identity\nid-<solutionSuffix>"]
+    end
+
+    subgraph Compute["Compute"]
+      CAE["Container Apps Environment\ncae-<solutionSuffix>"]
+      CA_BACKEND["Container App: Backend\nca-<solutionSuffix>\nIngress: external :8000"]
+      CA_MCP["Container App: MCP\nca-mcp-<solutionSuffix>\nIngress: external :9000"]
+
+      ASP["App Service Plan (Linux)\nasp-<solutionSuffix>"]
+      WEB["Web App for Containers: Frontend\napp-<solutionSuffix>\nPort: 3000"]
+    end
+
+    subgraph AI["AI + Search"]
+      AISVC["Azure AI Foundry AI Services\n(aif-<solutionSuffix>)\nModel deployments: gpt-4.1, gpt-4.1-mini, o4-mini"]
+      AIPROJ["AI Foundry Project\n(proj-<solutionSuffix>)\nSystem MI"]
+      SRCH["Azure AI Search\nsrch-<solutionSuffix>\nPublic Network Access: Enabled (per repo)"]
+      AIFP_CONN["AI Project Connection\nMicrosoft.CognitiveServices/.../connections\n(aifp-srch-connection-<solutionSuffix>)\nAuthType: ApiKey"]
+    end
+
+    subgraph Data["Data Stores"]
+      COSMOS["Cosmos DB (SQL)\ncosmos-<solutionSuffix>\nDB: macae\nContainer: memory"]
+      ST["Storage Account (Blob)\nst<solutionSuffix>\nMultiple containers"]
+      KV["Key Vault\nkv-<solutionSuffix>\nSecret: AzureAISearchAPIKey"]
+    end
+
+    subgraph Ops["Observability"]
+      LAW["Log Analytics Workspace\nlog-<solutionSuffix> (or existing)"]
+      APPINS["Application Insights\nappi-<solutionSuffix>"]
+    end
+
+    subgraph Registry["Registry"]
+      ACR["Azure Container Registry\ncr<solutionSuffix>"]
+    end
+
+    %% Core wiring
+    WEB -->|HTTPS| CA_BACKEND
+    CA_BACKEND -->|MCP streamable-http| CA_MCP
+
+    CA_BACKEND -->|Azure SDK (MI)| COSMOS
+    CA_BACKEND -->|Azure SDK (MI)| AISVC
+    CA_BACKEND -->|Search query/index\n(API key or AAD)| SRCH
+    CA_BACKEND -->|Blob read| ST
+
+    %% AI Foundry uses a project-scoped connection to Search
+    AIPROJ --> AIFP_CONN --> SRCH
+
+    %% Key Vault secret is used as Key Vault reference for backend secret
+    KV -->|Key Vault reference| CA_BACKEND
+
+    %% Identity assignments (simplified)
+    UAMI --> CA_BACKEND
+    UAMI --> CA_MCP
+    UAMI --> WEB
+
+    %% Image pulls
+    ACR --> CA_BACKEND
+    ACR --> CA_MCP
+    ACR --> WEB
+
+    %% Diagnostics (high-level)
+    CAE --> LAW
+    CA_BACKEND --> LAW
+    CA_MCP --> LAW
+    WEB --> LAW
+    CA_BACKEND --> APPINS
+  end
+
+  %% Optional WAF-aligned private networking (enabled via infra/main.parameters.json)
+  subgraph VNET_OPT["Optional: Private Networking (WAF-aligned)"]
+    direction LR
+    VNET["Virtual Network + Subnets\nbackend / containers / webserverfarm / administration / bastion"]
+    PE["Private Endpoints\n(Cosmos, Blob, Key Vault, AI services)\n(Search PE disabled in repo)"]
+    PDNS["Private DNS Zones\n(openai, cognitiveservices, documents, blob, vault, search)"]
+    BASTION["Azure Bastion (optional)"]
+    JUMP["Jumpbox VM (optional)"]
+    VNET --> PE --> PDNS
+    BASTION --> JUMP
+  end
+```
+

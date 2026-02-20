@@ -1,0 +1,51 @@
+```mermaid
+C4Container
+title MACAE (Multi-Agent Custom Automation Engine) - Container View
+
+Person(user, "End User", "Uses browser to submit tasks and approve plans")
+
+System_Boundary(macae, "MACAE Solution Accelerator") {
+  Container(frontend, "Frontend Web App", "React + FastAPI static server", "Serves UI and exposes /config for runtime API settings")
+  Container(backend, "Backend API + Orchestrator", "Python FastAPI + agent_framework", "Runs orchestration, websocket updates, and integration APIs (QBO/Drive)")
+  Container(mcp, "MCP Tool Server", "FastMCP (streamable-http)", "Exposes tool APIs at /mcp for agents (HR/finance/etc.)")
+}
+
+System_Ext(entra, "Microsoft Entra ID", "OIDC/OAuth2", "User authentication and JWT signing keys")
+System_Ext(intuit, "Intuit QuickBooks Online (QBO)", "OAuth2 + REST", "Accounting data source for finance workflows")
+System_Ext(gdrive, "Google Drive API (Optional)", "OAuth2 + REST", "Evidence/document source")
+
+ContainerDb(cosmos, "Azure Cosmos DB (SQL API)", "Database", "Memory store, plans, team configs, QBO refresh tokens")
+ContainerDb(storage, "Azure Storage (Blob)", "Blob Containers", "Sample datasets and documents for indexing")
+ContainerDb(search, "Azure AI Search", "Search Indexes", "RAG index/query for agents and backend")
+ContainerDb(keyvault, "Azure Key Vault", "Secrets", "Stores sensitive values (e.g., Search API key) as Key Vault references")
+
+System_Ext(aifoundry, "Azure AI Foundry (AI Services + Project)", "Agents API + OpenAI models", "Model deployments and agent execution environment")
+
+System_Ext(logs, "Azure Monitor (Log Analytics + App Insights)", "Observability", "Logs, traces, metrics")
+System_Ext(acr, "Azure Container Registry", "OCI registry", "Stores container images for backend/frontend/mcp")
+
+Rel(user, frontend, "Uses UI", "HTTPS")
+Rel(frontend, backend, "Calls APIs + websocket", "HTTPS")
+
+Rel(backend, entra, "Validates user JWTs (optional)", "JWKS HTTPS")
+Rel(backend, aifoundry, "Runs agents / model calls", "Azure SDK (Managed Identity)")
+Rel(backend, cosmos, "Reads/writes state", "Azure SDK (Managed Identity)")
+Rel(backend, search, "Queries and indexes content", "API key and/or AAD (TBD)")
+Rel(backend, storage, "Reads datasets/documents", "Azure SDK (Managed Identity)")
+Rel(backend, keyvault, "Reads secrets via Key Vault references", "Managed Identity")
+Rel(backend, mcp, "Invokes tools", "MCP streamable-http")
+
+Rel(mcp, backend, "Fan-out tool calls back into backend (finance/QBO)", "HTTPS + forwarded user token")
+
+Rel(backend, intuit, "OAuth2 + QBO API calls", "HTTPS")
+Rel(backend, gdrive, "OAuth2 + Drive API calls (optional)", "HTTPS")
+
+Rel(backend, logs, "Traces/logs/metrics", "OTel + platform diagnostics")
+Rel(frontend, logs, "App Service diagnostics", "Platform diagnostics")
+Rel(mcp, logs, "Container Apps logs", "Platform diagnostics")
+
+Rel(acr, backend, "Image pull", "ACR")
+Rel(acr, frontend, "Image pull", "ACR")
+Rel(acr, mcp, "Image pull", "ACR")
+```
+

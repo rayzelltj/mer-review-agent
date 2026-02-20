@@ -1,0 +1,94 @@
+## User Authentication (Entra) and API Access
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User (Browser)
+  participant FE as Frontend Web App (App Service)
+  participant Entra as Microsoft Entra ID
+  participant BE as Backend API (Container App)
+  participant JWKS as Entra JWKS Endpoint
+
+  U->>FE: GET /
+
+  alt App Service Authentication (EasyAuth) enabled on FE
+    FE-->>U: 302 Redirect to Entra login
+    U->>Entra: Login + consent (OIDC)
+    Entra-->>U: Redirect back (session established)
+    U->>FE: GET / (authenticated session)
+    Note over U,FE: UI loads and can optionally request tokens for backend calls (TBD)
+  else SPA auth (MSAL) in the browser
+    U->>FE: Load React app
+    U->>Entra: Auth code + PKCE (OIDC/OAuth2)
+    Entra-->>U: id_token/access_token
+  else No-auth / dev mode
+    Note over U,FE: AUTH_ENABLED=false (repo default in infra/main.bicep)
+  end
+
+  U->>BE: HTTPS API call (Authorization: Bearer <token> if enabled)
+  BE->>JWKS: Fetch signing keys (if validating tokens)
+  JWKS-->>BE: JWKS
+  BE-->>U: API response (x-trace-id)
+```
+
+## Token Propagation: Backend -> MCP -> Backend (Finance/QBO)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User (Browser)
+  participant FE as Frontend UI
+  participant BE as Backend Orchestrator
+  participant AF as agent_framework Agent
+  participant MCP as MCP Server (/mcp)
+  participant BE2 as Backend API (QBO/Review endpoints)
+
+  U->>FE: Submit task
+  FE->>BE: POST /api/v4/process_request (Bearer token optional)
+  BE-->>FE: run_id + websocket process_id
+
+  Note over BE: Stores user token for tool calls (orchestration_config)
+  BE->>AF: Execute plan and agent steps
+  AF->>MCP: Invoke MCP tool (headers: x-user-auth-token + Authorization)
+
+  alt MCP auth enabled
+    MCP->>MCP: Validate JWT (JWKS/issuer/audience)
+  else MCP auth disabled
+    Note over MCP: ENABLE_AUTH=false (repo default in infra/main.bicep)
+  end
+
+  MCP->>BE2: Call backend (e.g., /api/qbo/data/*) using forwarded user token
+  BE2-->>MCP: JSON response
+  MCP-->>AF: Tool result
+  AF-->>BE: Agent output
+  BE-->>FE: Stream status via websocket
+  FE-->>U: Render progress + final result
+```
+
+## QBO OAuth2 (Intuit) Connect Flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User (Browser)
+  participant FE as Frontend UI
+  participant BE as Backend API (/api/qbo/*)
+  participant Cosmos as Cosmos DB
+  participant Intuit as Intuit OAuth/QBO
+
+  U->>FE: Click "Connect QuickBooks"
+  FE->>BE: GET /api/qbo/connect/start?client_id=...
+  BE->>Cosmos: Save oauth_state (state + user_principal_id + redirect_uri)
+  BE-->>U: 302 Redirect to Intuit authorize URL (state)
+
+  U->>Intuit: Login + consent
+  Intuit-->>U: Redirect to BE callback (code, realmId, state)
+
+  U->>BE: GET /api/qbo/connect/callback?code=...&realmId=...&state=...
+  BE->>Cosmos: Read + delete oauth_state, verify user binding
+  BE->>Intuit: Exchange code for tokens
+  Intuit-->>BE: access_token + refresh_token + expires_in
+  BE->>Cosmos: Upsert qbo_client refresh_token (keyed by user + client_id)
+  BE-->>U: Redirect back to UI / success
+```
+

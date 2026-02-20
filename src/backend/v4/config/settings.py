@@ -6,11 +6,16 @@ Handles Azure OpenAI, MCP, and environment setup (agent_framework version).
 import asyncio
 import json
 import logging
-from typing import Dict, Optional, Any
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Set
 
 from common.config.app_config import config
 from common.models.messages_af import TeamConfiguration
+from common.telemetry import current_trace_id, current_traceparent
 from fastapi import WebSocket
+from starlette.websockets import WebSocketState
 
 # agent_framework substitutes
 from agent_framework.azure import AzureOpenAIChatClient
@@ -87,11 +92,14 @@ class OrchestrationConfig:
     def __init__(self):
         # Previously Dict[str, MagenticOrchestration]; now generic workflow objects from MagenticBuilder.build()
         self.orchestrations: Dict[str, Any] = {}  # user_id -> workflow instance
+        self.agent_wrappers: Dict[str, list[Any]] = {}  # user_id -> wrapper instances
+        self.workflow_session_ids: Dict[str, str] = {}  # user_id -> active conversation session_id
         self.plans: Dict[str, MPlan] = {}  # plan_id -> plan details
         self.approvals: Dict[str, bool] = {}  # m_plan_id -> approval status (None pending)
         self.sockets: Dict[str, WebSocket] = {}  # user_id -> WebSocket
         self.clarifications: Dict[str, str] = {}  # m_plan_id -> clarification response
         self.max_rounds: int = 20  # Maximum replanning rounds
+        self.user_auth_tokens: Dict[str, str] = {}  # user_id -> latest bearer/id token
 
         # Event-driven notification system for approvals and clarifications
         self._approval_events: Dict[str, asyncio.Event] = {}
@@ -103,6 +111,27 @@ class OrchestrationConfig:
     def get_current_orchestration(self, user_id: str) -> Any:
         """Get existing orchestration workflow instance for user_id."""
         return self.orchestrations.get(user_id, None)
+
+    def set_user_auth_token(self, user_id: str, token: str | None) -> bool:
+        """Store latest user auth token. Returns True when token value changed."""
+        if not user_id:
+            return False
+
+        normalized = str(token or "").strip()
+        previous = self.user_auth_tokens.get(user_id, "")
+
+        if normalized:
+            self.user_auth_tokens[user_id] = normalized
+        else:
+            self.user_auth_tokens.pop(user_id, None)
+
+        return previous != normalized
+
+    def get_user_auth_token(self, user_id: str) -> str | None:
+        if not user_id:
+            return None
+        token = str(self.user_auth_tokens.get(user_id, "")).strip()
+        return token or None
 
     def set_approval_pending(self, plan_id: str) -> None:
         """Mark approval pending and create/reset its event."""
@@ -221,69 +250,200 @@ class OrchestrationConfig:
         self._clarification_events.pop(request_id, None)
 
 
+@dataclass
+class ActiveRunState:
+    run_id: str
+    plan_id: str
+    user_id: str
+    session_id: str
+    process_id: str
+    started_at: str
+    expires_at: str
+
+
+class RunControlConfig:
+    """Tracks one active workflow execution per user with TTL auto-release."""
+
+    def __init__(self):
+        self._runs_by_user: Dict[str, ActiveRunState] = {}
+        self._tasks_by_run: Dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+        self.ttl_seconds = int(
+            os.getenv("ORCHESTRATION_RUN_TTL_SECONDS", "1800").strip() or "1800"
+        )
+
+    async def acquire_run(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        run_id: str,
+        plan_id: str,
+        process_id: str | None = None,
+    ) -> tuple[bool, ActiveRunState]:
+        if not user_id:
+            raise ValueError("user_id is required")
+        async with self._lock:
+            self._cleanup_expired_locked()
+            existing = self._runs_by_user.get(user_id)
+            if existing:
+                return False, existing
+
+            now = datetime.now(timezone.utc)
+            state = ActiveRunState(
+                run_id=run_id,
+                plan_id=plan_id,
+                user_id=user_id,
+                session_id=session_id,
+                process_id=process_id or plan_id,
+                started_at=now.isoformat(),
+                expires_at=(now + timedelta(seconds=self.ttl_seconds)).isoformat(),
+            )
+            self._runs_by_user[user_id] = state
+            return True, state
+
+    async def get_active_run(self, user_id: str) -> ActiveRunState | None:
+        if not user_id:
+            return None
+        async with self._lock:
+            self._cleanup_expired_locked()
+            return self._runs_by_user.get(user_id)
+
+    async def release_run(self, user_id: str, run_id: str | None = None) -> None:
+        if not user_id:
+            return
+        async with self._lock:
+            existing = self._runs_by_user.get(user_id)
+            if not existing:
+                return
+            if run_id and existing.run_id != run_id:
+                return
+            self._tasks_by_run.pop(existing.run_id, None)
+            self._runs_by_user.pop(user_id, None)
+
+    async def refresh_ttl(self, user_id: str, run_id: str) -> None:
+        async with self._lock:
+            existing = self._runs_by_user.get(user_id)
+            if not existing or existing.run_id != run_id:
+                return
+            now = datetime.now(timezone.utc)
+            existing.expires_at = (now + timedelta(seconds=self.ttl_seconds)).isoformat()
+
+    async def register_task(self, *, user_id: str, run_id: str, task: asyncio.Task) -> None:
+        if not user_id:
+            return
+        async with self._lock:
+            existing = self._runs_by_user.get(user_id)
+            if not existing or existing.run_id != run_id:
+                return
+            self._tasks_by_run[run_id] = task
+
+    async def cancel_run(
+        self, *, user_id: str, run_id: str | None = None
+    ) -> tuple[bool, ActiveRunState | None, bool]:
+        task_to_cancel: asyncio.Task | None = None
+
+        async with self._lock:
+            self._cleanup_expired_locked()
+            existing = self._runs_by_user.get(user_id)
+            if not existing:
+                return False, None, False
+            if run_id and existing.run_id != run_id:
+                return False, existing, False
+
+            task_to_cancel = self._tasks_by_run.pop(existing.run_id, None)
+            self._runs_by_user.pop(user_id, None)
+
+        task_cancel_requested = False
+        if task_to_cancel and not task_to_cancel.done():
+            task_to_cancel.cancel()
+            task_cancel_requested = True
+
+        return True, existing, task_cancel_requested
+
+    def _cleanup_expired_locked(self) -> None:
+        now = datetime.now(timezone.utc)
+        expired_users = []
+        for user_id, state in self._runs_by_user.items():
+            try:
+                expires_at = datetime.fromisoformat(state.expires_at)
+            except ValueError:
+                expired_users.append(user_id)
+                continue
+            if expires_at <= now:
+                expired_users.append(user_id)
+        for user_id in expired_users:
+            state = self._runs_by_user.pop(user_id, None)
+            if state:
+                self._tasks_by_run.pop(state.run_id, None)
+
+
 class ConnectionConfig:
     """Connection manager for WebSocket connections."""
 
     def __init__(self):
-        self.connections: Dict[str, WebSocket] = {}
-        self.user_to_process: Dict[str, str] = {}
+        self.connections: Dict[str, Set[WebSocket]] = {}
+        self.user_to_processes: Dict[str, Set[str]] = {}
 
-    def add_connection(self, process_id: str, connection: WebSocket, user_id: str = None):
-        """Add or replace a connection for a process/user."""
-        if process_id in self.connections:
-            try:
-                asyncio.create_task(self.connections[process_id].close())
-            except Exception as e:
-                logger.error("Error closing existing connection for process %s: %s", process_id, e)
-
-        self.connections[process_id] = connection
-
+    def add_connection(self, process_id: str, connection: WebSocket, user_id: str | None = None):
+        """Add a connection for a process/user without dropping existing connections."""
+        process_id = str(process_id)
+        self.connections.setdefault(process_id, set()).add(connection)
         if user_id:
             user_id = str(user_id)
-            old_process_id = self.user_to_process.get(user_id)
-            if old_process_id and old_process_id != process_id:
-                old_conn = self.connections.get(old_process_id)
-                if old_conn:
-                    try:
-                        asyncio.create_task(old_conn.close())
-                        del self.connections[old_process_id]
-                        logger.info("Closed old connection %s for user %s", old_process_id, user_id)
-                    except Exception as e:
-                        logger.error("Error closing old connection for user %s: %s", user_id, e)
-
-            self.user_to_process[user_id] = process_id
-            logger.info("WebSocket connection added for process: %s (user: %s)", process_id, user_id)
+            self.user_to_processes.setdefault(user_id, set()).add(process_id)
+            logger.info(
+                "WebSocket connection added process=%s user=%s total_process_sockets=%d",
+                process_id,
+                user_id,
+                len(self.connections.get(process_id, set())),
+            )
         else:
-            logger.info("WebSocket connection added for process: %s", process_id)
+            logger.info("WebSocket connection added process=%s", process_id)
 
-    def remove_connection(self, process_id: str):
-        """Remove a connection and associated user mapping."""
+    def remove_connection(self, process_id: str, connection: WebSocket | None = None):
+        """Remove one or all connections for a process and clean user mappings."""
         process_id = str(process_id)
-        self.connections.pop(process_id, None)
-        for user_id, mapped in list(self.user_to_process.items()):
-            if mapped == process_id:
-                del self.user_to_process[user_id]
-                logger.debug("Removed user mapping: %s -> %s", user_id, process_id)
-                break
+        socket_set = self.connections.get(process_id)
+        if not socket_set:
+            return
 
-    def get_connection(self, process_id: str):
-        """Fetch a connection by process_id."""
-        return self.connections.get(process_id)
+        if connection is not None:
+            socket_set.discard(connection)
 
-    async def close_connection(self, process_id: str):
-        """Close and remove a connection by process_id."""
-        connection = self.get_connection(process_id)
-        if connection:
+        if connection is None or not socket_set:
+            self.connections.pop(process_id, None)
+            for user_id, processes in list(self.user_to_processes.items()):
+                if process_id in processes:
+                    processes.discard(process_id)
+                if not processes:
+                    self.user_to_processes.pop(user_id, None)
+
+    def get_connections(self, process_id: str) -> Set[WebSocket]:
+        """Fetch active sockets by process_id."""
+        return set(self.connections.get(str(process_id), set()))
+
+    async def close_connection(self, process_id: str, connection: WebSocket | None = None):
+        """Close one or all sockets by process_id."""
+        process_id = str(process_id)
+        sockets = (
+            {connection}
+            if connection is not None
+            else set(self.connections.get(process_id, set()))
+        )
+        if not sockets:
+            logger.debug("No connection found for process_id=%s", process_id)
+            self.remove_connection(process_id, connection=connection)
+            return
+
+        for ws in sockets:
             try:
-                await connection.close()
-                logger.info("Connection closed for process ID: %s", process_id)
-            except Exception as e:
-                logger.error("Error closing connection for %s: %s", process_id, e)
-        else:
-            logger.warning("No connection found for process ID: %s", process_id)
-
-        self.remove_connection(process_id)
-        logger.info("Connection removed for process ID: %s", process_id)
+                if ws.client_state != WebSocketState.DISCONNECTED:
+                    await ws.close()
+            except Exception as exc:
+                logger.debug("Error closing websocket process=%s: %s", process_id, exc)
+            finally:
+                self.remove_connection(process_id, connection=ws)
 
     async def send_status_update_async(
         self,
@@ -291,15 +451,9 @@ class ConnectionConfig:
         user_id: str,
         message_type: WebsocketMessageType = WebsocketMessageType.SYSTEM_MESSAGE,
     ):
-        """Send a status update to a user via its mapped process connection."""
+        """Send a status update to all active user sockets."""
         if not user_id:
             logger.warning("No user_id provided for WebSocket message")
-            return
-
-        process_id = self.user_to_process.get(user_id)
-        if not process_id:
-            logger.warning("No active WebSocket process found for user ID: %s", user_id)
-            logger.debug("Available user mappings: %s", list(self.user_to_process.keys()))
             return
 
         try:
@@ -315,30 +469,62 @@ class ConnectionConfig:
             logger.error("Error processing message data: %s", e)
             message_data = str(message)
 
-        payload = {"type": message_type, "data": message_data}
-        connection = self.get_connection(process_id)
-        if connection:
-            try:
-                await connection.send_text(json.dumps(payload, default=str))
-                logger.debug("Message sent to user %s via process %s", user_id, process_id)
-            except Exception as e:
-                logger.error("Failed to send message to user %s: %s", user_id, e)
-                self.remove_connection(process_id)
-        else:
-            logger.warning("No connection found for process ID: %s (user: %s)", process_id, user_id)
-            self.user_to_process.pop(user_id, None)
+        process_ids = set(self.user_to_processes.get(user_id, set()))
+        if not process_ids and isinstance(message_data, dict):
+            process_fallback = str(
+                message_data.get("process_id") or message_data.get("plan_id") or ""
+            ).strip()
+            if process_fallback and process_fallback in self.connections:
+                process_ids.add(process_fallback)
+                logger.info(
+                    "Using process-id fallback for websocket delivery user=%s process=%s",
+                    user_id,
+                    process_fallback,
+                )
+
+        if not process_ids:
+            logger.warning("No active WebSocket process found for user ID: %s", user_id)
+            logger.debug("Available user mappings: %s", list(self.user_to_processes.keys()))
+            return
+
+        payload = {
+            "type": message_type,
+            "data": message_data,
+            "meta": {
+                "trace_id": current_trace_id(),
+                "traceparent": current_traceparent(),
+            },
+        }
+
+        stale_processes: set[str] = set()
+        for process_id in list(process_ids):
+            process_sockets = self.get_connections(process_id)
+            if not process_sockets:
+                stale_processes.add(process_id)
+                continue
+            for ws in process_sockets:
+                try:
+                    await ws.send_text(json.dumps(payload, default=str))
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send websocket message user=%s process=%s: %s",
+                        user_id,
+                        process_id,
+                        exc,
+                    )
+                    self.remove_connection(process_id, connection=ws)
+
+        for process_id in stale_processes:
+            self.remove_connection(process_id)
 
     def send_status_update(self, message: str, process_id: str):
         """Sync helper to send a message by process_id."""
         process_id = str(process_id)
-        connection = self.get_connection(process_id)
-        if connection:
+        for connection in self.get_connections(process_id):
             try:
                 asyncio.create_task(connection.send_text(message))
             except Exception as e:
                 logger.error("Failed to send message to process %s: %s", process_id, e)
-        else:
-            logger.warning("No connection found for process ID: %s", process_id)
 
 
 class TeamConfig:
@@ -360,5 +546,6 @@ class TeamConfig:
 azure_config = AzureConfig()
 mcp_config = MCPConfig()
 orchestration_config = OrchestrationConfig()
+run_control_config = RunControlConfig()
 connection_config = ConnectionConfig()
 team_config = TeamConfig()

@@ -105,11 +105,13 @@ def make_ctx(period_end):
         profit_and_loss: ProfitAndLossSnapshot | None = None,
         evidence: EvidenceBundle | None = None,
         reconciliations: tuple[ReconciliationSnapshot, ...] = (),
+        prior_balance_sheets: tuple[BalanceSheetSnapshot, ...] = (),
     ) -> RuleContext:
         cfg = ClientRulesConfig(rules=client_rules)
         return RuleContext(
             period_end=period_end,
             balance_sheet=balance_sheet,
+            prior_balance_sheets=prior_balance_sheets,
             profit_and_loss=profit_and_loss,
             evidence=evidence or EvidenceBundle(),
             reconciliations=reconciliations,

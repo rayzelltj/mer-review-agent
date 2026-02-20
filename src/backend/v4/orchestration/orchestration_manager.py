@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import uuid
+import time
 from typing import List, Optional
 
 # agent_framework imports
@@ -19,7 +19,9 @@ from agent_framework import (
 )
 
 from common.config.app_config import config
-from common.models.messages_af import TeamConfiguration
+from common.database.database_factory import DatabaseFactory
+from common.models.messages_af import PlanStatus, TeamConfiguration
+from common.telemetry import traced_phase
 
 from common.database.database_base import DatabaseBase
 
@@ -28,7 +30,7 @@ from v4.callbacks.response_handlers import (
     agent_response_callback,
     streaming_agent_response_callback,
 )
-from v4.config.settings import connection_config, orchestration_config
+from v4.config.settings import connection_config, orchestration_config, run_control_config
 from v4.models.messages import WebsocketMessageType
 from v4.orchestration.human_approval_manager import HumanApprovalMagenticManager
 from v4.magentic_agents.magentic_agent_factory import MagenticAgentFactory
@@ -170,6 +172,20 @@ class OrchestrationManager:
         """
         current = orchestration_config.get_current_orchestration(user_id)
         if current is None or team_switched:
+            orchestration_config.workflow_session_ids.pop(user_id, None)
+            existing_wrappers = orchestration_config.agent_wrappers.pop(user_id, [])
+            for wrapper in existing_wrappers:
+                close_coro = getattr(wrapper, "close", None)
+                if callable(close_coro):
+                    try:
+                        await close_coro()
+                    except Exception as e:
+                        cls.logger.warning(
+                            "Error closing prior wrapper agent for user '%s': %s",
+                            user_id,
+                            e,
+                        )
+
             if current is not None and team_switched:
                 cls.logger.info(
                     "Team switched, closing previous agents for user '%s'", user_id
@@ -190,11 +206,18 @@ class OrchestrationManager:
 
             factory = MagenticAgentFactory(team_service=team_service)
             try:
-                agents = await factory.get_agents(
-                    user_id=user_id,
-                    team_config_input=team_config,
-                    memory_store=team_service.memory_context,
-                )
+                user_auth_token = orchestration_config.get_user_auth_token(user_id)
+                with traced_phase(
+                    "orchestration.team_assembly",
+                    logger=cls.logger,
+                    attributes={"user.id": user_id, "team.id": team_config.team_id},
+                ):
+                    agents = await factory.get_agents(
+                        user_id=user_id,
+                        team_config_input=team_config,
+                        memory_store=team_service.memory_context,
+                        user_auth_token=user_auth_token,
+                    )
                 cls.logger.info("Created %d agents for user '%s'", len(agents), user_id)
             except Exception as e:
                 cls.logger.error(
@@ -204,11 +227,17 @@ class OrchestrationManager:
                 raise
             try:
                 cls.logger.info("Initializing new orchestration for user '%s'", user_id)
-                orchestration_config.orchestrations[user_id] = (
-                    await cls.init_orchestration(
-                        agents, team_config, team_service.memory_context, user_id
+                with traced_phase(
+                    "orchestration.workflow_init",
+                    logger=cls.logger,
+                    attributes={"user.id": user_id, "team.id": team_config.team_id},
+                ):
+                    orchestration_config.orchestrations[user_id] = (
+                        await cls.init_orchestration(
+                            agents, team_config, team_service.memory_context, user_id
+                        )
                     )
-                )
+                    orchestration_config.agent_wrappers[user_id] = list(agents)
             except Exception as e:
                 cls.logger.error(
                     "Failed to initialize orchestration for user '%s': %s", user_id, e
@@ -220,197 +249,272 @@ class OrchestrationManager:
     # ---------------------------
     # Execution
     # ---------------------------
-    async def run_orchestration(self, user_id: str, input_task) -> None:
+    async def run_orchestration(
+        self,
+        user_id: str,
+        input_task,
+        plan_id: str,
+        run_id: str,
+    ) -> None:
         """
         Execute the Magentic workflow for the provided user and task description.
         """
-        job_id = str(uuid.uuid4())
-        orchestration_config.set_approval_pending(job_id)
         self.logger.info(
-            "Starting orchestration job '%s' for user '%s'", job_id, user_id
+            "Starting orchestration job run_id=%s plan_id=%s user=%s",
+            run_id,
+            plan_id,
+            user_id,
         )
 
         workflow = orchestration_config.get_current_orchestration(user_id)
         if workflow is None:
-            raise ValueError("Orchestration not initialized for user.")
-        # Fresh thread per participant to avoid cross-run state bleed
+            self.logger.warning(
+                "Orchestration missing for user=%s; attempting lazy initialization.",
+                user_id,
+            )
+            bootstrap_store = await DatabaseFactory.get_database(user_id=user_id)
+            user_current_team = await bootstrap_store.get_current_team(user_id=user_id)
+            if not user_current_team:
+                raise ValueError("Orchestration not initialized and no current team is set.")
+
+            team_service = TeamService(bootstrap_store)
+            team_configuration = await team_service.get_team_configuration(
+                user_current_team.team_id,
+                user_id,
+            )
+            if not team_configuration:
+                raise ValueError(
+                    f"Unable to initialize orchestration. Team '{user_current_team.team_id}' not found."
+                )
+
+            workflow = await self.get_current_or_new_orchestration(
+                user_id=user_id,
+                team_config=team_configuration,
+                team_switched=False,
+                team_service=team_service,
+            )
+            if workflow is None:
+                raise ValueError("Orchestration initialization failed for user.")
+        session_id = str(getattr(input_task, "session_id", "") or "")
+        previous_session_id = orchestration_config.workflow_session_ids.get(user_id)
+        reset_executor_state = previous_session_id != session_id
+        orchestration_config.workflow_session_ids[user_id] = session_id
+
         executors = getattr(workflow, "executors", {})
         self.logger.debug("Executor keys at run start: %s", list(executors.keys()))
 
-        for exec_key, executor in executors.items():
-            try:
-                if exec_key == "magentic_orchestrator":
-                    # Orchestrator path
-                    if hasattr(executor, "_conversation"):
-                        conv = getattr(executor, "_conversation")
-                        # Support list-like or custom container with clear()
-                        if hasattr(conv, "clear") and callable(conv.clear):
-                            conv.clear()
-                            self.logger.debug(
-                                "Cleared orchestrator conversation (%s)", exec_key
-                            )
-                        elif isinstance(conv, list):
-                            conv[:] = []
-                            self.logger.debug(
-                                "Emptied orchestrator conversation list (%s)", exec_key
-                            )
+        if reset_executor_state:
+            with traced_phase(
+                "orchestration.executor_reset",
+                logger=self.logger,
+                attributes={
+                    "run.id": run_id,
+                    "plan.id": plan_id,
+                    "user.id": user_id,
+                    "session.id": session_id,
+                },
+            ):
+                for exec_key, executor in executors.items():
+                    try:
+                        if exec_key == "magentic_orchestrator":
+                            if hasattr(executor, "_conversation"):
+                                conv = getattr(executor, "_conversation")
+                                if hasattr(conv, "clear") and callable(conv.clear):
+                                    conv.clear()
+                                elif isinstance(conv, list):
+                                    conv[:] = []
                         else:
-                            self.logger.debug(
-                                "Orchestrator conversation not clearable type (%s): %s",
-                                exec_key,
-                                type(conv),
-                            )
-                    else:
-                        self.logger.debug(
-                            "Orchestrator has no _conversation attribute (%s)", exec_key
+                            if hasattr(executor, "_chat_history"):
+                                hist = getattr(executor, "_chat_history")
+                                if hasattr(hist, "clear") and callable(hist.clear):
+                                    hist.clear()
+                                elif isinstance(hist, list):
+                                    hist[:] = []
+                    except Exception as e:
+                        self.logger.warning(
+                            "Failed clearing state for executor %s: %s", exec_key, e
                         )
-                else:
-                    # Agent path
-                    if hasattr(executor, "_chat_history"):
-                        hist = getattr(executor, "_chat_history")
-                        if hasattr(hist, "clear") and callable(hist.clear):
-                            hist.clear()
-                            self.logger.debug(
-                                "Cleared agent chat history (%s)", exec_key
-                            )
-                        elif isinstance(hist, list):
-                            hist[:] = []
-                            self.logger.debug(
-                                "Emptied agent chat history list (%s)", exec_key
-                            )
-                        else:
-                            self.logger.debug(
-                                "Agent chat history not clearable type (%s): %s",
-                                exec_key,
-                                type(hist),
-                            )
-                    else:
-                        self.logger.debug(
-                            "Agent executor has no _chat_history attribute (%s)",
-                            exec_key,
-                        )
-            except Exception as e:
-                self.logger.warning(
-                    "Failed clearing state for executor %s: %s", exec_key, e
-                )
-        # --- END NEW BLOCK ---
+        else:
+            self.logger.info(
+                "Continuing orchestration conversation in existing session user=%s session=%s run_id=%s",
+                user_id,
+                session_id,
+                run_id,
+            )
 
         # Build task from input (same as old version)
         task_text = getattr(input_task, "description", str(input_task))
         self.logger.debug("Task: %s", task_text)
+        final_text = ""
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
 
         try:
-            # Execute workflow using run_stream with task as positional parameter
-            # The execution settings are configured in the manager/client
+            start_ts = time.perf_counter()
             final_output: str | None = None
+            self.logger.info(
+                "Starting workflow execution user=%s session=%s run_id=%s",
+                user_id,
+                session_id,
+                run_id,
+            )
+            with traced_phase(
+                "orchestration.workflow_stream",
+                logger=self.logger,
+                attributes={"run.id": run_id, "plan.id": plan_id, "user.id": user_id},
+            ):
+                async for event in workflow.run_stream(task_text):
+                    await run_control_config.refresh_ttl(user_id=user_id, run_id=run_id)
+                    try:
+                        if isinstance(event, MagenticOrchestratorMessageEvent):
+                            message_text = getattr(event.message, "text", "")
+                            self.logger.info("[ORCHESTRATOR:%s] %s", event.kind, message_text)
 
-            self.logger.info("Starting workflow execution...")
-            async for event in workflow.run_stream(task_text):
-                try:
-                    # Handle orchestrator messages (task assignments, coordination)
-                    if isinstance(event, MagenticOrchestratorMessageEvent):
-                        message_text = getattr(event.message, "text", "")
-                        self.logger.info(f"[ORCHESTRATOR:{event.kind}] {message_text}")
-
-                    # Handle streaming updates from agents
-                    elif isinstance(event, MagenticAgentDeltaEvent):
-                        try:
-                            await streaming_agent_response_callback(
-                                event.agent_id,
-                                event,  # Pass the event itself as the update object
-                                False,  # Not final yet (streaming in progress)
-                                user_id,
-                            )
-                        except Exception as e:
-                            self.logger.error(
-                                f"Error in streaming callback for agent {event.agent_id}: {e}"
-                            )
-
-                    # Handle final agent messages (complete response)
-                    elif isinstance(event, MagenticAgentMessageEvent):
-                        if event.message:
+                        elif isinstance(event, MagenticAgentDeltaEvent):
                             try:
-                                agent_response_callback(
-                                    event.agent_id, event.message, user_id
+                                await streaming_agent_response_callback(
+                                    event.agent_id,
+                                    event,
+                                    False,
+                                    user_id,
                                 )
                             except Exception as e:
                                 self.logger.error(
-                                    f"Error in agent callback for agent {event.agent_id}: {e}"
+                                    "Error in streaming callback for agent %s: %s",
+                                    event.agent_id,
+                                    e,
                                 )
 
-                    # Handle final result from the entire workflow
-                    elif isinstance(event, MagenticFinalResultEvent):
-                        final_text = getattr(event.message, "text", "")
-                        self.logger.info(
-                            f"[FINAL RESULT] Length: {len(final_text)} chars"
+                        elif isinstance(event, MagenticAgentMessageEvent):
+                            if event.message:
+                                try:
+                                    agent_response_callback(
+                                        event.agent_id, event.message, user_id
+                                    )
+                                except Exception as e:
+                                    self.logger.error(
+                                        "Error in agent callback for agent %s: %s",
+                                        event.agent_id,
+                                        e,
+                                    )
+
+                        elif isinstance(event, MagenticFinalResultEvent):
+                            final_text = getattr(event.message, "text", "")
+                            self.logger.info("[FINAL RESULT] length=%d", len(final_text))
+
+                        elif isinstance(event, WorkflowOutputEvent):
+                            output_data = event.data
+                            if isinstance(output_data, ChatMessage):
+                                final_output = getattr(output_data, "text", None) or str(
+                                    output_data
+                                )
+                            else:
+                                final_output = str(output_data)
+
+                    except Exception as e:
+                        self.logger.error(
+                            "Error processing event %s: %s",
+                            type(event).__name__,
+                            e,
+                            exc_info=True,
                         )
 
-                    # Handle workflow output event (captures final result)
-                    elif isinstance(event, WorkflowOutputEvent):
-                        output_data = event.data
-                        if isinstance(output_data, ChatMessage):
-                            final_output = getattr(output_data, "text", None) or str(
-                                output_data
-                            )
-                        else:
-                            final_output = str(output_data)
-                        self.logger.debug("Received workflow output event")
-
-                except Exception as e:
-                    self.logger.error(
-                        f"Error processing event {type(event).__name__}: {e}",
-                        exc_info=True,
-                    )
-
-            # Extract final result
-            final_text = final_output if final_output else ""
-
-            # Log results
-            self.logger.info("\nAgent responses:")
+            final_text = final_output if final_output else final_text
             self.logger.info(
-                "Orchestration completed. Final result length: %d chars",
+                "Orchestration finished user=%s run_id=%s duration_s=%.2f final_len=%d",
+                user_id,
+                run_id,
+                time.perf_counter() - start_ts,
                 len(final_text),
             )
-            self.logger.info("\nFinal result:\n%s", final_text)
-            self.logger.info("=" * 50)
 
-            # Send final result via WebSocket
             await connection_config.send_status_update_async(
                 {
-                    "type": WebsocketMessageType.FINAL_RESULT_MESSAGE,
-                    "data": {
-                        "content": final_text,
-                        "status": "completed",
-                        "timestamp": asyncio.get_event_loop().time(),
-                    },
+                    "content": final_text,
+                    "status": "completed",
+                    "timestamp": asyncio.get_event_loop().time(),
+                    "plan_id": plan_id,
+                    "run_id": run_id,
                 },
                 user_id,
                 message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
             )
-            self.logger.info("Final result sent via WebSocket to user '%s'", user_id)
 
-        except Exception as e:
-            # Error handling
-            self.logger.error("Unexpected orchestration error: %s", e, exc_info=True)
-            self.logger.error("Error type: %s", type(e).__name__)
-            if hasattr(e, "__dict__"):
-                self.logger.error("Error attributes: %s", e.__dict__)
-            self.logger.info("=" * 50)
+            plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+            if plan:
+                plan.overall_status = PlanStatus.completed
+                plan.streaming_message = final_text
+                await memory_store.update_plan(plan)
 
-            # Send error status to user
+        except asyncio.CancelledError:
+            cancel_message = "Run cancelled by user."
+            self.logger.info(
+                "Orchestration cancelled user=%s run_id=%s plan_id=%s",
+                user_id,
+                run_id,
+                plan_id,
+            )
+            try:
+                plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+                if plan and plan.overall_status != PlanStatus.canceled:
+                    plan.overall_status = PlanStatus.canceled
+                    plan.streaming_message = cancel_message
+                    await memory_store.update_plan(plan)
+            except Exception as status_error:
+                self.logger.warning(
+                    "Unable to mark canceled status for plan_id=%s: %s",
+                    plan_id,
+                    status_error,
+                )
+
             try:
                 await connection_config.send_status_update_async(
                     {
-                        "type": WebsocketMessageType.FINAL_RESULT_MESSAGE,
-                        "data": {
-                            "content": f"Error during orchestration: {str(e)}",
-                            "status": "error",
-                            "timestamp": asyncio.get_event_loop().time(),
-                        },
+                        "content": cancel_message,
+                        "status": "canceled",
+                        "timestamp": asyncio.get_event_loop().time(),
+                        "plan_id": plan_id,
+                        "run_id": run_id,
+                    },
+                    user_id,
+                    message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
+                )
+            except Exception as send_error:
+                self.logger.warning(
+                    "Unable to send canceled status for run_id=%s: %s",
+                    run_id,
+                    send_error,
+                )
+            raise
+        except Exception as e:
+            self.logger.error("Unexpected orchestration error: %s", e, exc_info=True)
+            try:
+                await connection_config.send_status_update_async(
+                    {
+                        "content": f"Error during orchestration: {str(e)}",
+                        "status": "error",
+                        "timestamp": asyncio.get_event_loop().time(),
+                        "plan_id": plan_id,
+                        "run_id": run_id,
                     },
                     user_id,
                     message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
                 )
             except Exception as send_error:
                 self.logger.error("Failed to send error status: %s", send_error)
+
+            try:
+                plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+                if plan:
+                    plan.overall_status = PlanStatus.failed
+                    plan.streaming_message = f"Error during orchestration: {str(e)}"
+                    await memory_store.update_plan(plan)
+            except Exception as status_error:
+                self.logger.warning(
+                    "Unable to mark failed status for plan_id=%s: %s",
+                    plan_id,
+                    status_error,
+                )
             raise
+        finally:
+            await run_control_config.release_run(user_id=user_id, run_id=run_id)
+            self.logger.info("Released run lock user=%s run_id=%s", user_id, run_id)

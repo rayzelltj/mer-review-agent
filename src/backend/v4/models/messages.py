@@ -186,6 +186,9 @@ class WebsocketMessageType(str, Enum):
     """Types of WebSocket messages."""
     SYSTEM_MESSAGE = "system_message"
     AGENT_MESSAGE = "agent_message"
+    # Sub-agents return structured JSON internally; the UI treats this type as
+    # non-renderable so it will never display raw intermediate agent text.
+    INTERNAL_AGENT_MESSAGE = "internal_agent_message"
     AGENT_STREAM_START = "agent_stream_start"
     AGENT_STREAM_END = "agent_stream_end"
     AGENT_MESSAGE_STREAMING = "agent_message_streaming"

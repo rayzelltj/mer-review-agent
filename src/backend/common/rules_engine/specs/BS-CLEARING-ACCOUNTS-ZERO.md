@@ -1,56 +1,61 @@
-# BS-CLEARING-ACCOUNTS-ZERO — Sales clearing accounts should be within tolerance at period end
+# BS-CLEARING-ACCOUNTS-ZERO — Sales clearing accounts should be within threshold at period end
 
 ## Intent
-Sales clearing accounts (typically in Current Assets) should “wash out” to $0 at the MER period end, or stay within
-an allowed variance tied to platform sales. Non-zero balances require explanation or correction.
+Any Balance Sheet account under assets whose name contains `clearing` is treated as a sales clearing account.  
+The account should clear to zero, with a bounded variance tied to platform revenue and prior-month variance.
 
 ## Inputs (required)
 - `BalanceSheetSnapshot` at `period_end`
-  - for each configured clearing account: `account_ref`, `balance`
+  - account `account_ref`, `name`, `type`, `balance`
 - `ClientRulesConfig` for this rule
-  - list of clearing accounts to evaluate
 
 ## Inputs (optional)
-- `ProfitAndLossSnapshot` revenue total (`totals["revenue"]`)
-  - used only if you configure `% of revenue` tolerances
+- `ProfitAndLossSnapshot` with platform revenue lines (`totals["income_line:*"]`)
+- `prior_balance_sheets` in `RuleContext`
+  - latest snapshot before `period_end` is used for prior-month variance value
 
 ## Config (knobs)
 Config model: `ClearingAccountsZeroRuleConfig`
 - `enabled` (default true)
-- `accounts[]`: the clearing accounts to evaluate (stable `account_ref`s)
-- `current_asset_types`: account types treated as sales clearing (defaults to Bank, Accounts Receivable, Other Current Asset, Cash and Cash Equivalents)
-- `default_threshold` and per-account `threshold`:
-  - `floor_amount` (absolute tolerance)
-  - `pct_of_revenue` (e.g. `0.001` = 0.1% of revenue)
-- `missing_data_policy`: what to do if an expected account is missing in the snapshot (`NEEDS_REVIEW` or `NOT_APPLICABLE`)
+- `accounts[]` (optional explicit account refs)
+- `current_asset_types` (asset classifications eligible for this rule)
+- `missing_data_policy` (`NEEDS_REVIEW` or `NOT_APPLICABLE`)
 
-### Fallback (when not configured)
-If `accounts[]` is empty/missing, the rule falls back to evaluating Balance Sheet accounts whose `name`
-contains `"clearing"` (case-insensitive) **and** whose account type is one of `current_asset_types`.
+When `accounts[]` is empty, accounts are inferred by name match (`"clearing"`) and asset classification.
 
 ## Decision table
-- NOT_APPLICABLE: `enabled == false`
-- NEEDS_REVIEW:
-  - one or more configured accounts missing from the Balance Sheet and `missing_data_policy == NEEDS_REVIEW`
-  - one or more clearing accounts lack account type data (cannot classify sales vs non-sales)
-- PASS: all sales clearing accounts have `abs(balance) == 0`
-- WARN: at least one configured clearing account has `0 < abs(balance) <= allowed_variance`, and none exceed allowed variance
-- FAIL: at least one configured clearing account has `abs(balance) > allowed_variance`
+- `NOT_APPLICABLE`
+  - `enabled == false`, or no eligible sales clearing accounts found
+- `NEEDS_REVIEW`
+  - account missing from Balance Sheet and `missing_data_policy == NEEDS_REVIEW`
+  - clearing account has missing account type/subtype (cannot classify under assets)
+  - account name is generic (no platform token), e.g. `Clearing Account`
+  - platform revenue mapping not found in P&L (`income_line:*`)
+- `PASS`
+  - all evaluated accounts have `abs(balance) == 0` and naming/mapping checks pass
+- `WARN`
+  - at least one account has `0 < abs(balance) <= allowed_variance`, none exceed
+- `FAIL`
+  - at least one account has `abs(balance) > allowed_variance`
+
+## Allowed variance formula
+`allowed_variance = (10% * abs(platform_revenue)) + (3% * abs(previous_month_variance_value))`
 
 Where:
-- `allowed_variance = max(floor_amount, abs(revenue_total) * pct_of_revenue)`
-- if revenue is missing → the revenue component is treated as `0`, so `allowed_variance = floor_amount`
+- `platform_revenue` is summed from matched `income_line:*` P&L rows based on account-name tokens.
+- `previous_month_variance_value` is the latest prior-period absolute balance for the same account ref.
+- If prior snapshot/account is missing, prior-month component defaults to `0` and is flagged in detail payload.
 
-## Edge cases
-- Missing `ProfitAndLossSnapshot` or missing `totals["revenue"]` → tolerance becomes floor-only.
-- Negative balances are evaluated using `abs(balance)`.
-- Non-sales clearing accounts are handled by `BS-CLEARING-ACCOUNTS-NON-SALES-ZERO`.
+## Naming requirement
+Sales clearing account names must include the associated sales platform/channel (e.g. `Etsy Clearing Account`).  
+Generic names trigger `NEEDS_REVIEW` with explicit review comment.
 
 ## Output expectations
-- One `RuleResult.details[]` entry per configured account, including:
-  - `balance`, `allowed_variance`, threshold values, and per-account status
-- `human_action` is set for `WARN`, `FAIL`, and `NEEDS_REVIEW`.
+- One `details[]` row per evaluated account including:
+  - `platform_revenue`, `previous_month_variance_value`, component rates/amounts
+  - `allowed_variance`
+  - `allowed_variance_calculation` (numeric formula trace)
+  - naming/mapping review flags and comment
 
 ## Tests
 - `src/backend/tests/rules_engine/test_bs_clearing_accounts_zero.py`
-- Covered cases: PASS, WARN, FAIL, missing-account → NEEDS_REVIEW

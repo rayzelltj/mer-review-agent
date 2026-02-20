@@ -42,11 +42,11 @@ evidence pipeline, and end-to-end flow. It is meant to be updated as you add rea
 
 All listed rules are implemented in `src/backend/common/rules_engine/rules/` and documented under `docs/rules/balance_sheet/`.
 
-- [x] **BS-BANK-RECONCILED-THROUGH-PERIOD-END**
-  - Requires reconciliation snapshots + **statement attachment** evidence
-  - Requires register balance vs Balance Sheet tie-out
-  - Requires maintenance count check vs inferred bank/cc accounts
-  - Tests: PASS / FAIL / NEEDS_REVIEW cases
+- [x] **BS-BANK-CC-RECONCILED-THROUGH-PERIOD-END**
+  - Uses active CoA Bank/Credit Card accounts as scope source
+  - Uses equation: `expected_outstanding = register - statement` vs `S1/S2` unreconciled sums
+  - Requires statement, trial balance, and transaction-list evidence
+  - Tests: PASS / WARN / NEEDS_REVIEW cases
 - [x] **BS-UNCLEARED-ITEMS-INVESTIGATED-AND-FLAGGED**
   - Flags uncleared items > 2 months old
   - Tests: PASS / WARN / NEEDS_REVIEW
@@ -200,7 +200,7 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 - [x] Profit & Loss report sample
 
 **Bank reconciliation fixtures**
-- [x] Blackbird Fabrics reconciliation reports (AUD/CAD)
+- [x] Sample client reconciliation reports (AUD/CAD)
 - [x] PayPal activity statement sample
 - [x] Maintenance list sample
 
@@ -217,7 +217,7 @@ All listed rules are implemented in `src/backend/common/rules_engine/rules/` and
 
 **Rules engine**
 - [x] Unit tests for all balance sheet rules
-- [x] Blackbird Fabrics reconciliation sample tests
+- [x] Sample client reconciliation sample tests
 
 **Adapters**
 - [x] QBO adapter unit tests

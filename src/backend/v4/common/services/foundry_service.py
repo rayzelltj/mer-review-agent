@@ -3,9 +3,10 @@ import re
 from typing import Any, Dict, List
 
 # from git import List
-import aiohttp
 from azure.ai.projects.aio import AIProjectClient
 from common.config.app_config import config
+from common.http_clients import get_shared_aiohttp_session
+from common.telemetry import traced_phase
 
 
 class FoundryService:
@@ -83,7 +84,12 @@ class FoundryService:
             }
             params = {"api-version": "2024-10-01"}
 
-            async with aiohttp.ClientSession() as session:
+            session = await get_shared_aiohttp_session()
+            with traced_phase(
+                "dependency.azure_management.list_deployments",
+                logger=self.logger,
+                attributes={"dependency.type": "http", "http.method": "GET"},
+            ):
                 async with session.get(url, headers=headers, params=params) as response:
                     if response.status == 200:
                         data = await response.json()
@@ -105,12 +111,14 @@ class FoundryService:
                                 }
                             )
                         return deployment_info
-                    else:
-                        error_text = await response.text()
-                        self.logger.error(
-                            f"Failed to list deployments. Status: {response.status}, Error: {error_text}"
-                        )
-                        return []
+
+                    error_text = await response.text()
+                    self.logger.error(
+                        "Failed to list deployments. status=%s error=%s",
+                        response.status,
+                        error_text,
+                    )
+                    return []
         except Exception as e:
             self.logger.error(f"Error listing model deployments: {e}")
             return []

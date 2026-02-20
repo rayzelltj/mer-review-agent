@@ -1,176 +1,163 @@
+from datetime import date
 from decimal import Decimal
 
-from common.rules_engine.models import ProfitAndLossSnapshot, RuleStatus, Severity
+from common.rules_engine.models import BalanceSheetSnapshot, ProfitAndLossSnapshot, RuleStatus, Severity
 from common.rules_engine.rules.bs_clearing_accounts_zero import BS_CLEARING_ACCOUNTS_ZERO
 
 
-def test_clearing_accounts_zero_pass_warn_fail_severity(
-    make_balance_sheet, make_profit_and_loss, make_ctx, period_end
-):
-    pnl = make_profit_and_loss(revenue=Decimal("100000"))
-    rule_cfg = {
-        "BS-CLEARING-ACCOUNTS-ZERO": {
-            "accounts": [
-                {
-                    "account_ref": "A1",
-                    "account_name": "Clearing - Payroll",
-                    "threshold": {"floor_amount": "50", "pct_of_revenue": "0.001"},
-                }
-            ]
-        }
-    }
+def _platform_pnl(*, period_end, platform_name: str, amount: Decimal) -> ProfitAndLossSnapshot:
+    return ProfitAndLossSnapshot(
+        period_start=date(period_end.year, period_end.month, 1),
+        period_end=period_end,
+        currency="USD",
+        totals={
+            "revenue": amount,
+            f"income_line:Sales - {platform_name}": amount,
+        },
+    )
 
-    # PASS
+
+def test_clearing_accounts_warn_and_fail_with_platform_plus_prior_variance(
+    make_balance_sheet, make_ctx, period_end
+):
+    rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {}}
+    pnl = _platform_pnl(period_end=period_end, platform_name="Etsy", amount=Decimal("1000"))
+    prior_bs = BalanceSheetSnapshot(
+        as_of_date=date(2025, 11, 30),
+        currency="USD",
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Etsy Clearing Account",
+                "type": "Bank",
+                "balance": "100",
+            }
+        ],
+    )
+
+    bs_warn = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Etsy Clearing Account",
+                "type": "Bank",
+                "balance": "103",
+            }
+        ]
+    )
+    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
+        make_ctx(
+            balance_sheet=bs_warn,
+            client_rules=rule_cfg,
+            profit_and_loss=pnl,
+            prior_balance_sheets=(prior_bs,),
+        )
+    )
+    assert res.status == RuleStatus.WARN
+    assert res.severity == Severity.LOW
+    detail = res.details[0].values
+    assert Decimal(detail["platform_revenue"]) == Decimal("1000")
+    assert Decimal(detail["previous_month_variance_value"]) == Decimal("100")
+    assert Decimal(detail["allowed_variance"]) == Decimal("103")
+    assert "0.10" in detail["allowed_variance_calculation"]
+    assert "0.03" in detail["allowed_variance_calculation"]
+    assert detail["threshold_source"] == "platform_revenue_plus_previous_month_variance"
+
+    bs_fail = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Etsy Clearing Account",
+                "type": "Bank",
+                "balance": "104",
+            }
+        ]
+    )
+    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
+        make_ctx(
+            balance_sheet=bs_fail,
+            client_rules=rule_cfg,
+            profit_and_loss=pnl,
+            prior_balance_sheets=(prior_bs,),
+        )
+    )
+    assert res.status == RuleStatus.FAIL
+    assert res.severity == Severity.HIGH
+
+
+def test_clearing_accounts_generic_name_requires_review(make_balance_sheet, make_ctx):
     bs = make_balance_sheet(
         accounts=[
             {
                 "account_ref": "A1",
-                "name": "Clearing - Payroll",
+                "name": "Clearing Account",
                 "type": "Bank",
                 "balance": "0",
             }
         ]
     )
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
-        make_ctx(balance_sheet=bs, profit_and_loss=pnl, client_rules=rule_cfg)
+        make_ctx(balance_sheet=bs, client_rules={"BS-CLEARING-ACCOUNTS-ZERO": {}})
     )
-    assert res.status == RuleStatus.PASS
-    assert res.severity == Severity.INFO
-    assert period_end.isoformat() in res.summary
-
-    # WARN (allowed = max(50, 100000*0.001=100) => 100)
-    bs = make_balance_sheet(
-        accounts=[
-            {
-                "account_ref": "A1",
-                "name": "Clearing - Payroll",
-                "type": "Bank",
-                "balance": "80",
-            }
-        ]
-    )
-    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
-        make_ctx(balance_sheet=bs, profit_and_loss=pnl, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.WARN
-    assert res.severity == Severity.LOW
-    assert "Clearing - Payroll" in res.summary
-    assert "80" in res.summary
-
-    # FAIL
-    bs = make_balance_sheet(
-        accounts=[
-            {
-                "account_ref": "A1",
-                "name": "Clearing - Payroll",
-                "type": "Bank",
-                "balance": "120",
-            }
-        ]
-    )
-    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
-        make_ctx(balance_sheet=bs, profit_and_loss=pnl, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.FAIL
-    assert res.severity == Severity.HIGH
-    assert "Clearing - Payroll" in res.summary
-
-
-def test_clearing_accounts_missing_account_needs_review(make_balance_sheet, make_ctx):
-    rule_cfg = {
-        "BS-CLEARING-ACCOUNTS-ZERO": {
-            "accounts": [{"account_ref": "A1", "account_name": "Clearing - Payroll"}]
-        }
-    }
-    bs = make_balance_sheet(accounts=[])
-    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
     assert res.status == RuleStatus.NEEDS_REVIEW
     assert res.severity == Severity.MEDIUM
-    assert res.details and res.details[0].key == "A1"
+    assert res.details[0].values["platform_name_missing"] is True
+    assert "GENERIC CLEARING ACCOUNT" in (res.details[0].values.get("review_comment") or "")
 
 
-def test_clearing_accounts_needs_review_when_not_configured(make_balance_sheet, make_ctx):
-    rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {}}
+def test_clearing_accounts_asset_scope_only(make_balance_sheet, make_ctx, period_end):
     bs = make_balance_sheet(
         accounts=[
             {
                 "account_ref": "A1",
-                "name": "Payroll Clearing",
+                "name": "Etsy Clearing Account",
+                "type": "Bank",
+                "balance": "0",
+            },
+            {
+                "account_ref": "A2",
+                "name": "Etsy Clearing Account Liability",
+                "type": "Accounts Payable",
+                "balance": "999",
+            },
+        ]
+    )
+    pnl = _platform_pnl(period_end=period_end, platform_name="Etsy", amount=Decimal("1000"))
+    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
+        make_ctx(balance_sheet=bs, client_rules={"BS-CLEARING-ACCOUNTS-ZERO": {}}, profit_and_loss=pnl)
+    )
+    assert res.status == RuleStatus.PASS
+    assert {d.key for d in res.details} == {"A1"}
+
+
+def test_clearing_accounts_missing_platform_mapping_needs_review(make_balance_sheet, make_ctx, period_end):
+    bs = make_balance_sheet(
+        accounts=[
+            {
+                "account_ref": "A1",
+                "name": "Etsy Clearing Account",
                 "type": "Bank",
                 "balance": "10",
             }
         ]
     )
-    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.NEEDS_REVIEW
-
-
-def test_clearing_accounts_name_inference_when_enabled(make_balance_sheet, make_ctx):
-    rule_cfg = {
-        "BS-CLEARING-ACCOUNTS-ZERO": {
-            "allow_name_inference": True,
-            "unconfigured_threshold_policy": "NEEDS_REVIEW",
-        }
-    }
-    bs = make_balance_sheet(
-        accounts=[
-            {"account_ref": "A1", "name": "Payroll Clearing", "type": "Bank", "balance": "10"},
-            {"account_ref": "A2", "name": "Other clearing", "type": "Fixed Asset", "balance": "10"},
-            {"account_ref": "A3", "name": "Cash", "balance": "999"},
-        ]
-    )
-    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    # With no thresholds configured, non-zero balances default to NEEDS_REVIEW (unconfigured_threshold_policy).
-    assert res.status == RuleStatus.NEEDS_REVIEW
-    evaluated_keys = {d.key for d in res.details}
-    assert evaluated_keys == {"A1"}
-    assert any(d.values.get("threshold_configured") is False for d in res.details)
-
-
-def test_clearing_accounts_rounding_boundary_quantizes(make_balance_sheet, make_ctx):
-    rule_cfg = {
-        "BS-CLEARING-ACCOUNTS-ZERO": {
-            "accounts": [{"account_ref": "A1", "account_name": "Clearing"}],
-            "amount_quantize": "0.01",
-        }
-    }
-    bs = make_balance_sheet(
-        accounts=[
-            {
-                "account_ref": "A1",
-                "name": "Clearing",
-                "type": "Bank",
-                "balance": "0.004",
-            }
-        ]
-    )
-    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.PASS
-
-
-def test_clearing_accounts_platform_revenue_threshold(make_balance_sheet, make_ctx, period_end):
-    rule_cfg = {"BS-CLEARING-ACCOUNTS-ZERO": {}}
-    bs = make_balance_sheet(
-        accounts=[
-            {
-                "account_ref": "A1",
-                "name": "Etsy Clearing",
-                "type": "Bank",
-                "balance": "50",
-            }
-        ]
-    )
-    pnl = ProfitAndLossSnapshot(
-        period_start=period_end,
-        period_end=period_end,
-        currency="USD",
-        totals={
-            "revenue": Decimal("1000"),
-            "income_line:Sales - Etsy": Decimal("1000"),
-        },
-    )
+    pnl = _platform_pnl(period_end=period_end, platform_name="Shopify", amount=Decimal("500"))
     res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
-        make_ctx(balance_sheet=bs, client_rules=rule_cfg, profit_and_loss=pnl)
+        make_ctx(balance_sheet=bs, client_rules={"BS-CLEARING-ACCOUNTS-ZERO": {}}, profit_and_loss=pnl)
     )
-    assert res.status == RuleStatus.WARN
-    assert res.details[0].values["threshold_source"] == "platform_revenue"
+    assert res.status == RuleStatus.NEEDS_REVIEW
+    assert res.details[0].values["platform_revenue_missing"] is True
+
+
+def test_clearing_accounts_missing_account_needs_review(make_balance_sheet, make_ctx):
+    rule_cfg = {
+        "BS-CLEARING-ACCOUNTS-ZERO": {
+            "accounts": [{"account_ref": "A1", "account_name": "Etsy Clearing Account"}]
+        }
+    }
+    res = BS_CLEARING_ACCOUNTS_ZERO().evaluate(
+        make_ctx(balance_sheet=make_balance_sheet(accounts=[]), client_rules=rule_cfg)
+    )
+    assert res.status == RuleStatus.NEEDS_REVIEW
+    assert res.severity == Severity.MEDIUM
+    assert res.details and res.details[0].key == "A1"

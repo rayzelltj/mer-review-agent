@@ -1,0 +1,34 @@
+{
+  "period_end": "2025-11-30",
+  "evidence": [
+    {
+      "evidence_type": "statement_balance_attachment",
+      "amount": "4580.25",
+      "statement_end_date": "2025-11-30",
+      "uri": "fixture://paypal_activity_statement",
+      "meta": {
+        "account_ref": "name::Paypal AUD Account",
+        "currency": "AUD"
+      }
+    },
+    {
+      "evidence_type": "statement_balance_attachment",
+      "amount": "1274.87",
+      "statement_end_date": "2025-11-30",
+      "uri": "fixture://paypal_activity_statement",
+      "meta": {
+        "account_ref": "name::Paypal CAD Account",
+        "currency": "CAD"
+      }
+    },
+    {
+      "evidence_type": "petty_cash_support",
+      "amount": "250.00",
+      "as_of_date": "2025-11-30",
+      "uri": "fixture://petty_cash_support_placeholder",
+      "meta": {
+        "notes": "PLACEHOLDER: sample petty cash support extracted amount"
+      }
+    }
+  ]
+}

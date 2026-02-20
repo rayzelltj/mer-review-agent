@@ -1,6 +1,7 @@
 """Agent template for building Foundry agents with Azure AI Search, optional MCP tool, and Code Interpreter (agent_framework version)."""
 
 import logging
+import os
 from typing import List, Optional
 
 from agent_framework import (ChatAgent, ChatMessage, HostedCodeInterpreterTool,
@@ -40,6 +41,7 @@ class FoundryAgentTemplate(AzureAgentBase):
         team_service: TeamService | None = None,
         team_config: TeamConfiguration | None = None,
         memory_store: DatabaseBase | None = None,
+        user_auth_token: str | None = None,
     ) -> None:
         # Get project_client before calling super().__init__
         project_client = config.get_ai_project_client()
@@ -51,6 +53,7 @@ class FoundryAgentTemplate(AzureAgentBase):
             team_service=team_service,
             team_config=team_config,
             memory_store=memory_store,
+            user_auth_token=user_auth_token,
             agent_name=agent_name,
             agent_description=agent_description,
             agent_instructions=agent_instructions,
@@ -107,6 +110,14 @@ class FoundryAgentTemplate(AzureAgentBase):
 
         self.logger.info("Total tools collected (MCP path): %d", len(tools))
         return tools
+
+    def _mcp_tool_choice(self, tools: List) -> str:
+        if not tools:
+            return "none"
+        force_required = os.getenv("MCP_TOOL_CHOICE_REQUIRED", "").strip().lower()
+        if force_required in {"0", "false", "no", "off"}:
+            return "auto"
+        return "required"
 
     # -------------------------
     # Azure Search helper
@@ -210,6 +221,7 @@ class FoundryAgentTemplate(AzureAgentBase):
                 agent_id=azure_agent.id,
                 async_credential=self.creds,
             )
+            self._track_chat_client(chat_client)
             return chat_client
         except Exception as ex:
             self.logger.error(
@@ -261,6 +273,7 @@ class FoundryAgentTemplate(AzureAgentBase):
                 # use MCP path
                 self.logger.info("Initializing agent in MCP mode.")
                 tools = await self._collect_tools()
+                tool_choice = self._mcp_tool_choice(tools)
                 self._agent = ChatAgent(
                     id=self.get_agent_id(chatClient),
                     chat_client=self.get_chat_client(chatClient),
@@ -268,9 +281,14 @@ class FoundryAgentTemplate(AzureAgentBase):
                     name=self.agent_name,
                     description=self.agent_description,
                     tools=tools if tools else None,
-                    tool_choice="auto" if tools else "none",
+                    tool_choice=tool_choice,
                     temperature=temp,
                     model_id=self.model_deployment_name,
+                )
+                self.logger.info(
+                    "Initialized MCP agent tool_choice=%s tools=%d",
+                    tool_choice,
+                    len(tools),
                 )
             self.logger.info("Initialized ChatAgent '%s'", self.agent_name)
 

@@ -116,6 +116,7 @@ class UserCurrentTeam(BaseDataModel):
 class CurrentTeamAgent(BaseDataModel):
     """Represents the current agent of a user."""
     data_type: Literal[DataType.current_team_agent] = DataType.current_team_agent
+    user_id: Optional[str] = None
     team_id: str
     team_name: str
     agent_name: str

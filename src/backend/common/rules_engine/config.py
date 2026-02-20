@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
@@ -63,22 +64,28 @@ class PettyCashMatchRuleConfig(RuleConfigBase):
 
 
 class BankReconciledThroughPeriodEndRuleConfig(RuleConfigBase):
-    # Default behavior is to infer bank/credit card scope from Balance Sheet account type/subtype.
-    # Overrides are available for edge cases (include/exclude specific accounts).
+    # Scope overrides (optional). Default scope is active Bank/Credit Card accounts from CoA evidence.
     include_accounts: List[str] = Field(default_factory=list)
     exclude_accounts: List[str] = Field(default_factory=list)
 
-    # Back-compat: older configs used `expected_accounts` as the explicit list of accounts to evaluate.
+    # If provided, acts as explicit scope (after exclude filter).
     expected_accounts: List[str] = Field(default_factory=list)
-    require_statement_end_date_gte_period_end: bool = True
-    # NOTE: Register balance as of period end must tie to the Balance Sheet (required by policy).
-    # This flag is retained for backward compatibility but is always enforced by the rule.
-    require_book_balance_as_of_period_end_ties_to_balance_sheet: bool = True
-    # NOTE: Statement ending balance must match a statement artifact/attachment (required by policy).
-    # This flag is retained for backward compatibility but is always enforced by the rule.
-    require_statement_balance_matches_attachment: bool = True
+
+    # Evidence types used by the new reconciliation equation flow.
+    chart_of_accounts_evidence_type: str = "qbo_chart_of_accounts_bank_cc_active"
+    trial_balance_evidence_type: str = "qbo_trial_balance_register_balance"
+    transaction_list_evidence_type: str = "qbo_transaction_list_unreconciled"
     statement_balance_attachment_evidence_type: str = "statement_balance_attachment"
-    # Statement ending balance (reconciliation report) must match the Balance Sheet balance (exact match).
+
+    # If CoA evidence is missing, allow fallback name heuristics for bank/cc identification.
+    allow_fallback_name_heuristics_when_coa_missing: bool = True
+    # Evaluate active accounts only from CoA evidence.
+    require_active_accounts_only: bool = True
+
+    # Legacy fields retained for compatibility with older configs.
+    require_statement_end_date_gte_period_end: bool = True
+    require_book_balance_as_of_period_end_ties_to_balance_sheet: bool = True
+    require_statement_balance_matches_attachment: bool = True
     require_statement_balance_matches_balance_sheet: bool = True
 
 
@@ -223,6 +230,24 @@ class ApArYearEndBatchAdjustmentsRuleConfig(RuleConfigBase):
     )
 
 
+class ApArPaidAfterMonthEndNotedRuleConfig(RuleConfigBase):
+    ap_detail_rows_evidence_type: str = "ap_aging_detail_rows"
+    ar_detail_rows_evidence_type: str = "ar_aging_detail_rows"
+
+    # If true, the period-end AP/AR detail evidence must have as_of_date == RuleContext.period_end.
+    require_period_end_evidence_date_match: bool = True
+
+    # Optional explicit follow-up date for comparison (e.g. review date). If omitted, latest as_of_date > period_end
+    # is used for each stream independently.
+    comparison_as_of_date: date | None = None
+
+    # Status assigned when period-end items are absent from the follow-up report (inferred settled after month-end).
+    settled_item_status: RuleStatus = RuleStatus.NEEDS_REVIEW
+
+    # Max number of settled items returned in detail payloads.
+    max_noted_items_in_detail: int = 25
+
+
 class IntercompanyBalancesReconcileRuleConfig(RuleConfigBase):
     evidence_type: str = "intercompany_balance_sheet"
     name_patterns: List[str] = Field(
@@ -244,6 +269,39 @@ class WorkingPaperReconcilesRuleConfig(RuleConfigBase):
         default_factory=lambda: ["prepaid", "unearned", "deferred", "deferred revenue", "accrual"]
     )
     require_evidence_as_of_date_match_period_end: bool = True
+
+
+class FixedAssetRegisterReconcilesRuleConfig(RuleConfigBase):
+    evidence_type: str = "fixed_asset_register_balance"
+    require_evidence_as_of_date_match_period_end: bool = True
+
+    # When multiple balance sheet accounts match an asset class by name, prefer "Total <asset class>" lines.
+    prefer_total_balance_sheet_lines: bool = True
+
+
+class FixedAssetCapitalizationThresholdRuleConfig(RuleConfigBase):
+    kyc_evidence_type: str = "kyc_profile"
+    fixed_asset_ledger_evidence_type: str = "qbo_fixed_asset_ledger_transactions"
+    pnl_expense_monthly_evidence_type: str = "qbo_pnl_expense_monthly"
+
+    abnormal_change_pct: Decimal = Decimal("0.10")
+    capitalization_violation_status: RuleStatus = RuleStatus.FAIL
+    abnormal_expense_change_status: RuleStatus = RuleStatus.WARN
+
+    require_kyc_threshold_when_fixed_asset_increase: bool = True
+    require_ledger_transactions_when_fixed_asset_increase: bool = True
+
+    max_transactions_to_evaluate_per_account: int = 200
+    max_flagged_expense_lines: int = 50
+    ignore_expense_name_patterns: List[str] = Field(
+        default_factory=lambda: [
+            "payroll",
+            "wages",
+            "salary",
+            "cogs",
+            "cost of goods",
+        ]
+    )
 
 
 class NonSalesClearingAccountsZeroRuleConfig(RuleConfigBase):

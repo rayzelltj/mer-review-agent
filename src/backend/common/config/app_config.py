@@ -44,7 +44,7 @@ class AppConfig:
 
         # Azure OpenAI settings
         self.AZURE_OPENAI_DEPLOYMENT_NAME = self._get_required(
-            "AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"
+            "AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4.1"
         )
 
         self.AZURE_OPENAI_RAI_DEPLOYMENT_NAME = self._get_required(

@@ -26,6 +26,9 @@ opentelemetry-exporter-otlp-proto-grpc
 # Date and internationalization
 babel>=2.9.0
 
+# PDF text extraction (bank statement adapter)
+pdfplumber>=0.11
+
 # Testing tools
 pytest>=8.2,<9  # Compatible version for pytest-asyncio
 pytest-asyncio==0.24.0

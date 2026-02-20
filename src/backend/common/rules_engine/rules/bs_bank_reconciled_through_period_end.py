@@ -2,35 +2,74 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import Any
+
+from adapters.qbo.bank_cc_reconciliation import (
+    active_bank_cc_accounts_from_accounts_payload,
+    coerce_report_payload,
+    transaction_list_unreconciled_sums_from_report,
+    trial_balance_register_balances_from_report,
+)
 
 from ..config import BankReconciledThroughPeriodEndRuleConfig
 from ..context import RuleContext, quantize_amount
-from ..models import (
-    AccountBalance,
-    ReconciliationSnapshot,
-    RuleResult,
-    RuleResultDetail,
-    RuleStatus,
-    Severity,
-    StatusOrdering,
-    severity_for_status,
-)
+from ..models import RuleResult, RuleResultDetail, RuleStatus, StatusOrdering, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
+
+BANK_NAME_HINTS = ("chequing", "checking", "savings", "bank", "rbc", "td", "bmo", "cibc", "scotia")
+CC_NAME_HINTS = ("visa", "mastercard", "master card", "amex", "credit card", " cc ")
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _canonical_account_id(account_ref: str) -> str:
+    raw = str(account_ref or "").strip()
+    if not raw:
+        return ""
+    return raw.split("::")[-1]
+
+
+def _matches_account(meta: dict[str, Any], *, account_ref: str, account_id: str) -> bool:
+    ref = str(meta.get("account_ref") or "").strip()
+    acc_id = str(meta.get("account_id") or "").strip()
+    if ref and (ref == account_ref or _canonical_account_id(ref) == account_id):
+        return True
+    if acc_id and acc_id == account_id:
+        return True
+    return False
+
+
+def _statement_sign_normalized(account_type: str, amount: Decimal) -> Decimal:
+    # Statement ending balance is always expressed as an absolute "you-owe" (CC) or
+    # "you-have" (Bank) amount from the statement perspective.  No sign flip needed
+    # because the CC register balance is independently normalised to the same
+    # positive "you-owe" convention in the evaluate() loop below.
+    return amount
 
 
 @register_rule
 class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
-    rule_id = "BS-BANK-RECONCILED-THROUGH-PERIOD-END"
-    rule_title = "Bank/credit card accounts reconciled through statement date"
-    best_practices_reference = "Bank reconciliations → Banks and Credit cards"
-    sources = ["QBO (reports/exports)", "Bank statements (evidence)"]
+    rule_id = "BS-BANK-CC-RECONCILED-THROUGH-PERIOD-END"
+    rule_title = "Bank/credit card accounts reconcile using statement, trial balance, and unreconciled transactions"
+    best_practices_reference = "Bank reconciliations -> Banks and credit cards"
+    sources = [
+        "QBO (Chart of Accounts, Trial Balance, Transaction List by Account)",
+        "Bank statements/activity statements (evidence)",
+    ]
     config_model = BankReconciledThroughPeriodEndRuleConfig
 
     def evaluate(self, ctx: RuleContext) -> RuleResult:
-        cfg = ctx.client_config.get_rule_config(
-            self.rule_id, BankReconciledThroughPeriodEndRuleConfig
-        )
+        cfg = ctx.client_config.get_rule_config(self.rule_id, BankReconciledThroughPeriodEndRuleConfig)
         missing_status = RuleStatus(cfg.missing_data_policy.value)
         if not cfg.enabled:
             return RuleResult(
@@ -43,25 +82,39 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 summary="Rule disabled by client configuration.",
             )
 
-        inferred_refs, infer_detail = self._infer_scope_from_balance_sheet(ctx)
-        if inferred_refs is None and not cfg.expected_accounts:
+        coa_accounts, scope_source = self._bank_cc_scope_from_coa(ctx, cfg)
+        if not coa_accounts:
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
-                status=RuleStatus.NEEDS_REVIEW,
-                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
+                status=missing_status,
+                severity=severity_for_status(missing_status),
                 summary=(
-                    f"Cannot determine bank/credit card reconciliation scope for {ctx.period_end.isoformat()}; "
-                    "account type/subtype data is missing."
+                    "No active bank/credit-card scope could be built from Chart of Accounts evidence; "
+                    "cannot evaluate reconciliation."
                 ),
-                details=[infer_detail] if infer_detail is not None else [],
-                human_action="Ensure the adapter provides Balance Sheet account type/subtype to infer bank/cc scope.",
+                details=[
+                    RuleResultDetail(
+                        key="scope",
+                        message="Missing CoA bank/credit-card scope evidence.",
+                        values={
+                            "period_end": ctx.period_end.isoformat(),
+                            "chart_of_accounts_evidence_type": cfg.chart_of_accounts_evidence_type,
+                            "allow_fallback_name_heuristics_when_coa_missing": cfg.allow_fallback_name_heuristics_when_coa_missing,
+                            "status": missing_status.value,
+                        },
+                    )
+                ],
+                human_action=(
+                    "Provide Chart of Accounts evidence with active Bank/Credit Card accounts "
+                    f"({cfg.chart_of_accounts_evidence_type})."
+                ),
             )
 
-        required_refs = self._determine_scope(ctx, cfg, inferred_refs or [])
-        if not required_refs:
+        refs = self._determine_scope(cfg, [row["account_ref"] for row in coa_accounts])
+        if not refs:
             return RuleResult(
                 rule_id=self.rule_id,
                 rule_title=self.rule_title,
@@ -69,92 +122,232 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
                 sources=self.sources,
                 status=RuleStatus.NOT_APPLICABLE,
                 severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
-                summary=f"No bank/credit card accounts in-scope as of {ctx.period_end.isoformat()}.",
+                summary=f"No in-scope bank/credit-card accounts as of {ctx.period_end.isoformat()}.",
             )
 
-        ordering = StatusOrdering.default()
+        coa_by_ref = {row["account_ref"]: row for row in coa_accounts}
+        coa_by_id = {_canonical_account_id(row["account_ref"]): row for row in coa_accounts}
+        bs_name_by_ref = {row.account_ref: row.name for row in ctx.balance_sheet.accounts}
+        bs_balance_by_ref = {row.account_ref: row.balance for row in ctx.balance_sheet.accounts}
+        bs_balance_by_id = {
+            _canonical_account_id(row.account_ref): row.balance
+            for row in ctx.balance_sheet.accounts
+        }
+        trial_balances = self._trial_balance_map(ctx, cfg)
+        tx_items = [item for item in ctx.evidence.items if item.evidence_type == cfg.transaction_list_evidence_type]
+        statement_items = [
+            item for item in ctx.evidence.items if item.evidence_type == cfg.statement_balance_attachment_evidence_type
+        ]
 
-        recs = list(ctx.reconciliations)
-        name_by_ref = {a.account_ref: a.name for a in ctx.balance_sheet.accounts}
-        bs_balance_by_ref = {a.account_ref: a.balance for a in ctx.balance_sheet.accounts}
         statuses: list[RuleStatus] = []
         details: list[RuleResultDetail] = []
-        if infer_detail is not None:
-            statuses.append(RuleStatus.NEEDS_REVIEW)
-            details.append(infer_detail)
+        ordering = StatusOrdering.default()
 
-        scope_check_status, scope_check_detail = self._check_maintenance_count(
-            ctx, cfg, inferred_refs
-        )
-        if scope_check_status is not None and scope_check_detail is not None:
-            statuses.append(scope_check_status)
-            details.append(scope_check_detail)
+        for account_ref in refs:
+            account_id = _canonical_account_id(account_ref)
+            coa_row = coa_by_ref.get(account_ref) or coa_by_id.get(account_id) or {}
+            account_name = str(coa_row.get("account_name") or bs_name_by_ref.get(account_ref) or account_ref)
+            account_type = str(coa_row.get("account_type") or "")
+            account_active = bool(coa_row.get("active", True))
 
-        for account_ref in required_refs:
-            account_name = name_by_ref.get(account_ref, "")
-            candidates = [r for r in recs if r.account_ref == account_ref]
-            if not candidates:
-                statuses.append(missing_status)
-                details.append(
-                    RuleResultDetail(
-                        key=account_ref,
-                        message="Missing reconciliation snapshot for this account.",
-                        values={
-                            "account_name": account_name,
-                            "period_end": ctx.period_end.isoformat(),
-                            "status": missing_status.value,
-                            "expected_from_maintenance": True,
-                        },
-                    )
+            statement_item = self._find_best_statement_item(
+                statement_items,
+                account_ref=account_ref,
+                account_id=account_id,
+            )
+            statement_balance = None
+            statement_end_date = ctx.period_end
+            statement_balance_source = None
+            if statement_item is not None:
+                statement_end_date = (
+                    statement_item.statement_end_date
+                    or statement_item.as_of_date
+                    or ctx.period_end
                 )
+                if statement_item.amount is not None:
+                    statement_balance = statement_item.amount
+                    statement_balance_source = "evidence.amount"
+                else:
+                    statement_balance = self._statement_amount_from_meta(statement_item.meta or {})
+                    statement_balance_source = "evidence.meta"
+            register_balance = trial_balances.get(account_ref)
+            if register_balance is None:
+                register_balance = trial_balances.get(account_id)
+
+            # For Credit Card accounts the trial-balance net is debit − credit,
+            # which is a *negative* number when the card has an outstanding balance
+            # (the normal case).  Negate it so the register balance is expressed as
+            # the positive "amount owed to the card issuer" — the same perspective
+            # used by the bank statement.  This makes the equation:
+            #   expected_outstanding = register_balance − statement_ending_balance
+            # produce a positive result that S1 (sum of positive unreconciled charges)
+            # can be directly compared against.
+            if account_type == "Credit Card" and register_balance is not None and register_balance < 0:
+                register_balance = -register_balance
+
+            # Rule 2: look up the matching balance-sheet line for this account.
+            bs_balance = bs_balance_by_ref.get(account_ref)
+            if bs_balance is None:
+                bs_balance = bs_balance_by_id.get(account_id)
+
+            tx_summary = self._transaction_summary(
+                tx_items,
+                account_ref=account_ref,
+                account_id=account_id,
+                period_end=ctx.period_end,
+                statement_end_date=statement_end_date,
+            )
+            s1 = tx_summary.get("sum_not_reconciled_as_of_period_end")
+            s2 = tx_summary.get("sum_not_reconciled_between_period_end_and_statement_end")
+            clear_column_found = bool(tx_summary.get("clear_status_column_found"))
+
+            missing_fields: list[str] = []
+            if statement_balance is None:
+                missing_fields.append("statement_ending_balance")
+            if register_balance is None:
+                missing_fields.append("trial_balance_register_balance")
+            if s1 is None or s2 is None:
+                missing_fields.append("transaction_list_s1_s2")
+            if not clear_column_found:
+                missing_fields.append("transaction_list_clear_status_column")
+
+            if missing_fields:
+                status = missing_status
+                detail = RuleResultDetail(
+                    key=account_ref,
+                    message="Missing data required for bank/credit-card reconciliation equation.",
+                    values={
+                        "account_name": account_name,
+                        "account_ref": account_ref,
+                        "account_id": account_id,
+                        "account_type": account_type,
+                        "account_active": account_active,
+                        "scope_source": scope_source,
+                        "period_end": ctx.period_end.isoformat(),
+                        "statement_end_date": statement_end_date.isoformat() if statement_end_date else None,
+                        "statement_balance_attachment_evidence_type": cfg.statement_balance_attachment_evidence_type,
+                        "trial_balance_evidence_type": cfg.trial_balance_evidence_type,
+                        "transaction_list_evidence_type": cfg.transaction_list_evidence_type,
+                        "statement_balance": str(statement_balance) if statement_balance is not None else None,
+                        "register_balance": str(register_balance) if register_balance is not None else None,
+                        "s1_not_reconciled_as_of_period_end": str(s1) if s1 is not None else None,
+                        "s2_not_reconciled_between_period_end_and_statement_end": str(s2) if s2 is not None else None,
+                        "bs_line_balance": str(bs_balance) if bs_balance is not None else None,
+                        "missing_fields": missing_fields,
+                        "status": status.value,
+                    },
+                )
+                statuses.append(status)
+                details.append(detail)
                 continue
 
-            latest = max(
-                candidates,
-                key=lambda r: r.statement_end_date or date.min,
-            )
-            bs_balance = bs_balance_by_ref.get(account_ref)
-            status, detail = self._evaluate_one(
-                ctx,
-                latest,
-                cfg,
-                balance_sheet_balance=bs_balance,
-                account_name_fallback=account_name,
-            )
+            statement_balance = _statement_sign_normalized(account_type, statement_balance)
+            register_q = quantize_amount(register_balance, cfg.amount_quantize)
+            statement_q = quantize_amount(statement_balance, cfg.amount_quantize)
+            s1_q = quantize_amount(s1, cfg.amount_quantize)
+            s2_q = quantize_amount(s2, cfg.amount_quantize)
+
+            expected = quantize_amount(register_q - statement_q, cfg.amount_quantize)
+            diff_expected_minus_s1 = quantize_amount(expected - s1_q, cfg.amount_quantize)
+            pass_s1 = diff_expected_minus_s1 == 0
+            pass_s2 = diff_expected_minus_s1 == s2_q
+
+            if pass_s1 or pass_s2:
+                status = RuleStatus.PASS
+                equation_result = "PASS"
+            else:
+                status = RuleStatus.WARN
+                equation_result = "MISMATCH_REVIEW"
+
+            # Sub-check Rule 2: trial-balance register balance must match the
+            # balance-sheet line for the same account.  A mismatch means the two
+            # data sources are inconsistent and deserves a WARN even when the
+            # reconciliation equation itself passes.
+            bs_line_balance: str | None = None
+            register_matches_bs_line: bool | None = None
+            bs_vs_register_diff: str | None = None
+            if bs_balance is not None:
+                _reg_abs = abs(register_q)
+                _bs_abs = abs(quantize_amount(bs_balance, cfg.amount_quantize))
+                _diff_bs = abs(_reg_abs - _bs_abs)
+                register_matches_bs_line = _diff_bs <= Decimal("0.02")
+                bs_line_balance = str(_bs_abs)
+                bs_vs_register_diff = str(_diff_bs)
+                if not register_matches_bs_line and status == RuleStatus.PASS:
+                    status = RuleStatus.WARN
+                    equation_result = "PASS_BUT_REGISTER_VS_BS_MISMATCH"
+
             statuses.append(status)
-            details.append(detail)
+            details.append(
+                RuleResultDetail(
+                    key=account_ref,
+                    message="Bank/credit-card equation evaluated.",
+                    values={
+                        "account_name": account_name,
+                        "account_ref": account_ref,
+                        "account_id": account_id,
+                        "account_type": account_type,
+                        "account_active": account_active,
+                        "scope_source": scope_source,
+                        "period_end": ctx.period_end.isoformat(),
+                        "statement_end_date": statement_end_date.isoformat() if statement_end_date else None,
+                        "statement_balance_source": statement_balance_source,
+                        "statement_balance": str(statement_q),
+                        "register_balance": str(register_q),
+                        "equation_1": "expected_outstanding = register_balance - statement_ending_balance  [CC: register_balance = abs(trial_balance_net)]",
+                        "expected_outstanding": str(expected),
+                        "equation_2": "S1 = sum(unreconciled as of period end: blank + C, positive amounts for charges)",
+                        "s1_not_reconciled_as_of_period_end": str(s1_q),
+                        "equation_3": "S2 = sum(unreconciled between period end and reconciliation date)",
+                        "s2_not_reconciled_between_period_end_and_statement_end": str(s2_q),
+                        "expected_minus_s1": str(diff_expected_minus_s1),
+                        "pass_if_expected_equals_s1": pass_s1,
+                        "pass_if_expected_minus_s1_equals_s2": pass_s2,
+                        "transaction_list_parsed_rows": tx_summary.get("parsed_rows"),
+                        "transaction_list_ignored_rows": tx_summary.get("ignored_rows"),
+                        "clear_status_column_found": clear_column_found,
+                        "active_account_filter_applied": cfg.require_active_accounts_only,
+                        "bs_line_balance": bs_line_balance,
+                        "register_matches_bs_line": register_matches_bs_line,
+                        "bs_vs_register_diff": bs_vs_register_diff,
+                        "sub_check_register_vs_bs": (
+                            "PASS" if register_matches_bs_line is True
+                            else "WARN" if register_matches_bs_line is False
+                            else None
+                        ),
+                        "status": status.value,
+                        "equation_result": equation_result,
+                    },
+                )
+            )
 
         overall = ordering.worst(statuses)
         severity = severity_for_status(overall)
-
         exemplar = next((d for d in details if d.values.get("status") == overall.value), None)
+
         if overall == RuleStatus.PASS:
             summary = (
-                f"All {len(required_refs)} account(s) are reconciled through {ctx.period_end.isoformat()} "
-                "and tie out exactly."
+                f"All {len(refs)} active bank/credit-card account(s) passed reconciliation equation "
+                f"as of {ctx.period_end.isoformat()}."
             )
-        elif overall == RuleStatus.FAIL and exemplar:
-            if exemplar.key == "scope_count":
-                summary = (
-                    "Maintenance bank/cc account count does not match Balance Sheet bank/cc count "
-                    f"as of {ctx.period_end.isoformat()}."
-                )
-            else:
-                summary = (
-                    f"Account '{exemplar.values.get('account_name','')}' is not reconciled through period end "
-                    f"or fails tie-out as of {ctx.period_end.isoformat()}."
-                )
+        elif overall == RuleStatus.WARN and exemplar:
+            summary = (
+                f"Equation mismatch for '{exemplar.values.get('account_name','')}' as of {ctx.period_end.isoformat()} "
+                "(review expected outstanding vs S1/S2)."
+            )
         elif overall == RuleStatus.NEEDS_REVIEW:
-            summary = f"Missing data prevented evaluation for one or more accounts as of {ctx.period_end.isoformat()}."
+            summary = (
+                f"Missing evidence prevented full bank/credit-card reconciliation equation evaluation "
+                f"as of {ctx.period_end.isoformat()}."
+            )
         else:
             summary = "Not applicable."
 
         human_action = None
-        if overall in (RuleStatus.WARN, RuleStatus.FAIL, RuleStatus.NEEDS_REVIEW):
+        if overall in (RuleStatus.WARN, RuleStatus.NEEDS_REVIEW):
             human_action = (
-                "Verify reconciliation status through MER period end, confirm statement ending balances against "
-                "bank statements, and tie out register/book balances to the Balance Sheet; explain or correct "
-                "any variances."
+                "Provide/verify: active CoA bank/credit-card scope, statement ending balances per account, "
+                "trial balance register balances at month end, and transaction-list unreconciled sums (S1/S2)."
             )
 
         return RuleResult(
@@ -169,319 +362,166 @@ class BS_BANK_RECONCILED_THROUGH_PERIOD_END(Rule):
             human_action=human_action,
         )
 
-    def _evaluate_one(
+    def _bank_cc_scope_from_coa(
         self,
         ctx: RuleContext,
-        rec: ReconciliationSnapshot,
         cfg: BankReconciledThroughPeriodEndRuleConfig,
-        *,
-        balance_sheet_balance: Decimal | None,
-        account_name_fallback: str,
-    ) -> tuple[RuleStatus, RuleResultDetail]:
-        account_name = rec.account_name or account_name_fallback
-        missing_status = RuleStatus(cfg.missing_data_policy.value)
-        if rec.statement_end_date is None:
-            return (
-                missing_status,
-                RuleResultDetail(
-                    key=rec.account_ref,
-                    message="Missing statement end date; cannot verify reconciliation through period end.",
-                    values={
-                        "account_name": account_name,
-                        "period_end": ctx.period_end.isoformat(),
-                        "status": missing_status.value,
-                    },
-                ),
-            )
-
-        if cfg.require_statement_end_date_gte_period_end and rec.statement_end_date < ctx.period_end:
-            return (
-                RuleStatus.FAIL,
-                RuleResultDetail(
-                    key=rec.account_ref,
-                    message="Statement end date is before MER period end; not reconciled through period end.",
-                    values={
-                        "account_name": account_name,
-                        "statement_end_date": rec.statement_end_date.isoformat(),
-                        "period_end": ctx.period_end.isoformat(),
-                        "status": RuleStatus.FAIL.value,
-                    },
-                ),
-            )
-
-        if rec.statement_ending_balance is None:
-            return (
-                missing_status,
-                RuleResultDetail(
-                    key=rec.account_ref,
-                    message="Missing statement ending balance; cannot tie out.",
-                    values={
-                        "account_name": account_name,
-                        "period_end": ctx.period_end.isoformat(),
-                        "statement_end_date": rec.statement_end_date.isoformat(),
-                        "status": missing_status.value,
-                    },
-                ),
-            )
-
-        if rec.book_balance_as_of_statement_end is None:
-            return (
-                missing_status,
-                RuleResultDetail(
-                    key=rec.account_ref,
-                    message="Missing book/register balance as of statement end date; cannot tie out.",
-                    values={
-                        "account_name": account_name,
-                        "period_end": ctx.period_end.isoformat(),
-                        "statement_end_date": rec.statement_end_date.isoformat(),
-                        "statement_ending_balance": str(rec.statement_ending_balance),
-                        "status": missing_status.value,
-                    },
-                ),
-            )
-
-        statement_end_q = quantize_amount(rec.book_balance_as_of_statement_end, cfg.amount_quantize)
-        statement_bal_q = quantize_amount(rec.statement_ending_balance, cfg.amount_quantize)
-        statement_diff = abs(statement_end_q - statement_bal_q)
-
-        if statement_diff == 0:
-            statement_status = RuleStatus.PASS
-        else:
-            statement_status = RuleStatus.FAIL
-
-        statuses = [statement_status]
-        period_end_status: RuleStatus | None = None
-        period_end_diff: Decimal | None = None
-        attachment_status: RuleStatus | None = None
-        attachment_diff: Decimal | None = None
-        attachment_amount: Decimal | None = None
-        attachment_statement_end_date: date | None = None
-        attachment_uri: str | None = None
-        statement_balance_matches_bs_status: RuleStatus | None = None
-        statement_balance_matches_bs_diff: Decimal | None = None
-
-        # Required per policy: register balance as of period end must match Balance Sheet.
-        if True:
-            if balance_sheet_balance is None:
-                period_end_status = missing_status
-            elif rec.book_balance_as_of_period_end is None:
-                period_end_status = missing_status
-            else:
-                bs_q = quantize_amount(balance_sheet_balance, cfg.amount_quantize)
-                book_pe_q = quantize_amount(rec.book_balance_as_of_period_end, cfg.amount_quantize)
-                period_end_diff = abs(book_pe_q - bs_q)
-                if period_end_diff == 0:
-                    period_end_status = RuleStatus.PASS
-                else:
-                    period_end_status = RuleStatus.FAIL
-            statuses.append(period_end_status)
-
-        if cfg.require_statement_balance_matches_balance_sheet:
-            if balance_sheet_balance is None:
-                statement_balance_matches_bs_status = missing_status
-            else:
-                bs_q = quantize_amount(balance_sheet_balance, cfg.amount_quantize)
-                statement_balance_matches_bs_diff = abs(statement_bal_q - bs_q)
-                statement_balance_matches_bs_status = (
-                    RuleStatus.PASS if statement_balance_matches_bs_diff == 0 else RuleStatus.FAIL
-                )
-            statuses.append(statement_balance_matches_bs_status)
-
-        # Required per policy: statement ending balance must match attachment (bank statement/activity statement).
-        if True:
-            evidence_item = None
-            for item in ctx.evidence.items:
-                if item.evidence_type != cfg.statement_balance_attachment_evidence_type:
-                    continue
-                if item.meta.get("account_ref") != rec.account_ref:
-                    continue
-                evidence_item = item
-                break
-
-            if evidence_item is None:
-                attachment_status = missing_status
-            elif evidence_item.amount is None:
-                attachment_status = missing_status
-            else:
-                attachment_amount = quantize_amount(evidence_item.amount, cfg.amount_quantize)
-                attachment_statement_end_date = evidence_item.statement_end_date
-                attachment_uri = evidence_item.uri
-
-                if (
-                    attachment_statement_end_date is not None
-                    and rec.statement_end_date is not None
-                    and attachment_statement_end_date != rec.statement_end_date
-                ):
-                    attachment_status = RuleStatus.FAIL
-                else:
-                    attachment_diff = abs(statement_bal_q - attachment_amount)
-                    attachment_status = RuleStatus.PASS if attachment_diff == 0 else RuleStatus.FAIL
-
-            statuses.append(attachment_status)
-
-        status = StatusOrdering.default().worst([s for s in statuses if s is not None])
-
-        return (
-            status,
-            RuleResultDetail(
-                key=rec.account_ref,
-                message="Account reconciliation tie-out evaluated.",
-                values={
-                    "account_name": account_name,
-                    "period_end": ctx.period_end.isoformat(),
-                    "statement_end_date": rec.statement_end_date.isoformat(),
-                    "statement_ending_balance": str(statement_bal_q),
-                    "book_balance_as_of_statement_end": str(statement_end_q),
-                    "statement_tie_difference": str(statement_diff),
-                    "statement_tie_status": statement_status.value,
-                    "require_book_balance_as_of_period_end_ties_to_balance_sheet": True,
-                    "balance_sheet_balance": str(quantize_amount(balance_sheet_balance, cfg.amount_quantize))
-                    if balance_sheet_balance is not None
-                    else None,
-                    "book_balance_as_of_period_end": str(
-                        quantize_amount(rec.book_balance_as_of_period_end, cfg.amount_quantize)
-                    )
-                    if rec.book_balance_as_of_period_end is not None
-                    else None,
-                    "period_end_tie_difference": str(period_end_diff) if period_end_diff is not None else None,
-                    "period_end_tie_status": period_end_status.value if period_end_status is not None else None,
-                    "require_statement_balance_matches_balance_sheet": cfg.require_statement_balance_matches_balance_sheet,
-                    "statement_balance_matches_balance_sheet_difference": str(statement_balance_matches_bs_diff)
-                    if statement_balance_matches_bs_diff is not None
-                    else None,
-                    "statement_balance_matches_balance_sheet_status": statement_balance_matches_bs_status.value
-                    if statement_balance_matches_bs_status is not None
-                    else None,
-                    "require_statement_balance_matches_attachment": True,
-                    "statement_balance_attachment_evidence_type": cfg.statement_balance_attachment_evidence_type,
-                    "attachment_statement_end_date": attachment_statement_end_date.isoformat()
-                    if attachment_statement_end_date is not None
-                    else None,
-                    "attachment_amount": str(attachment_amount) if attachment_amount is not None else None,
-                    "attachment_uri": attachment_uri,
-                    "attachment_balance_difference": str(attachment_diff) if attachment_diff is not None else None,
-                    "attachment_status": attachment_status.value if attachment_status is not None else None,
-                    "status": status.value,
-                },
-            ),
-        )
-
-    def _is_bank_or_credit_card(self, acct: AccountBalance) -> bool:
-        """Decide whether a Balance Sheet account should be included in bank/cc scope (type/subtype only)."""
-        type_l = (acct.type or "").strip().lower()
-        subtype_l = (acct.subtype or "").strip().lower()
-        if not (type_l or subtype_l):
-            return False
-        if "bank" in type_l or "bank" in subtype_l:
-            return True
-        if "credit" in type_l or "credit" in subtype_l:
-            return True
-        if "card" in type_l or "card" in subtype_l:
-            return True
-        return False
-
-    def _infer_scope_from_balance_sheet(
-        self, ctx: RuleContext
-    ) -> tuple[list[str] | None, RuleResultDetail | None]:
-        # Default: infer scope from Balance Sheet account type/subtype; if any types are missing, flag for review.
-        missing_type_refs: list[str] = []
-        inferred: list[str] = []
-        for acct in ctx.balance_sheet.accounts:
-            if not ((acct.type or "").strip() or (acct.subtype or "").strip()):
-                missing_type_refs.append(acct.account_ref)
+    ) -> tuple[list[dict[str, Any]], str]:
+        scoped: list[dict[str, Any]] = []
+        for item in ctx.evidence.items:
+            if item.evidence_type != cfg.chart_of_accounts_evidence_type:
                 continue
-            if self._is_bank_or_credit_card(acct):
-                inferred.append(acct.account_ref)
+            rows = item.meta.get("accounts")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                account_ref = str(row.get("account_ref") or "").strip()
+                account_type = str(row.get("account_type") or "").strip()
+                if not account_ref or account_type not in {"Bank", "Credit Card"}:
+                    continue
+                if cfg.require_active_accounts_only and row.get("active") is False:
+                    continue
+                scoped.append(row)
 
-        if missing_type_refs:
-            return None, RuleResultDetail(
-                key="scope",
-                message="Cannot infer bank/cc scope because some Balance Sheet accounts are missing type/subtype.",
-                values={
-                    "period_end": ctx.period_end.isoformat(),
-                    "missing_type_account_refs": missing_type_refs[:20],
-                    "missing_type_account_count": len(missing_type_refs),
-                    "status": RuleStatus.NEEDS_REVIEW.value,
-                },
+        if scoped:
+            return sorted(scoped, key=lambda row: row["account_ref"]), "chart_of_accounts"
+
+        if not cfg.allow_fallback_name_heuristics_when_coa_missing:
+            return [], "chart_of_accounts_missing"
+
+        fallback: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for acct in ctx.balance_sheet.accounts:
+            ref = acct.account_ref
+            if not ref or ref in seen:
+                continue
+            type_l = (acct.type or "").strip().lower()
+            subtype_l = (acct.subtype or "").strip().lower()
+            name_l = f" {((acct.name or '').strip().lower())} "
+            is_bank_cc = any(token in type_l for token in ("bank", "credit", "card")) or any(
+                token in subtype_l for token in ("bank", "credit", "card")
             )
-
-        return sorted(inferred), None
+            if not is_bank_cc:
+                bank_hint = any(token in name_l for token in BANK_NAME_HINTS)
+                cc_hint = any(token in name_l for token in CC_NAME_HINTS)
+                is_bank_cc = bank_hint or cc_hint
+            if not is_bank_cc:
+                continue
+            seen.add(ref)
+            fallback.append(
+                {
+                    "account_ref": ref,
+                    "account_id": _canonical_account_id(ref),
+                    "account_name": acct.name,
+                    "account_type": "Credit Card"
+                    if any(token in name_l for token in CC_NAME_HINTS)
+                    else "Bank",
+                    "active": True,
+                    "inferred_by_name_heuristic": True,
+                }
+            )
+        return sorted(fallback, key=lambda row: row["account_ref"]), "fallback_heuristic"
 
     def _determine_scope(
         self,
-        ctx: RuleContext,
         cfg: BankReconciledThroughPeriodEndRuleConfig,
         inferred_refs: list[str],
     ) -> list[str]:
-        exclude = list(cfg.exclude_accounts or [])
-
-        # Back-compat: if `expected_accounts[]` is provided, treat it as the explicit scope list.
+        exclude = set(cfg.exclude_accounts or [])
         if cfg.expected_accounts:
-            return sorted([r for r in cfg.expected_accounts if r not in set(exclude)])
+            return sorted([ref for ref in cfg.expected_accounts if ref not in exclude])
+        refs = (set(inferred_refs) | set(cfg.include_accounts or [])) - exclude
+        return sorted(refs)
 
-        refs = sorted((set(inferred_refs) | set(cfg.include_accounts or [])) - set(exclude))
-        return refs
-
-    def _check_maintenance_count(
+    def _trial_balance_map(
         self,
         ctx: RuleContext,
         cfg: BankReconciledThroughPeriodEndRuleConfig,
-        inferred_refs: list[str] | None,
-    ) -> tuple[RuleStatus | None, RuleResultDetail | None]:
-        """
-        Compare maintenance list count to inferred bank/cc accounts from the Balance Sheet.
-        """
-        if not cfg.expected_accounts:
-            return None, None
+    ) -> dict[str, Decimal]:
+        out: dict[str, Decimal] = {}
+        for item in ctx.evidence.items:
+            if item.evidence_type != cfg.trial_balance_evidence_type:
+                continue
+            direct = item.meta.get("balances_by_account_ref")
+            if isinstance(direct, dict):
+                for key, value in direct.items():
+                    amount = _as_decimal(value)
+                    if amount is None:
+                        continue
+                    out[str(key)] = amount
+            report_payload = item.meta.get("report")
+            report = coerce_report_payload(report_payload) if report_payload is not None else None
+            if report is None:
+                report = coerce_report_payload(item.meta)
+            if report is not None:
+                out.update(trial_balance_register_balances_from_report(report))
+        return out
 
-        if inferred_refs is None:
-            return (
-                RuleStatus.NEEDS_REVIEW,
-                RuleResultDetail(
-                    key="scope_count",
-                    message="Cannot compare maintenance list to Balance Sheet bank/cc count (missing type/subtype).",
-                    values={
-                        "period_end": ctx.period_end.isoformat(),
-                        "maintenance_account_count": len(cfg.expected_accounts),
-                        "status": RuleStatus.NEEDS_REVIEW.value,
-                    },
-                ),
-            )
-
-        maintenance_refs = list(cfg.expected_accounts)
-        inferred_set = set(inferred_refs)
-        maintenance_set = set(maintenance_refs)
-
-        missing_in_bs = sorted(maintenance_set - inferred_set)
-        extra_in_bs = sorted(inferred_set - maintenance_set)
-
-        if len(maintenance_refs) != len(inferred_refs):
-            return (
-                RuleStatus.FAIL,
-                RuleResultDetail(
-                    key="scope_count",
-                    message="Maintenance bank/cc account count does not match Balance Sheet bank/cc count.",
-                    values={
-                        "period_end": ctx.period_end.isoformat(),
-                        "maintenance_account_count": len(maintenance_refs),
-                        "balance_sheet_bank_cc_count": len(inferred_refs),
-                        "missing_in_balance_sheet": missing_in_bs[:20],
-                        "extra_in_balance_sheet": extra_in_bs[:20],
-                        "status": RuleStatus.FAIL.value,
-                    },
-                ),
-            )
-
-        return (
-            RuleStatus.PASS,
-            RuleResultDetail(
-                key="scope_count",
-                message="Maintenance bank/cc account count matches Balance Sheet bank/cc count.",
-                values={
-                    "period_end": ctx.period_end.isoformat(),
-                    "maintenance_account_count": len(maintenance_refs),
-                    "balance_sheet_bank_cc_count": len(inferred_refs),
-                    "status": RuleStatus.PASS.value,
-                },
-            ),
+    def _find_best_statement_item(
+        self,
+        items: list[Any],
+        *,
+        account_ref: str,
+        account_id: str,
+    ):
+        candidates = [
+            item
+            for item in items
+            if _matches_account(item.meta or {}, account_ref=account_ref, account_id=account_id)
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: item.statement_end_date or item.as_of_date or date.min,
         )
+
+    def _statement_amount_from_meta(self, meta: dict[str, Any]) -> Decimal | None:
+        for key in ("ending_balance", "statement_ending_balance", "available_ending", "amount"):
+            value = _as_decimal(meta.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _transaction_summary(
+        self,
+        tx_items: list[Any],
+        *,
+        account_ref: str,
+        account_id: str,
+        period_end: date,
+        statement_end_date: date,
+    ) -> dict[str, Any]:
+        for item in tx_items:
+            meta = item.meta or {}
+            if not _matches_account(meta, account_ref=account_ref, account_id=account_id):
+                continue
+            s1 = _as_decimal(meta.get("sum_not_reconciled_as_of_period_end"))
+            s2 = _as_decimal(meta.get("sum_not_reconciled_between_period_end_and_statement_end"))
+            if s1 is not None and s2 is not None:
+                return {
+                    "sum_not_reconciled_as_of_period_end": s1,
+                    "sum_not_reconciled_between_period_end_and_statement_end": s2,
+                    "clear_status_column_found": bool(meta.get("clear_status_column_found", True)),
+                    "parsed_rows": meta.get("parsed_rows"),
+                    "ignored_rows": meta.get("ignored_rows"),
+                }
+            report = meta.get("report")
+            if report is None and isinstance(meta.get("payload"), dict):
+                report = meta.get("payload")
+            if report is not None:
+                parsed = transaction_list_unreconciled_sums_from_report(
+                    report,
+                    period_end=period_end,
+                    statement_end_date=statement_end_date,
+                )
+                return parsed
+        return {
+            "sum_not_reconciled_as_of_period_end": None,
+            "sum_not_reconciled_between_period_end_and_statement_end": None,
+            "clear_status_column_found": False,
+            "parsed_rows": 0,
+            "ignored_rows": 0,
+        }

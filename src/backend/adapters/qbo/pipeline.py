@@ -25,8 +25,8 @@ def build_qbo_snapshots(
     profit_and_loss_report: dict[str, Any] | None = None,
     accounts_payload: dict[str, Any] | None = None,
     realm_id: str | None = None,
-    include_rows_without_id: bool = False,
-    include_summary_totals: bool = False,
+    include_rows_without_id: bool = True,
+    include_summary_totals: bool = True,
     pnl_summarize_by_month: bool = False,
 ) -> QBOAdapterOutputs:
     """

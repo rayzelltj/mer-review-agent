@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .auth import QBOAuthError, TOKEN_URL
+from common.telemetry import traced_phase
 
 
 def exchange_code_for_tokens(
@@ -33,9 +34,13 @@ def exchange_code_for_tokens(
     req.add_header("Authorization", f"Basic {auth_b64}")
 
     try:
-        with urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
+        with traced_phase(
+            "dependency.qbo.exchange_code",
+            attributes={"http.url": TOKEN_URL, "http.method": "POST"},
+        ):
+            with urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw)
     except HTTPError as exc:
         body = exc.read().decode("utf-8") if exc.fp else None
         raise QBOAuthError(f"Token exchange failed: {exc.code} {exc.reason}", body) from exc

@@ -32,3 +32,6 @@ Config model: `BalanceUnchangedPriorMonthRuleConfig`
 
 Notes:
 - This rule uses only the most recent prior month snapshot.
+
+## Tests
+- `src/backend/tests/rules_engine/test_bs_balance_unchanged_prior_month.py`

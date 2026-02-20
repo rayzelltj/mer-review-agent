@@ -35,7 +35,29 @@ def _iter_items(meta: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 yield item
 
 
+def _to_date(value: Any) -> date | None:
+    """Coerce a str, date, or datetime to a date object; return None on failure."""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value if not hasattr(value, "date") else value.date()  # type: ignore[union-attr]
+    if isinstance(value, str):
+        val = value.strip()
+        if not val:
+            return None
+        # Accept ISO date (YYYY-MM-DD) or datetime prefix
+        try:
+            return date.fromisoformat(val[:10])
+        except ValueError:
+            return None
+    return None
+
+
 def _infer_months_between(start: date, end: date) -> int | None:
+    start = _to_date(start)  # type: ignore[assignment]
+    end = _to_date(end)  # type: ignore[assignment]
+    if start is None or end is None:
+        return None
     if end < start:
         return None
     months = (end.year - start.year) * 12 + (end.month - start.month) + 1
@@ -132,7 +154,7 @@ class BS_TAX_FILINGS_UP_TO_DATE(Rule):
             _TaxAgency(
                 agency_id=str(item.get("id") or ""),
                 display_name=str(item.get("display_name") or ""),
-                last_file_date=item.get("last_file_date"),
+                last_file_date=_to_date(item.get("last_file_date")),
                 tax_tracked_on_sales=bool(item.get("tax_tracked_on_sales")),
             )
             for item in _iter_items(agencies_item.meta or {})
@@ -140,9 +162,9 @@ class BS_TAX_FILINGS_UP_TO_DATE(Rule):
         returns = [
             _TaxReturn(
                 agency_id=str(item.get("agency_id") or ""),
-                start_date=item.get("start_date"),
-                end_date=item.get("end_date"),
-                file_date=item.get("file_date"),
+                start_date=_to_date(item.get("start_date")),
+                end_date=_to_date(item.get("end_date")),
+                file_date=_to_date(item.get("file_date")),
             )
             for item in _iter_items(returns_item.meta or {})
         ]

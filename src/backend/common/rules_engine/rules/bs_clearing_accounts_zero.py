@@ -3,17 +3,16 @@ from __future__ import annotations
 from decimal import Decimal
 
 from ..config import AccountThresholdOverride, ClearingAccountsZeroRuleConfig
-from ..context import RuleContext, compute_allowed_variance, quantize_amount
-from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
+from ..context import RuleContext, quantize_amount
+from ..models import RuleResult, RuleResultDetail, RuleStatus, StatusOrdering, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
 
+PLATFORM_REVENUE_RATE = Decimal("0.10")
+PRIOR_VARIANCE_RATE = Decimal("0.03")
 
-def _platform_revenue_from_pnl(
-    pnl, account_name: str
-) -> tuple[Decimal | None, list[str]]:
-    if pnl is None or not account_name:
-        return None, []
+
+def _platform_tokens(account_name: str) -> list[str]:
     stopwords = {
         "clearing",
         "account",
@@ -28,7 +27,15 @@ def _platform_revenue_from_pnl(
         for t in account_name.replace("-", " ").replace("/", " ").split()
         if t.strip()
     ]
-    tokens = [t for t in tokens if t not in stopwords and len(t) >= 3]
+    return [t for t in tokens if t not in stopwords and len(t) >= 3]
+
+
+def _platform_revenue_from_pnl(
+    pnl, account_name: str
+) -> tuple[Decimal | None, list[str]]:
+    if pnl is None or not account_name:
+        return None, []
+    tokens = _platform_tokens(account_name)
     if not tokens:
         return None, []
 
@@ -45,11 +52,39 @@ def _platform_revenue_from_pnl(
     return (total if matched else None), tokens
 
 
-def _is_current_asset_type(account_type: str, current_asset_types: list[str]) -> bool:
+def _is_sales_asset_type(account_type: str, current_asset_types: list[str]) -> bool:
     if not account_type:
         return False
     lowered = account_type.lower()
-    return any(lowered == t.lower() for t in current_asset_types)
+    if any(lowered == t.lower() for t in current_asset_types):
+        return True
+    return "asset" in lowered
+
+
+def _latest_prior_snapshot(ctx: RuleContext):
+    if not ctx.prior_balance_sheets:
+        return None
+    return max(
+        (bs for bs in ctx.prior_balance_sheets if bs.as_of_date < ctx.period_end),
+        default=None,
+        key=lambda bs: bs.as_of_date,
+    )
+
+
+def _previous_month_variance_value(
+    ctx: RuleContext,
+    *,
+    account_ref: str,
+) -> tuple[Decimal, str | None, bool]:
+    prior_snapshot = _latest_prior_snapshot(ctx)
+    if prior_snapshot is None:
+        return Decimal("0"), None, True
+
+    for acct in prior_snapshot.accounts:
+        if acct.account_ref == account_ref:
+            return abs(acct.balance), prior_snapshot.as_of_date.isoformat(), False
+
+    return Decimal("0"), prior_snapshot.as_of_date.isoformat(), True
 
 
 @register_rule
@@ -77,49 +112,62 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
         accounts_to_eval: list[AccountThresholdOverride] = []
         used_name_inference = False
         type_unknown: list[AccountThresholdOverride] = []
-        skipped_non_current: list[AccountThresholdOverride] = []
         account_by_ref = {acct.account_ref: acct for acct in ctx.balance_sheet.accounts}
+        name_by_ref = {acct.account_ref: acct.name for acct in ctx.balance_sheet.accounts}
+
         if cfg.accounts:
             for acct_cfg in cfg.accounts:
                 acct = account_by_ref.get(acct_cfg.account_ref)
+                resolved_name = (acct.name if acct else "") or acct_cfg.account_name
                 if acct is None:
-                    accounts_to_eval.append(acct_cfg)
+                    accounts_to_eval.append(
+                        AccountThresholdOverride(
+                            account_ref=acct_cfg.account_ref,
+                            account_name=resolved_name,
+                            threshold=acct_cfg.threshold,
+                        )
+                    )
                     continue
                 if not acct.type:
-                    type_unknown.append(acct_cfg)
+                    type_unknown.append(
+                        AccountThresholdOverride(
+                            account_ref=acct_cfg.account_ref,
+                            account_name=resolved_name,
+                            threshold=acct_cfg.threshold,
+                        )
+                    )
                     continue
-                if _is_current_asset_type(acct.type, cfg.current_asset_types):
-                    accounts_to_eval.append(acct_cfg)
-                else:
-                    skipped_non_current.append(acct_cfg)
+                if _is_sales_asset_type(acct.type, cfg.current_asset_types):
+                    accounts_to_eval.append(
+                        AccountThresholdOverride(
+                            account_ref=acct_cfg.account_ref,
+                            account_name=resolved_name,
+                            threshold=acct_cfg.threshold,
+                        )
+                    )
         else:
             used_name_inference = True
             for acct in ctx.balance_sheet.accounts:
                 if acct.account_ref.startswith("report::"):
                     continue
-                if "clearing" in (acct.name or "").lower():
-                    if not acct.type:
-                        type_unknown.append(
-                            AccountThresholdOverride(
-                                account_ref=acct.account_ref,
-                                account_name=acct.name,
-                            )
-                        )
-                        continue
-                    if not _is_current_asset_type(acct.type, cfg.current_asset_types):
-                        skipped_non_current.append(
-                            AccountThresholdOverride(
-                                account_ref=acct.account_ref,
-                                account_name=acct.name,
-                            )
-                        )
-                        continue
-                    accounts_to_eval.append(
+                if "clearing" not in (acct.name or "").lower():
+                    continue
+                if not acct.type:
+                    type_unknown.append(
                         AccountThresholdOverride(
                             account_ref=acct.account_ref,
                             account_name=acct.name,
                         )
                     )
+                    continue
+                if not _is_sales_asset_type(acct.type, cfg.current_asset_types):
+                    continue
+                accounts_to_eval.append(
+                    AccountThresholdOverride(
+                        account_ref=acct.account_ref,
+                        account_name=acct.name,
+                    )
+                )
 
         if type_unknown:
             return RuleResult(
@@ -131,7 +179,7 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                 severity=severity_for_status(missing_status),
                 summary=(
                     "Clearing accounts found but missing account type/subtype; cannot "
-                    "classify sales vs non-sales clearing accounts."
+                    "confirm they are sales clearing accounts under assets."
                 ),
                 details=[
                     RuleResultDetail(
@@ -140,12 +188,15 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                         values={
                             "account_name": acct.account_name,
                             "period_end": ctx.period_end.isoformat(),
+                            "classification_rule": "sales clearing accounts must be under assets",
                             "status": missing_status.value,
                         },
                     )
                     for acct in type_unknown
                 ],
-                human_action="Provide account types (via Chart of Accounts) for clearing accounts.",
+                human_action=(
+                    "Provide account types (via Chart of Accounts) so clearing accounts can be classified under assets."
+                ),
             )
 
         if not accounts_to_eval:
@@ -156,29 +207,20 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                 sources=self.sources,
                 status=RuleStatus.NOT_APPLICABLE,
                 severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
-                summary=(
-                    f"No sales clearing accounts found for period end {ctx.period_end.isoformat()}."
-                ),
+                summary=f"No sales clearing accounts found for period end {ctx.period_end.isoformat()}.",
                 human_action=(
-                    "Configure clearing account refs for this client or confirm they do not exist, then set "
-                    "acceptable variances per account (recommended)."
+                    "Confirm whether sales clearing accounts exist under assets and ensure account names include "
+                    "their platform/sales-channel name."
                 ),
             )
 
-        revenue_total = ctx.get_revenue_total()
         ordering = StatusOrdering.default()
         statuses: list[RuleStatus] = []
         details: list[RuleResultDetail] = []
 
-        default_threshold_configured = (cfg.default_threshold.floor_amount != 0) or (
-            cfg.default_threshold.pct_of_revenue != 0
-        )
-        has_any_threshold = default_threshold_configured or any(
-            a.threshold is not None for a in accounts_to_eval
-        )
-
         for acct_cfg in accounts_to_eval:
             bal = ctx.get_account_balance(acct_cfg.account_ref)
+            account_name = name_by_ref.get(acct_cfg.account_ref, "") or acct_cfg.account_name
             if bal is None:
                 statuses.append(missing_status)
                 details.append(
@@ -186,37 +228,60 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                         key=acct_cfg.account_ref,
                         message="Account not found in balance sheet snapshot.",
                         values={
-                            "account_name": acct_cfg.account_name,
+                            "account_name": account_name,
                             "period_end": ctx.period_end.isoformat(),
+                            "classification_rule": "sales clearing accounts must be under assets",
                             "status": missing_status.value,
                         },
                     )
                 )
                 continue
 
-            threshold = acct_cfg.threshold or cfg.default_threshold
-            threshold_configured = default_threshold_configured or (acct_cfg.threshold is not None)
-            platform_revenue = None
-            platform_tokens: list[str] = []
-            if acct_cfg.threshold is None:
-                platform_revenue, platform_tokens = _platform_revenue_from_pnl(
-                    ctx.profit_and_loss, acct_cfg.account_name
+            platform_revenue, platform_tokens = _platform_revenue_from_pnl(
+                ctx.profit_and_loss, account_name
+            )
+            previous_variance_value, previous_period_end, previous_variance_missing = (
+                _previous_month_variance_value(
+                    ctx,
+                    account_ref=acct_cfg.account_ref,
                 )
-            if platform_revenue is not None:
-                allowed = (abs(platform_revenue) * Decimal("0.10")).copy_abs()
-                threshold_configured = True
-                threshold_source = "platform_revenue"
-            else:
-                allowed = compute_allowed_variance(threshold=threshold, revenue_total=revenue_total)
-                threshold_source = "configured" if threshold_configured else "unconfigured"
+            )
+
+            platform_component = (
+                (abs(platform_revenue) * PLATFORM_REVENUE_RATE).copy_abs()
+                if platform_revenue is not None
+                else Decimal("0")
+            )
+            previous_component = (previous_variance_value * PRIOR_VARIANCE_RATE).copy_abs()
+            allowed = platform_component + previous_component
+
             bal_q = quantize_amount(bal, cfg.amount_quantize)
             abs_bal = abs(bal_q)
+            platform_component_q = quantize_amount(platform_component, cfg.amount_quantize)
+            previous_variance_q = quantize_amount(previous_variance_value, cfg.amount_quantize)
+            previous_component_q = quantize_amount(previous_component, cfg.amount_quantize)
             allowed_q = quantize_amount(allowed, cfg.amount_quantize)
+            allowed_variance_calculation = (
+                f"({PLATFORM_REVENUE_RATE} * abs({platform_revenue if platform_revenue is not None else Decimal('0')})) + "
+                f"({PRIOR_VARIANCE_RATE} * abs({previous_variance_value})) = {allowed_q}"
+            )
+            platform_name_missing = len(platform_tokens) == 0
+            platform_revenue_missing = platform_revenue is None
 
-            if abs_bal == 0:
+            review_comment = None
+            if platform_name_missing:
+                status = RuleStatus.NEEDS_REVIEW
+                review_comment = (
+                    "GENERIC CLEARING ACCOUNT: add specific platform/sales-channel name "
+                    "(e.g., 'Etsy Clearing Account')."
+                )
+            elif platform_revenue_missing:
+                status = RuleStatus.NEEDS_REVIEW
+                review_comment = (
+                    "No matching platform revenue line found in P&L for this clearing account name."
+                )
+            elif abs_bal == 0:
                 status = RuleStatus.PASS
-            elif not threshold_configured:
-                status = cfg.unconfigured_threshold_policy
             else:
                 status = RuleStatus.WARN if abs_bal <= allowed_q else RuleStatus.FAIL
 
@@ -226,20 +291,32 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                     key=acct_cfg.account_ref,
                     message="Clearing account balance evaluated.",
                     values={
-                        "account_name": acct_cfg.account_name,
+                        "account_name": account_name,
                         "period_end": ctx.period_end.isoformat(),
                         "balance": str(bal_q),
                         "abs_balance": str(abs_bal),
-                        "allowed_variance": str(allowed_q),
-                        "revenue_total": str(revenue_total) if revenue_total is not None else None,
-                        "threshold_floor_amount": str(threshold.floor_amount),
-                        "threshold_pct_of_revenue": str(threshold.pct_of_revenue),
-                        "status": status.value,
-                        "threshold_configured": threshold_configured,
-                        "inferred_by_name_match": used_name_inference,
-                        "threshold_source": threshold_source,
+                        "classification_rule": "sales clearing accounts must be under assets",
+                        "variance_formula": (
+                            "allowed_variance = (10% * abs(platform_revenue)) + "
+                            "(3% * abs(previous_month_variance_value))"
+                        ),
+                        "platform_revenue_rate": str(PLATFORM_REVENUE_RATE),
                         "platform_revenue": str(platform_revenue) if platform_revenue is not None else None,
+                        "platform_variance_component": str(platform_component_q),
+                        "previous_month_variance_rate": str(PRIOR_VARIANCE_RATE),
+                        "previous_month_variance_value": str(previous_variance_q),
+                        "previous_month_variance_component": str(previous_component_q),
+                        "previous_month_period_end": previous_period_end,
+                        "previous_month_variance_missing": previous_variance_missing,
+                        "allowed_variance": str(allowed_q),
+                        "allowed_variance_calculation": allowed_variance_calculation,
+                        "threshold_source": "platform_revenue_plus_previous_month_variance",
                         "platform_tokens": platform_tokens,
+                        "platform_name_missing": platform_name_missing,
+                        "platform_revenue_missing": platform_revenue_missing,
+                        "review_comment": review_comment,
+                        "status": status.value,
+                        "inferred_by_name_match": used_name_inference,
                     },
                 )
             )
@@ -263,21 +340,41 @@ class BS_CLEARING_ACCOUNTS_ZERO(Rule):
                 f"({exemplar.values.get('balance')} vs {exemplar.values.get('allowed_variance')}) "
                 f"as of {ctx.period_end.isoformat()}."
             )
+        elif overall == RuleStatus.NEEDS_REVIEW and exemplar:
+            review_comment = exemplar.values.get("review_comment")
+            if review_comment:
+                summary = review_comment
+            else:
+                summary = (
+                    f"One or more sales clearing accounts require review as of {ctx.period_end.isoformat()} "
+                    "(missing platform name, mapping, or data)."
+                )
         elif overall == RuleStatus.NEEDS_REVIEW:
-            summary = f"Missing data prevented evaluation for one or more accounts as of {ctx.period_end.isoformat()}."
+            summary = (
+                f"One or more sales clearing accounts require review as of {ctx.period_end.isoformat()} "
+                "(missing platform name, mapping, or data)."
+            )
         else:
             summary = "Not applicable."
 
         human_action = None
         if overall in (RuleStatus.WARN, RuleStatus.FAIL, RuleStatus.NEEDS_REVIEW):
-            human_action = (
-                "Verify clearing account activity near period end and explain any non-zero balances; "
-                "adjust tolerances per account if warranted."
-            )
-            if not has_any_threshold and overall != RuleStatus.PASS:
+            has_generic = any(d.values.get("platform_name_missing") for d in details)
+            has_missing_mapping = any(d.values.get("platform_revenue_missing") for d in details)
+            if has_generic:
                 human_action = (
-                    f"{human_action} Note: no acceptable variance was configured (TBD); "
-                    "set per-account thresholds (floor and/or % of revenue)."
+                    "GENERIC CLEARING ACCOUNT detected. Rename each clearing account to include its associated "
+                    "platform/sales channel (e.g., Etsy, Shopify, Amazon)."
+                )
+            elif has_missing_mapping:
+                human_action = (
+                    "Ensure each clearing account name maps to a platform revenue line in P&L "
+                    "(income_line:*), then re-run the variance check."
+                )
+            else:
+                human_action = (
+                    "Review non-zero sales clearing balances and reconcile them using "
+                    "allowed_variance = 10% platform revenue + 3% previous-month variance value."
                 )
             if used_name_inference:
                 human_action = f"{human_action} Note: accounts were inferred by name match ('clearing')."

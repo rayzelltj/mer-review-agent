@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional, Union
 
 import aiohttp
 from common.config.app_config import config
+from common.http_clients import get_shared_aiohttp_session
 
 
 class BaseAPIService:
@@ -26,6 +27,7 @@ class BaseAPIService:
         self.default_headers = default_headers or {}
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session_external = session is not None
+        self._session_shared = False
         self._session: Optional[aiohttp.ClientSession] = session
 
     @classmethod
@@ -51,8 +53,18 @@ class BaseAPIService:
         return cls(base_url, **kwargs)
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self.timeout)
+        if self._session is None:
+            if self._session_external:
+                raise RuntimeError(
+                    "External aiohttp session was expected but is not available."
+                )
+            self._session = await get_shared_aiohttp_session()
+            self._session_shared = True
+        elif self._session.closed:
+            if self._session_external:
+                raise RuntimeError("External aiohttp session is closed.")
+            self._session = await get_shared_aiohttp_session()
+            self._session_shared = True
         return self._session
 
     def _url(self, path: str) -> str:
@@ -69,13 +81,23 @@ class BaseAPIService:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Union[str, int, float]]] = None,
         json: Optional[Dict[str, Any]] = None,
-    ) -> aiohttp.ClientResponse:
+    ) -> Any:
         session = await self._ensure_session()
         url = self._url(path)
         merged_headers = {**self.default_headers, **(headers or {})}
-        return await session.request(
-            method.upper(), url, headers=merged_headers, params=params, json=json
-        )
+        async with session.request(
+            method.upper(),
+            url,
+            headers=merged_headers,
+            params=params,
+            json=json,
+            timeout=self.timeout,
+        ) as response:
+            response.raise_for_status()
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if "application/json" in content_type:
+                return await response.json()
+            return await response.text()
 
     async def get_json(
         self,
@@ -84,9 +106,7 @@ class BaseAPIService:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Union[str, int, float]]] = None,
     ) -> Any:
-        resp = await self._request("GET", path, headers=headers, params=params)
-        resp.raise_for_status()
-        return await resp.json()
+        return await self._request("GET", path, headers=headers, params=params)
 
     async def post_json(
         self,
@@ -96,14 +116,15 @@ class BaseAPIService:
         params: Optional[Dict[str, Union[str, int, float]]] = None,
         json: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        resp = await self._request(
-            "POST", path, headers=headers, params=params, json=json
-        )
-        resp.raise_for_status()
-        return await resp.json()
+        return await self._request("POST", path, headers=headers, params=params, json=json)
 
     async def close(self) -> None:
-        if self._session and not self._session.closed and not self._session_external:
+        if (
+            self._session
+            and not self._session.closed
+            and not self._session_external
+            and not self._session_shared
+        ):
             await self._session.close()
 
     async def __aenter__(self) -> "BaseAPIService":

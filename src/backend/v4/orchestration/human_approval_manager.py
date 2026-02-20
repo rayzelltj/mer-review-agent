@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import v4.models.messages as messages
 from agent_framework import ChatMessage
+from common.database.database_factory import DatabaseFactory
 from agent_framework._workflows._magentic import (
     MagenticContext,
     StandardMagenticManager,
@@ -53,18 +54,42 @@ Do not ask the user unless all agents have been consulted and the information is
 Plan steps should always include a bullet point, followed by an agent name, followed by a description of the action
 to be taken. If a step involves multiple actions, separate them into distinct steps with an agent included in each step.
 If the step is taken by an agent that is not part of the team, such as the MagenticManager, please always list the MagenticManager as the agent for that step. At any time, if more information is needed from the user, use the ProxyAgent to request this information.
+The first plan step must always be a MagenticManager orchestration step that states it will coordinate the team.
+Every plan step — including steps 2, 3, and all subsequent steps — MUST start with the assigned agent name in bold (e.g. **ConnectorAgent**, **NormalizationAgent**, **RulesAgent**, **ReportAgent**, **HITLAgent**, **ProxyAgent**). Never omit the agent name from any step.
 
-Here is an example of a well-structured plan:
-- **EnhancedResearchAgent** to gather authoritative data on the latest industry trends and best practices in employee onboarding
-- **EnhancedResearchAgent** to gather authoritative data on Innovative onboarding techniques that enhance new hire engagement and retention.
-- **DocumentCreationAgent** to draft a comprehensive onboarding plan that includes a detailed schedule of onboarding activities and milestones.
-- **DocumentCreationAgent** to draft a comprehensive onboarding plan that includes a checklist of resources and materials needed for effective onboarding.
-- **ProxyAgent** to review the drafted onboarding plan for clarity and completeness.
-- **MagenticManager** to finalize the onboarding plan and prepare it for presentation to stakeholders.
+BALANCE SHEET REVIEW — PIPELINE FLOW (when a full review is requested):
+  **ConnectorAgent** → verifies QBO connection, calls bs_fetch_data, waits for status=raw (raw QBO API data saved)
+  **NormalizationAgent** → calls bs_normalize_data (runs build_qbo_snapshots/aging/tax evidence), waits for status=fetched
+  **RulesAgent** → triggers rules evaluation via bs_run_rules (or bs_run_rules with rule_ids for specific rules)
+  **ReportAgent** → reads findings via bs_get_findings and returns structured JSON with balance_sheet_rows
+  **HITLAgent** → ONLY if ReportAgent JSON contains non-empty hitl_requests; calls bs_submit_evidence_request
+
+CRITICAL CONSTRAINT — A full balance sheet review MUST include ALL FIVE of the above agents in EXACTLY this order: ConnectorAgent → NormalizationAgent → RulesAgent → ReportAgent → HITLAgent. Omitting RulesAgent is INCORRECT — the rules engine will never run and the review will be incomplete. Omitting NormalizationAgent is INCORRECT — raw data will not be normalized and RulesAgent will fail. Every full review plan MUST contain a step for each of these five agents.
+
+FLEXIBLE FLOW — NOT every query requires all agents. Route based on user intent:
+  - "Is QBO connected?" or "check QBO status" → **ConnectorAgent** only → **ProxyAgent**
+  - "Show me the balance sheet / P&L data" → **ConnectorAgent** (fetch) → **ProxyAgent**
+  - "Run only rule BS-CASH-BALANCE" → **ConnectorAgent** → **NormalizationAgent** → **RulesAgent** (with rule_ids) → **ReportAgent**
+  - "What were the findings from run <run_id>?" → **ReportAgent** (reads stored run) → **ProxyAgent**
+  - "Full balance sheet review" → full 5-agent pipeline above (ALL FIVE agents, no skipping)
+  - "What rules are available?" → **RulesAgent** (calls bs_list_rules) → **ProxyAgent**
+
+If the ConnectorAgent reports QBO disconnected or unauthorized, terminate the workflow immediately after providing the connect URL through ProxyAgent, and do not invoke the remaining agents.
+If any agent reports a transient tool or network failure (for example timeout, JSON parse on timeout text, or temporary 5xx), retry the same step up to 2 times before escalating to ProxyAgent.
 """
 
         final_append = """
 DO NOT EVER OFFER TO HELP FURTHER IN THE FINAL ANSWER! Just provide the final answer and end with a polite closing.
+
+BALANCE SHEET REVIEW OUTPUT FORMAT — When the task involves a balance sheet review and the conversation contains balance_sheet_rows data, structure your final answer as follows:
+
+1. **Executive Summary** — 3-5 sentences on the client's overall financial position and most critical concerns.
+
+2. **## Balance Sheet** — Render ALL rows from balance_sheet_rows as a markdown table. Add a `### [Section]` heading before each distinct account section group (e.g. ### Assets, ### Current Liabilities, ### Non-current Liabilities, ### Equity). Columns: | Account | Balance | Status | Notes |. Status emoji: ✅ PASS · ❌ FAIL · ⚠️ NEEDS REVIEW · — (NOT_APPLICABLE). Show the row's `flag` in Notes if non-empty, otherwise leave blank. Format balance values with two decimal places.
+
+3. **## Issues Requiring Attention** — Bullet list of every ❌ FAIL and ⚠️ NEEDS REVIEW account, showing the account name, flag description, and required action from balance_sheet_rows.
+
+4. **## Recommended Next Steps** — Numbered list of 3-6 concrete actions ordered by urgency.
 """
 
         kwargs["task_ledger_plan_prompt"] = (
@@ -103,6 +128,42 @@ DO NOT EVER OFFER TO HELP FURTHER IN THE FINAL ANSWER! Just provide the final an
 
         self.magentic_plan = self.plan_to_obj(magentic_context, self.task_ledger)
         self.magentic_plan.user_id = self.current_user_id  # annotate with user
+        if not self.magentic_plan.plan_id:
+            try:
+                # Recover current plan_id so polling clients can render approval UI
+                # even if the websocket drops before the approval request arrives.
+                from v4.config.settings import run_control_config
+
+                active_run = await run_control_config.get_active_run(
+                    user_id=self.current_user_id
+                )
+                if active_run and active_run.plan_id:
+                    self.magentic_plan.plan_id = active_run.plan_id
+            except Exception as attach_err:
+                logger.warning(
+                    "Unable to attach plan_id to m_plan for user=%s: %s",
+                    self.current_user_id,
+                    attach_err,
+                )
+
+        if self.magentic_plan.plan_id:
+            try:
+                memory_store = await DatabaseFactory.get_database(
+                    user_id=self.current_user_id
+                )
+                db_plan = await memory_store.get_plan_by_plan_id(
+                    plan_id=self.magentic_plan.plan_id
+                )
+                if db_plan:
+                    db_plan.m_plan = self.magentic_plan.model_dump()
+                    await memory_store.update_plan(db_plan)
+            except Exception as persist_err:
+                logger.warning(
+                    "Failed to persist pending m_plan for user=%s plan_id=%s: %s",
+                    self.current_user_id,
+                    self.magentic_plan.plan_id,
+                    persist_err,
+                )
 
         approval_message = messages.PlanApprovalRequest(
             plan=self.magentic_plan,

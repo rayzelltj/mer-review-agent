@@ -30,6 +30,7 @@ Acceptable variance policy is not defined yet. Current placeholder supports:
 1. Per-client/per-account absolute threshold
 2. % of revenue threshold
 3. Hybrid (`max(floor_amount, abs(revenue_total) * pct_of_revenue)`)
+4. Platform fallback: when account name tokens match `income_line:*` totals, allowed variance defaults to `10%` of platform revenue
 
 ## Evaluation logic (step-by-step)
 1. If `enabled == false` → `NOT_APPLICABLE`
@@ -37,6 +38,7 @@ Acceptable variance policy is not defined yet. Current placeholder supports:
 3. If no accounts found → `NEEDS_REVIEW`
 4. For each account:
    - If missing in Balance Sheet snapshot → `missing_data_policy`
+   - If account name is too generic to infer platform context (for example only `Undeposited Funds`) → `NEEDS_REVIEW`
    - Quantize if configured
    - If `abs(balance) == 0` → PASS (per-account)
    - If no thresholds configured for this account and non-zero → `unconfigured_threshold_policy` (TBD)
@@ -52,6 +54,7 @@ Acceptable variance policy is not defined yet. Current placeholder supports:
 ## Edge cases
 - Negative balances evaluated by absolute value
 - Missing revenue yields floor-only tolerance
+- Generic account naming can force `NEEDS_REVIEW` until platform context is provided in the account name/configuration
 
 ## Test matrix
 | Scenario | Expected |

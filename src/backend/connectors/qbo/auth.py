@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,8 +10,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .config import QBOConfig
+from .config import QBOConfig, get_client_store_mode
+from .client_store import update_refresh_token_for_realm
 from .token_store import save_tokens, token_store_path
+from common.telemetry import traced_phase
 
 
 TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
@@ -48,6 +51,8 @@ def refresh_access_token(config: QBOConfig) -> QBOConfig:
         access_token=access_token,
         refresh_token=refresh_token,
         token_expires_at=expires_at,
+        client_record_id=config.client_record_id,
+        user_principal_id=config.user_principal_id,
     )
     _persist_tokens(updated)
     return updated
@@ -78,9 +83,13 @@ def _post_refresh_token(config: QBOConfig) -> dict[str, Any]:
     req.add_header("Authorization", f"Basic {auth_b64}")
 
     try:
-        with urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
+        with traced_phase(
+            "dependency.qbo.refresh_token",
+            attributes={"http.url": TOKEN_URL, "http.method": "POST"},
+        ):
+            with urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw)
     except HTTPError as exc:
         body = exc.read().decode("utf-8") if exc.fp else None
         raise QBOAuthError(f"Token refresh failed: {exc.code} {exc.reason}", body) from exc
@@ -121,6 +130,18 @@ def _persist_tokens(config: QBOConfig) -> None:
     os.environ["QBO_ACCESS_TOKEN"] = config.access_token
     os.environ["QBO_REFRESH_TOKEN"] = config.refresh_token
     os.environ["QBO_TOKEN_EXPIRES_AT"] = config.token_expires_at
+
+    if get_client_store_mode() == "cosmos":
+        try:
+            update_refresh_token_for_realm(
+                realm_id=config.realm_id,
+                refresh_token=config.refresh_token,
+                user_principal_id=config.user_principal_id,
+                client_id=config.client_record_id,
+            )
+        except Exception as exc:
+            logging.warning("Failed to update Cosmos refresh token: %s", exc)
+        return
 
     env_file = os.getenv("QBO_ENV_FILE", ".env")
     if not os.path.exists(env_file):

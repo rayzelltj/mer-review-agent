@@ -3,6 +3,7 @@ from pathlib import Path
 
 from adapters.qbo.profit_and_loss import (
     QBOProfitAndLossAdapterError,
+    expense_month_over_month_from_report,
     profit_and_loss_snapshot_from_report,
 )
 
@@ -48,3 +49,61 @@ def test_profit_and_loss_adapter_errors_when_mer_month_column_missing():
         assert "Monthly column" in str(exc)
         return
     raise AssertionError("Expected QBOProfitAndLossAdapterError for missing month column.")
+
+
+def test_expense_month_over_month_extracts_line_variances():
+    report = {
+        "Header": {
+            "ReportName": "ProfitAndLoss",
+            "StartPeriod": "2025-11-01",
+            "EndPeriod": "2025-12-31",
+            "Currency": "USD",
+            "SummarizeColumnsBy": "Month",
+        },
+        "Columns": {
+            "Column": [
+                {"ColTitle": "", "MetaData": [{"Name": "ColKey", "Value": "account"}]},
+                {"ColTitle": "Nov. 2025"},
+                {"ColTitle": "Dec. 2025"},
+                {"ColTitle": "Total", "MetaData": [{"Name": "ColKey", "Value": "total"}]},
+            ]
+        },
+        "Rows": {
+            "Row": [
+                {
+                    "group": "Expenses",
+                    "type": "Section",
+                    "Rows": {
+                        "Row": [
+                            {
+                                "type": "Data",
+                                "ColData": [
+                                    {"value": "Advertising"},
+                                    {"value": "100.00"},
+                                    {"value": "150.00"},
+                                    {"value": "250.00"},
+                                ],
+                            },
+                            {
+                                "type": "Data",
+                                "ColData": [
+                                    {"value": "Office supplies"},
+                                    {"value": "200.00"},
+                                    {"value": "180.00"},
+                                    {"value": "380.00"},
+                                ],
+                            },
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+
+    out = expense_month_over_month_from_report(report)
+    by_name = {row["name"]: row for row in out["lines"]}
+    assert out["current_period_end"] == "2025-12-31"
+    assert out["prior_period_end"] == "2025-11-30"
+    assert by_name["Advertising"]["delta_amount"] == "50.00"
+    assert by_name["Advertising"]["abs_pct_change"] == "0.5"
+    assert by_name["Office supplies"]["delta_amount"] == "-20.00"

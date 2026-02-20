@@ -27,6 +27,7 @@ async def find_first_available_team(team_service: TeamService, user_id: str) -> 
         "00000000-0000-0000-0000-000000000003",  # Retail
         "00000000-0000-0000-0000-000000000002",  # Marketing
         "00000000-0000-0000-0000-000000000001",  # HR
+        "00000000-0000-0000-0000-000000000006",  # Balance Sheet Review
     ]
 
     # First, check standard teams in priority order

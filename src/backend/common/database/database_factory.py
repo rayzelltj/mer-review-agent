@@ -1,5 +1,6 @@
 """Database factory for creating database instances."""
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -12,7 +13,8 @@ from .database_base import DatabaseBase
 class DatabaseFactory:
     """Factory class for creating database instances."""
 
-    _instance: Optional[DatabaseBase] = None
+    _instances: dict[str, DatabaseBase] = {}
+    _lock = asyncio.Lock()
     _logger = logging.getLogger(__name__)
 
     @staticmethod
@@ -35,9 +37,16 @@ class DatabaseFactory:
         Returns:
             DatabaseBase: Database instance
         """
+        normalized_user_id = str(user_id or "").strip() or "__default__"
+        existing = DatabaseFactory._instances.get(normalized_user_id)
+        if existing is not None and not force_new:
+            return existing
 
-        # Create new instance if forced or if singleton doesn't exist
-        if force_new or DatabaseFactory._instance is None:
+        async with DatabaseFactory._lock:
+            existing = DatabaseFactory._instances.get(normalized_user_id)
+            if existing is not None and not force_new:
+                return existing
+
             cosmos_db_client = CosmosDBClient(
                 endpoint=config.COSMOSDB_ENDPOINT,
                 credential=config.get_azure_credentials(),
@@ -50,15 +59,19 @@ class DatabaseFactory:
             await cosmos_db_client.initialize()
 
             if not force_new:
-                DatabaseFactory._instance = cosmos_db_client
+                DatabaseFactory._instances[normalized_user_id] = cosmos_db_client
 
             return cosmos_db_client
-
-        return DatabaseFactory._instance
 
     @staticmethod
     async def close_all():
         """Close all database connections."""
-        if DatabaseFactory._instance:
-            await DatabaseFactory._instance.close()
-            DatabaseFactory._instance = None
+        instances = list(DatabaseFactory._instances.values())
+        DatabaseFactory._instances = {}
+        for instance in instances:
+            try:
+                await instance.close()
+            except Exception:
+                DatabaseFactory._logger.exception(
+                    "Error while closing database instance"
+                )

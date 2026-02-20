@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 
 from .config import QBOConfig
 from .auth import ensure_access_token_valid, refresh_access_token
+from common.telemetry import traced_phase
 
 
 class QBOHttpError(RuntimeError):
@@ -47,9 +48,17 @@ def qbo_get(
         req.add_header("Authorization", f"Bearer {config.access_token}")
 
         try:
-            with urlopen(req, timeout=timeout_seconds) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw)
+            with traced_phase(
+                "dependency.qbo.http_get",
+                attributes={
+                    "http.url": url,
+                    "http.method": "GET",
+                    "qbo.realm_id": config.realm_id,
+                },
+            ):
+                with urlopen(req, timeout=timeout_seconds) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return json.loads(raw)
         except HTTPError as exc:
             body = exc.read().decode("utf-8") if exc.fp else None
             status = exc.code

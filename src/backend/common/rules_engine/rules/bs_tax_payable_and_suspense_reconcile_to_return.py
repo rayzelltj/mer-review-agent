@@ -25,6 +25,7 @@ class _TaxReturn:
     end_date: date | None
     file_date: date | None
     net_tax_amount_due: Decimal | None
+    upcoming_filing: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,23 @@ def _iter_items(meta: dict[str, Any]) -> Iterable[dict[str, Any]]:
         for item in items:
             if isinstance(item, dict):
                 yield item
+
+
+def _to_date(value: Any) -> date | None:
+    """Coerce a str, date, or datetime to a date object; return None on failure."""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value if not hasattr(value, "date") else value.date()  # type: ignore[union-attr]
+    if isinstance(value, str):
+        val = value.strip()
+        if not val:
+            return None
+        try:
+            return date.fromisoformat(val[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _name_matches(name: str, patterns: list[str]) -> bool:
@@ -91,6 +109,8 @@ def _add_months(dt: date, months: int) -> date:
 
 
 def _infer_months_between(start: date | None, end: date | None) -> int | None:
+    start = _to_date(start)  # type: ignore[assignment]
+    end = _to_date(end)  # type: ignore[assignment]
     if start is None or end is None or end < start:
         return None
     months = (end.year - start.year) * 12 + (end.month - start.month) + 1
@@ -123,6 +143,78 @@ def _is_payable_name(name: str) -> bool:
 def _is_suspense_name(name: str) -> bool:
     lowered = name.lower()
     return "suspense" in lowered or "suspence" in lowered
+
+
+def _latest_filed_return_as_of(
+    *,
+    agency_returns: list[_TaxReturn],
+    period_end: date,
+) -> _TaxReturn | None:
+    eligible = [
+        ret
+        for ret in agency_returns
+        if ret.end_date is not None
+        and ret.end_date <= period_end
+        and ret.file_date is not None
+        and ret.net_tax_amount_due is not None
+        and not ret.upcoming_filing
+    ]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda ret: ret.end_date or date.min)
+
+
+def _next_return_end_for_agency(
+    *,
+    agency_returns: list[_TaxReturn],
+    current_end: date,
+) -> date | None:
+    future_ends = sorted(
+        {
+            ret.end_date
+            for ret in agency_returns
+            if ret.end_date is not None and ret.end_date > current_end
+        }
+    )
+    return future_ends[0] if future_ends else None
+
+
+def _payment_adjustment_for_suspense(
+    *,
+    payments: list[_TaxPayment],
+    agency_id: str,
+    return_end_date: date,
+    period_end: date,
+    next_return_end: date | None,
+) -> tuple[Decimal, bool, int]:
+    payments_have_agency_mapping = any(p.agency_id for p in payments)
+    if not payments_have_agency_mapping:
+        return Decimal("0"), False, 0
+
+    adjustment = Decimal("0")
+    count = 0
+    for payment in payments:
+        if payment.agency_id != agency_id:
+            continue
+        if payment.payment_amount is None or payment.payment_date is None:
+            continue
+        if payment.payment_date <= return_end_date:
+            continue
+        if payment.payment_date > period_end:
+            continue
+        if next_return_end is not None and payment.payment_date > next_return_end:
+            continue
+
+        amount_abs = abs(payment.payment_amount)
+        if payment.refund:
+            # Refund increases suspense outstanding.
+            adjustment += amount_abs
+        else:
+            # Payment decreases suspense outstanding.
+            adjustment -= amount_abs
+        count += 1
+
+    return adjustment, True, count
 
 
 @register_rule
@@ -175,16 +267,17 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
         returns = [
             _TaxReturn(
                 agency_id=str(item.get("agency_id") or ""),
-                start_date=item.get("start_date"),
-                end_date=item.get("end_date"),
-                file_date=item.get("file_date"),
+                start_date=_to_date(item.get("start_date")),
+                end_date=_to_date(item.get("end_date")),
+                file_date=_to_date(item.get("file_date")),
                 net_tax_amount_due=item.get("net_tax_amount_due"),
+                upcoming_filing=bool(item.get("upcoming_filing")),
             )
             for item in _iter_items(returns_item.meta or {})
         ]
         payments = [
             _TaxPayment(
-                payment_date=item.get("payment_date"),
+                payment_date=_to_date(item.get("payment_date")),
                 payment_amount=item.get("payment_amount"),
                 refund=bool(item.get("refund")),
                 agency_id=item.get("agency_id"),
@@ -266,84 +359,36 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
             agency = next((a for a in agencies if a.agency_id == agency_id), None)
             agency_name = agency.display_name if agency else agency_id
             agency_returns = [r for r in returns if r.agency_id == agency_id]
-            filed_returns = [r for r in agency_returns if r.file_date is not None]
-            if not filed_returns:
-                if status_rank[missing_status] > status_rank[overall_status]:
-                    overall_status = missing_status
-                details.append(
-                    RuleResultDetail(
-                        key=agency_id,
-                        message="No filed tax returns found for agency.",
-                        values={
-                            "agency_name": agency_name,
-                            "period_end": ctx.period_end.isoformat(),
-                            "status": missing_status.value,
-                        },
-                    )
-                )
-                continue
-
-            cadence_months = _infer_months_between(
-                filed_returns[0].start_date, filed_returns[0].end_date
-            )
-            if cadence_months not in (1, 3, 12):
-                if status_rank[missing_status] > status_rank[overall_status]:
-                    overall_status = missing_status
-                details.append(
-                    RuleResultDetail(
-                        key=agency_id,
-                        message="Unable to infer filing cadence for agency.",
-                        values={
-                            "agency_name": agency_name,
-                            "period_end": ctx.period_end.isoformat(),
-                            "status": missing_status.value,
-                        },
-                    )
-                )
-                continue
-
-            anchor_end = max(
-                (r.end_date for r in agency_returns if r.end_date is not None),
-                default=None,
-            )
-            expected_end = _expected_period_end_from_anchor(
-                ctx.period_end, cadence_months, anchor_end
-            )
-            if expected_end is None:
-                if status_rank[missing_status] > status_rank[overall_status]:
-                    overall_status = missing_status
-                details.append(
-                    RuleResultDetail(
-                        key=agency_id,
-                        message="Unable to determine expected filing period end.",
-                        values={
-                            "agency_name": agency_name,
-                            "period_end": ctx.period_end.isoformat(),
-                            "status": missing_status.value,
-                        },
-                    )
-                )
-                continue
-
-            target_return = next(
-                (r for r in agency_returns if r.end_date == expected_end),
-                None,
+            target_return = _latest_filed_return_as_of(
+                agency_returns=agency_returns,
+                period_end=ctx.period_end,
             )
             if target_return is None:
-                eligible = [r for r in agency_returns if r.end_date and r.end_date <= expected_end]
-                if eligible:
-                    target_return = max(eligible, key=lambda r: r.end_date or date.min)
-            if target_return is None or target_return.net_tax_amount_due is None:
                 if status_rank[missing_status] > status_rank[overall_status]:
                     overall_status = missing_status
                 details.append(
                     RuleResultDetail(
                         key=agency_id,
-                        message="No return found for expected filing period.",
+                        message="No filed tax return found for agency on or before period end.",
                         values={
                             "agency_name": agency_name,
                             "period_end": ctx.period_end.isoformat(),
-                            "expected_period_end": expected_end.isoformat(),
+                            "status": missing_status.value,
+                        },
+                    )
+                )
+                continue
+
+            if target_return.net_tax_amount_due is None or target_return.end_date is None:
+                if status_rank[missing_status] > status_rank[overall_status]:
+                    overall_status = missing_status
+                details.append(
+                    RuleResultDetail(
+                        key=agency_id,
+                        message="Latest filed return is missing required net due or end date fields.",
+                        values={
+                            "agency_name": agency_name,
+                            "period_end": ctx.period_end.isoformat(),
                             "status": missing_status.value,
                         },
                     )
@@ -356,45 +401,32 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
             suspense_only = sum(
                 acct.balance for acct in accounts if _is_suspense_name(acct.name or "")
             )
-            actual_total = payable_only + suspense_only
 
-            matched_payments = [p for p in payments if p.agency_id == agency_id]
-            payments_mapped = any(p.agency_id for p in payments)
-            if not payments_mapped:
-                matched_payments = []
+            next_return_end = _next_return_end_for_agency(
+                agency_returns=agency_returns,
+                current_end=target_return.end_date,
+            )
+            payment_adjustment, payments_mapped_to_agency, payment_count = (
+                _payment_adjustment_for_suspense(
+                    payments=payments,
+                    agency_id=agency_id,
+                    return_end_date=target_return.end_date,
+                    period_end=ctx.period_end,
+                    next_return_end=next_return_end,
+                )
+            )
+            expected_suspense = target_return.net_tax_amount_due + payment_adjustment
 
-            net_payments = Decimal("0")
-            for p in matched_payments:
-                if p.payment_amount is None or p.payment_date is None:
-                    continue
-                if p.payment_date > ctx.period_end:
-                    continue
-                amt = p.payment_amount
-                if p.refund:
-                    amt = amt.copy_negate()
-                net_payments += amt
-
-            expected_total = target_return.net_tax_amount_due - net_payments
-            diff = abs(actual_total - expected_total)
-
-            core_status = RuleStatus.PASS if diff == 0 else cfg.delinquent_status
-
-            note = None
-            if target_return.net_tax_amount_due < 0 and core_status == RuleStatus.PASS:
-                note = "Refund indicated on latest return; refund may not have been issued yet."
-                if target_return.file_date:
-                    days_since_file = (ctx.period_end - target_return.file_date).days
-                    if days_since_file > cfg.refund_grace_days:
-                        core_status = RuleStatus.WARN
-
-            placement_warning = None
-            if payable_only < 0:
-                if target_return.net_tax_amount_due < 0 and core_status == RuleStatus.PASS:
-                    placement_warning = "Payable is negative; refund/credit scenario."
-                else:
-                    if status_rank[RuleStatus.WARN] > status_rank[core_status]:
-                        core_status = RuleStatus.WARN
-                    placement_warning = "Payable is negative; verify refund/overpayment/coding."
+            payable_status = RuleStatus.PASS if payable_only == 0 else RuleStatus.FAIL
+            suspense_difference = abs(suspense_only - expected_suspense)
+            suspense_status = (
+                RuleStatus.PASS if suspense_difference == 0 else RuleStatus(cfg.delinquent_status.value)
+            )
+            core_status = (
+                payable_status
+                if status_rank[payable_status] >= status_rank[suspense_status]
+                else suspense_status
+            )
 
             if status_rank[core_status] > status_rank[overall_status]:
                 overall_status = core_status
@@ -402,11 +434,17 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
             details.append(
                 RuleResultDetail(
                     key=agency_id,
-                    message="Tax payable/suspense balance reconciled to expected return.",
+                    message=(
+                        "Tax payable must be zero and suspense must tie to the most recent filed return "
+                        "plus payment/refund offsets."
+                    ),
                     values={
                         "agency_name": agency_name,
                         "period_end": ctx.period_end.isoformat(),
-                        "expected_period_end": expected_end.isoformat(),
+                        "expected_period_end": target_return.end_date.isoformat(),
+                        "next_expected_period_end": next_return_end.isoformat()
+                        if next_return_end is not None
+                        else None,
                         "return_start_date": target_return.start_date.isoformat()
                         if target_return.start_date
                         else None,
@@ -417,24 +455,25 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
                         if target_return.file_date
                         else None,
                         "return_net_tax_due": str(target_return.net_tax_amount_due),
-                        "net_payments": str(net_payments),
-                        "payments_mapped_to_agency": payments_mapped,
-                        "expected_total": str(expected_total),
-                        "actual_total": str(actual_total),
-                        "difference": str(diff),
+                        "payment_adjustment_to_suspense": str(payment_adjustment),
+                        "payments_mapped_to_agency": payments_mapped_to_agency,
+                        "payments_applied_count": payment_count,
+                        "expected_suspense": str(expected_suspense),
+                        "suspense_difference": str(suspense_difference),
                         "payable_only": str(payable_only),
                         "suspense_only": str(suspense_only),
+                        "payable_must_be_zero": True,
+                        "payable_status": payable_status.value,
+                        "suspense_status": suspense_status.value,
                         "status": core_status.value,
-                        "note": note,
-                        "placement_warning": placement_warning,
                     },
                 )
             )
 
         summary = (
-            f"Tax payable/suspense balances reconcile to expected returns as of {ctx.period_end.isoformat()}."
+            f"Tax payable is zero and suspense ties to the most recent filed return as of {ctx.period_end.isoformat()}."
             if overall_status == RuleStatus.PASS
-            else "Tax payable/suspense balances require review against the most recent returns."
+            else "Tax payable must be zero and suspense must reconcile to the most recent filed return."
         )
 
         return RuleResult(
@@ -448,7 +487,8 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
             details=details,
             evidence_used=[agencies_item, returns_item, payments_item],
             human_action=(
-                "Reconcile tax payable/suspense balances to the expected return and payments."
+                "Move any tax balance out of payable (payable must be zero) and reconcile suspense to the latest "
+                "filed return plus payment/refund offsets for that filing period."
                 if overall_status != RuleStatus.PASS
                 else None
             ),

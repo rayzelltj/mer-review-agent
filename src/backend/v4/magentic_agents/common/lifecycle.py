@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import AsyncExitStack
 from typing import Any, Optional
@@ -43,6 +44,7 @@ class MCPEnabledBase:
         agent_description: str | None = None,
         agent_instructions: str | None = None,
         model_deployment_name: str | None = None,
+        user_auth_token: str | None = None,
         project_client=None,
     ) -> None:
         self._stack: AsyncExitStack | None = None
@@ -60,7 +62,9 @@ class MCPEnabledBase:
         self.agent_instructions: str | None = agent_instructions
         self.model_deployment_name: str | None = model_deployment_name
         self.project_client = project_client
+        self.user_auth_token = str(user_auth_token or "").strip() or None
         self.logger = logging.getLogger(__name__)
+        self._owned_chat_clients: dict[int, Any] = {}
 
     async def open(self) -> "MCPEnabledBase":
         if self._stack is not None:
@@ -114,6 +118,22 @@ class MCPEnabledBase:
                         exc,
                         exc_info=True,
                     )
+            # Close any chat clients we created directly to avoid aiohttp leaks.
+            for client in list(self._owned_chat_clients.values()):
+                close_fn = getattr(client, "close", None) or getattr(client, "aclose", None)
+                if not close_fn:
+                    continue
+                try:
+                    result = close_fn()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:
+                    self.logger.warning(
+                        "Error closing chat client %s: %s",
+                        type(client).__name__,
+                        exc,
+                        exc_info=True,
+                    )
             # Unregister from registry if present
             try:
                 agent_registry.unregister_agent(self)
@@ -130,6 +150,7 @@ class MCPEnabledBase:
             self._stack = None
             self.mcp_tool = None
             self._agent = None
+            self._owned_chat_clients.clear()
 
     # Context manager
     async def __aenter__(self) -> "MCPEnabledBase":
@@ -163,11 +184,17 @@ class MCPEnabledBase:
             model_deployment_name=self.model_deployment_name,
             async_credential=self.creds,
         )
+        self._track_chat_client(chat_client)
         self.logger.info(
             "Created new AzureAIAgentClient for  get chat client",
             extra={"agent_id": chat_client.agent_id},
         )
         return chat_client
+
+    def _track_chat_client(self, chat_client: Any | None) -> None:
+        if chat_client is None:
+            return
+        self._owned_chat_clients[id(chat_client)] = chat_client
 
     async def resolve_agent_id(self, agent_id: str) -> Optional[str]:
         """Resolve agent ID via Projects SDK first (for RAI agents), fallback to AgentsClient.
@@ -254,6 +281,26 @@ class MCPEnabledBase:
                     agent_id,
                     self.agent_name,
                 )
+                # Prune stale persisted agent IDs to avoid repeated lookup misses
+                # on every run for this user/team.
+                try:
+                    if self.memory_store and self.team_config and self.agent_name:
+                        await self.memory_store.delete_team_agent(
+                            team_id=self.team_config.team_id,
+                            agent_name=self.agent_name,
+                        )
+                        self.logger.info(
+                            "Pruned stale team agent mapping team_id=%s agent_name=%s",
+                            self.team_config.team_id,
+                            self.agent_name,
+                        )
+                except Exception as cleanup_exc:
+                    self.logger.warning(
+                        "Failed pruning stale team agent mapping team_id=%s agent_name=%s: %s",
+                        getattr(self.team_config, "team_id", None),
+                        self.agent_name,
+                        cleanup_exc,
+                    )
                 return None
 
             # Create client with resolved ID, preferring project_client for RAI agents
@@ -263,6 +310,7 @@ class MCPEnabledBase:
                     agent_id=resolved,
                     async_credential=self.creds,
                 )
+                self._track_chat_client(chat_client)
                 self.logger.info(
                     "RAI.AgentReuseSuccess: Created AzureAIAgentClient via Projects SDK (id=%s)",
                     resolved,
@@ -274,6 +322,7 @@ class MCPEnabledBase:
                     model_deployment_name=self.model_deployment_name,
                     async_credential=self.creds,
                 )
+                self._track_chat_client(chat_client)
                 self.logger.info(
                     "Created AzureAIAgentClient via endpoint (id=%s)", resolved
                 )
@@ -304,6 +353,7 @@ class MCPEnabledBase:
                 return
 
             currentAgent = CurrentTeamAgent(
+                user_id=getattr(self.team_config, "user_id", None),
                 team_id=self.team_config.team_id,
                 team_name=self.team_config.name,
                 agent_name=self.agent_name,
@@ -326,14 +376,25 @@ class MCPEnabledBase:
         if not self.mcp_cfg:
             return
         try:
+            headers: dict[str, str] | None = None
+            if self.user_auth_token:
+                # Forward user auth to MCP so finance tools can call back into backend as that user.
+                # For MCP servers that enforce bearer auth, include Authorization as well.
+                token = str(self.user_auth_token).strip()
+                headers = {
+                    "x-user-auth-token": token,
+                    "authorization": f"Bearer {token}",
+                }
             mcp_tool = MCPStreamableHTTPTool(
                 name=self.mcp_cfg.name,
                 description=self.mcp_cfg.description,
                 url=self.mcp_cfg.url,
+                headers=headers,
             )
             await self._stack.enter_async_context(mcp_tool)
             self.mcp_tool = mcp_tool  # Store for later use
-        except Exception:
+        except Exception as ex:
+            self.logger.exception("Failed to initialize MCP tool: %s", ex)
             self.mcp_tool = None
 
 
@@ -350,6 +411,7 @@ class AzureAgentBase(MCPEnabledBase):
         self,
         mcp: MCPConfig | None = None,
         model_deployment_name: str | None = None,
+        user_auth_token: str | None = None,
         project_endpoint: str | None = None,
         team_service: TeamService | None = None,
         team_config: TeamConfiguration | None = None,
@@ -369,6 +431,7 @@ class AzureAgentBase(MCPEnabledBase):
             agent_description=agent_description,
             agent_instructions=agent_instructions,
             model_deployment_name=model_deployment_name,
+            user_auth_token=user_auth_token,
             project_client=project_client,
         )
 

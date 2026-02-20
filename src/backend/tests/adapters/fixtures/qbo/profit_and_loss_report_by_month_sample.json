@@ -1,0 +1,72 @@
+{
+  "Header": {
+    "ReportName": "ProfitAndLoss",
+    "ReportBasis": "Accrual",
+    "StartPeriod": "2025-08-01",
+    "EndPeriod": "2025-11-30",
+    "Currency": "USD",
+    "SummarizeColumnsBy": "Month"
+  },
+  "Rows": {
+    "Row": [
+      {
+        "Header": {
+          "ColData": [
+            { "value": "Income" },
+            { "value": "" },
+            { "value": "" },
+            { "value": "" },
+            { "value": "" },
+            { "value": "" }
+          ]
+        },
+        "type": "Section",
+        "group": "Income",
+        "Summary": {
+          "ColData": [
+            { "value": "Total Income" },
+            { "value": "100.00" },
+            { "value": "200.00" },
+            { "value": "300.00" },
+            { "value": "400.00" },
+            { "value": "1000.00" }
+          ]
+        }
+      }
+    ]
+  },
+  "Columns": {
+    "Column": [
+      {
+        "ColType": "Account",
+        "ColTitle": "",
+        "MetaData": [
+          { "Name": "ColKey", "Value": "account" }
+        ]
+      },
+      {
+        "ColType": "Money",
+        "ColTitle": "Aug. 2025"
+      },
+      {
+        "ColType": "Money",
+        "ColTitle": "Sep. 2025"
+      },
+      {
+        "ColType": "Money",
+        "ColTitle": "Oct. 2025"
+      },
+      {
+        "ColType": "Money",
+        "ColTitle": "Nov. 2025"
+      },
+      {
+        "ColType": "Money",
+        "ColTitle": "Total",
+        "MetaData": [
+          { "Name": "ColKey", "Value": "total" }
+        ]
+      }
+    ]
+  }
+}

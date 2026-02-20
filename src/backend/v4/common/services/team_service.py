@@ -1,6 +1,8 @@
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from azure.core.exceptions import (
@@ -22,6 +24,15 @@ from v4.common.services.foundry_service import FoundryService
 
 class TeamService:
     """Service for handling JSON team configuration operations."""
+
+    DEFAULT_BALANCE_SHEET_TEAM_ID = "00000000-0000-0000-0000-000000000006"
+    DEFAULT_BALANCE_SHEET_TEAM_NAME = "Balance Sheet Review Team"
+    DEFAULT_BALANCE_SHEET_TEMPLATE = (
+        Path(__file__).resolve().parents[3]
+        / "config"
+        / "team_templates"
+        / "balance_sheet_review_team.json"
+    )
 
     def __init__(self, memory_context: Optional[DatabaseBase] = None):
         """Initialize with optional memory context."""
@@ -207,14 +218,14 @@ class TeamService:
             if team_config is None:
                 return None
 
-            # Verify the configuration belongs to the user
-            # if team_config.user_id != user_id:
-            #     self.logger.warning(
-            #         "Access denied: config %s does not belong to user %s",
-            #         team_id,
-            #         user_id,
-            #     )
-            #     return None
+            # Enforce ownership to avoid cross-user access.
+            if str(team_config.user_id or "").strip() != str(user_id or "").strip():
+                self.logger.warning(
+                    "Access denied: config %s does not belong to user %s",
+                    team_id,
+                    user_id,
+                )
+                return None
 
             return team_config
 
@@ -299,7 +310,15 @@ class TeamService:
             True if deleted successfully, False if not found
         """
         try:
-            # First, verify the configuration exists and belongs to the user
+            team = await self.get_team_configuration(team_id, user_id)
+            if team is None:
+                self.logger.warning(
+                    "Delete denied or team not found team_id=%s user_id=%s",
+                    team_id,
+                    user_id,
+                )
+                return False
+
             success = await self.memory_context.delete_team(team_id)
             if success:
                 self.logger.info("Successfully deleted team configuration: %s", team_id)
@@ -309,6 +328,139 @@ class TeamService:
         except (KeyError, TypeError, ValueError) as e:
             self.logger.error("Error deleting team configuration: %s", str(e))
             return False
+
+    async def ensure_default_balance_sheet_team(
+        self, user_id: str
+    ) -> Optional[TeamConfiguration]:
+        """Provision a default balance-sheet team for the user if no team exists."""
+        existing_teams = await self.get_all_team_configurations()
+        if existing_teams:
+            preferred = next(
+                (
+                    team
+                    for team in existing_teams
+                    if str(team.team_id).strip() == self.DEFAULT_BALANCE_SHEET_TEAM_ID
+                    or str(team.name).strip().lower()
+                    == self.DEFAULT_BALANCE_SHEET_TEAM_NAME.lower()
+                ),
+                None,
+            )
+            if preferred and self._default_template_sync_enabled():
+                template = self._load_default_balance_sheet_template()
+                if template:
+                    desired = self._build_synced_default_team(
+                        existing_team=preferred,
+                        template=template,
+                        user_id=user_id,
+                    )
+                    if not self._teams_equivalent(preferred, desired):
+                        await self.memory_context.update_team(desired)
+                        preferred = desired
+                        self.logger.info(
+                            "Synchronized default balance-sheet team template for user_id=%s team_id=%s",
+                            user_id,
+                            preferred.team_id,
+                        )
+            return preferred or existing_teams[0]
+
+        template = self._load_default_balance_sheet_template()
+        if not template:
+            self.logger.warning(
+                "Default team template is missing: %s",
+                self.DEFAULT_BALANCE_SHEET_TEMPLATE,
+            )
+            return None
+
+        team = self._build_default_team_from_template(template=template, user_id=user_id)
+        await self.save_team_configuration(team)
+        self.logger.info(
+            "Provisioned default balance-sheet team for user_id=%s team_id=%s",
+            user_id,
+            team.team_id,
+        )
+        return team
+
+    def _load_default_balance_sheet_template(self) -> Optional[Dict[str, Any]]:
+        try:
+            import json
+
+            raw = self.DEFAULT_BALANCE_SHEET_TEMPLATE.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as exc:
+            self.logger.warning("Failed loading default team template: %s", exc)
+        return None
+
+    def _build_default_team_from_template(
+        self, *, template: Dict[str, Any], user_id: str
+    ) -> TeamConfiguration:
+        agents = [
+            self._validate_and_parse_agent(agent_data)
+            for agent_data in (template.get("agents") or [])
+        ]
+        if not agents:
+            raise ValueError("Default balance-sheet team template is missing agents.")
+
+        starting_tasks = [
+            self._validate_and_parse_task(task_data)
+            for task_data in (template.get("starting_tasks") or [])
+        ]
+        if not starting_tasks:
+            raise ValueError(
+                "Default balance-sheet team template is missing starting_tasks."
+            )
+
+        stable_session_id = f"team_config::{user_id}::{self.DEFAULT_BALANCE_SHEET_TEAM_ID}"
+        stable_doc_id = f"{self.DEFAULT_BALANCE_SHEET_TEAM_ID}::{user_id}"
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        return TeamConfiguration(
+            id=stable_doc_id,
+            session_id=stable_session_id,
+            team_id=self.DEFAULT_BALANCE_SHEET_TEAM_ID,
+            name=str(template.get("name") or self.DEFAULT_BALANCE_SHEET_TEAM_NAME),
+            status=str(template.get("status") or "visible"),
+            created=created_at,
+            created_by=user_id,
+            deployment_name=str(template.get("deployment_name") or ""),
+            agents=agents,
+            description=str(template.get("description") or ""),
+            logo=str(template.get("logo") or ""),
+            plan=str(template.get("plan") or ""),
+            starting_tasks=starting_tasks,
+            user_id=user_id,
+        )
+
+    def _default_template_sync_enabled(self) -> bool:
+        raw = os.getenv("DEFAULT_TEAM_TEMPLATE_SYNC_ENABLED", "").strip().lower()
+        if raw in {"0", "false", "no"}:
+            return False
+        return True
+
+    def _build_synced_default_team(
+        self,
+        *,
+        existing_team: TeamConfiguration,
+        template: Dict[str, Any],
+        user_id: str,
+    ) -> TeamConfiguration:
+        desired = self._build_default_team_from_template(template=template, user_id=user_id)
+        desired.id = existing_team.id
+        desired.session_id = existing_team.session_id
+        desired.team_id = existing_team.team_id
+        desired.created = existing_team.created
+        desired.created_by = existing_team.created_by
+        desired.user_id = existing_team.user_id
+        return desired
+
+    def _teams_equivalent(
+        self, existing_team: TeamConfiguration, desired_team: TeamConfiguration
+    ) -> bool:
+        ignored_fields = {"id", "session_id", "created", "created_by", "user_id"}
+        existing_payload = existing_team.model_dump(exclude=ignored_fields)
+        desired_payload = desired_team.model_dump(exclude=ignored_fields)
+        return existing_payload == desired_payload
 
     def extract_models_from_agent(self, agent: Dict[str, Any]) -> set:
         """

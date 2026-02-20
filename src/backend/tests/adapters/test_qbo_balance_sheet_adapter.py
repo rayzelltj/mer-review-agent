@@ -14,7 +14,7 @@ def _load(name: str) -> dict:
 
 def test_balance_sheet_adapter_parses_accounts_and_header_date():
     report = _load("balance_sheet_report_sample.json")
-    snapshot = balance_sheet_snapshot_from_report(report)
+    snapshot = balance_sheet_snapshot_from_report(report, include_rows_without_id=False)
     assert snapshot.as_of_date.isoformat() == "2016-10-31"
     assert snapshot.currency == "USD"
 

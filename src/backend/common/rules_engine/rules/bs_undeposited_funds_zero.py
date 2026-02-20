@@ -3,10 +3,37 @@ from __future__ import annotations
 from decimal import Decimal
 
 from ..config import AccountThresholdOverride, ZeroBalanceRuleConfig
-from ..context import RuleContext, compute_allowed_variance, quantize_amount
-from ..models import RuleResult, RuleResultDetail, RuleStatus, Severity, StatusOrdering, severity_for_status
+from ..context import RuleContext, quantize_amount
+from ..models import RuleResult, RuleResultDetail, RuleStatus, StatusOrdering, severity_for_status
 from ..registry import register_rule
 from ..rule import Rule
+
+PLATFORM_REVENUE_RATE = Decimal("0.10")
+PRIOR_VARIANCE_RATE = Decimal("0.03")
+SALES_ASSET_TYPES = (
+    "bank",
+    "accounts receivable",
+    "other current asset",
+    "cash and cash equivalents",
+)
+
+
+def _platform_tokens(account_name: str) -> list[str]:
+    stopwords = {
+        "undeposited",
+        "fund",
+        "funds",
+        "account",
+        "accounts",
+        "bank",
+        "clearing",
+    }
+    tokens = [
+        t.strip().lower()
+        for t in account_name.replace("-", " ").replace("/", " ").split()
+        if t.strip()
+    ]
+    return [t for t in tokens if t not in stopwords and len(t) >= 3]
 
 
 def _platform_revenue_from_pnl(
@@ -14,15 +41,7 @@ def _platform_revenue_from_pnl(
 ) -> tuple[Decimal | None, list[str]]:
     if pnl is None or not account_name:
         return None, []
-    stopwords = {
-        "undeposited"
-    }
-    tokens = [
-        t.strip().lower()
-        for t in account_name.replace("-", " ").replace("/", " ").split()
-        if t.strip()
-    ]
-    tokens = [t for t in tokens if t not in stopwords and len(t) >= 3]
+    tokens = _platform_tokens(account_name)
     if not tokens:
         return None, []
 
@@ -37,6 +56,41 @@ def _platform_revenue_from_pnl(
             matched = True
 
     return (total if matched else None), tokens
+
+
+def _is_sales_asset_type(account_type: str) -> bool:
+    if not account_type:
+        return False
+    lowered = account_type.lower()
+    if lowered in SALES_ASSET_TYPES:
+        return True
+    return "asset" in lowered
+
+
+def _latest_prior_snapshot(ctx: RuleContext):
+    if not ctx.prior_balance_sheets:
+        return None
+    return max(
+        (bs for bs in ctx.prior_balance_sheets if bs.as_of_date < ctx.period_end),
+        default=None,
+        key=lambda bs: bs.as_of_date,
+    )
+
+
+def _previous_month_variance_value(
+    ctx: RuleContext,
+    *,
+    account_ref: str,
+) -> tuple[Decimal, str | None, bool]:
+    prior_snapshot = _latest_prior_snapshot(ctx)
+    if prior_snapshot is None:
+        return Decimal("0"), None, True
+
+    for acct in prior_snapshot.accounts:
+        if acct.account_ref == account_ref:
+            return abs(acct.balance), prior_snapshot.as_of_date.isoformat(), False
+
+    return Decimal("0"), prior_snapshot.as_of_date.isoformat(), True
 
 
 @register_rule
@@ -62,21 +116,94 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
             )
 
         accounts_to_eval: list[AccountThresholdOverride] = []
+        type_unknown: list[AccountThresholdOverride] = []
         used_name_inference = False
+        account_by_ref = {acct.account_ref: acct for acct in ctx.balance_sheet.accounts}
+        name_by_ref = {acct.account_ref: acct.name for acct in ctx.balance_sheet.accounts}
+
         if cfg.accounts:
-            accounts_to_eval = list(cfg.accounts)
+            for acct_cfg in cfg.accounts:
+                acct = account_by_ref.get(acct_cfg.account_ref)
+                resolved_name = (acct.name if acct else "") or acct_cfg.account_name
+                if acct is None:
+                    accounts_to_eval.append(
+                        AccountThresholdOverride(
+                            account_ref=acct_cfg.account_ref,
+                            account_name=resolved_name,
+                            threshold=acct_cfg.threshold,
+                        )
+                    )
+                    continue
+                if not acct.type:
+                    type_unknown.append(
+                        AccountThresholdOverride(
+                            account_ref=acct_cfg.account_ref,
+                            account_name=resolved_name,
+                            threshold=acct_cfg.threshold,
+                        )
+                    )
+                    continue
+                if _is_sales_asset_type(acct.type):
+                    accounts_to_eval.append(
+                        AccountThresholdOverride(
+                            account_ref=acct_cfg.account_ref,
+                            account_name=resolved_name,
+                            threshold=acct_cfg.threshold,
+                        )
+                    )
         else:
             used_name_inference = True
             for acct in ctx.balance_sheet.accounts:
                 if acct.account_ref.startswith("report::"):
                     continue
-                if "undeposited" in (acct.name or "").lower():
-                    accounts_to_eval.append(
+                if "undeposited" not in (acct.name or "").lower():
+                    continue
+                if not acct.type:
+                    type_unknown.append(
                         AccountThresholdOverride(
                             account_ref=acct.account_ref,
                             account_name=acct.name,
                         )
                     )
+                    continue
+                if not _is_sales_asset_type(acct.type):
+                    continue
+                accounts_to_eval.append(
+                    AccountThresholdOverride(
+                        account_ref=acct.account_ref,
+                        account_name=acct.name,
+                    )
+                )
+
+        if type_unknown:
+            return RuleResult(
+                rule_id=self.rule_id,
+                rule_title=self.rule_title,
+                best_practices_reference=self.best_practices_reference,
+                sources=self.sources,
+                status=missing_status,
+                severity=severity_for_status(missing_status),
+                summary=(
+                    "Undeposited accounts found but missing account type/subtype; cannot "
+                    "confirm they are under assets."
+                ),
+                details=[
+                    RuleResultDetail(
+                        key=acct.account_ref,
+                        message="Undeposited account missing account type; cannot classify.",
+                        values={
+                            "account_name": acct.account_name,
+                            "period_end": ctx.period_end.isoformat(),
+                            "classification_rule": "undeposited accounts must be under assets",
+                            "status": missing_status.value,
+                        },
+                    )
+                    for acct in type_unknown
+                ],
+                human_action=(
+                    "Provide account types (via Chart of Accounts) so undeposited accounts can be classified under assets."
+                ),
+            )
 
         if not accounts_to_eval:
             return RuleResult(
@@ -84,28 +211,22 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                 rule_title=self.rule_title,
                 best_practices_reference=self.best_practices_reference,
                 sources=self.sources,
-                status=RuleStatus.NEEDS_REVIEW,
-                severity=severity_for_status(RuleStatus.NEEDS_REVIEW),
-                summary=f"No Undeposited Funds accounts found for period end {ctx.period_end.isoformat()}.",
+                status=RuleStatus.NOT_APPLICABLE,
+                severity=severity_for_status(RuleStatus.NOT_APPLICABLE),
+                summary=f"No undeposited accounts found for period end {ctx.period_end.isoformat()}.",
                 human_action=(
-                    "Configure the Undeposited Funds account ref for this client or confirm it does not exist."
+                    "Confirm whether undeposited accounts exist under assets and ensure account names include "
+                    "their platform/sales-channel name."
                 ),
             )
 
-        revenue_total = ctx.get_revenue_total()
         ordering = StatusOrdering.default()
         statuses: list[RuleStatus] = []
         details: list[RuleResultDetail] = []
 
-        default_threshold_configured = (cfg.default_threshold.floor_amount != 0) or (
-            cfg.default_threshold.pct_of_revenue != 0
-        )
-        has_any_threshold = default_threshold_configured or any(
-            a.threshold is not None for a in accounts_to_eval
-        )
-
         for acct_cfg in accounts_to_eval:
             bal = ctx.get_account_balance(acct_cfg.account_ref)
+            account_name = name_by_ref.get(acct_cfg.account_ref, "") or acct_cfg.account_name
             if bal is None:
                 statuses.append(missing_status)
                 details.append(
@@ -113,42 +234,60 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
                         key=acct_cfg.account_ref,
                         message="Account not found in balance sheet snapshot.",
                         values={
-                            "account_name": acct_cfg.account_name,
+                            "account_name": account_name,
                             "period_end": ctx.period_end.isoformat(),
+                            "classification_rule": "undeposited accounts must be under assets",
                             "status": missing_status.value,
                         },
                     )
                 )
                 continue
 
-            threshold = acct_cfg.threshold or cfg.default_threshold
-            threshold_configured = default_threshold_configured or (acct_cfg.threshold is not None)
             platform_revenue, platform_tokens = _platform_revenue_from_pnl(
-                ctx.profit_and_loss, acct_cfg.account_name
+                ctx.profit_and_loss, account_name
             )
-            if platform_revenue is not None:
-                allowed = (abs(platform_revenue) * Decimal("0.10")).copy_abs()
-                threshold_configured = True
-                threshold_source = "platform_revenue"
-                platform_missing = False
-            else:
-                allowed = compute_allowed_variance(
-                    threshold=threshold, revenue_total=revenue_total
+            previous_variance_value, previous_period_end, previous_variance_missing = (
+                _previous_month_variance_value(
+                    ctx,
+                    account_ref=acct_cfg.account_ref,
                 )
-                threshold_source = (
-                    "configured" if threshold_configured else "unconfigured"
-                )
-                platform_missing = len(platform_tokens) == 0
+            )
+
+            platform_component = (
+                (abs(platform_revenue) * PLATFORM_REVENUE_RATE).copy_abs()
+                if platform_revenue is not None
+                else Decimal("0")
+            )
+            previous_component = (previous_variance_value * PRIOR_VARIANCE_RATE).copy_abs()
+            allowed = platform_component + previous_component
+
             bal_q = quantize_amount(bal, cfg.amount_quantize)
             abs_bal = abs(bal_q)
+            platform_component_q = quantize_amount(platform_component, cfg.amount_quantize)
+            previous_variance_q = quantize_amount(previous_variance_value, cfg.amount_quantize)
+            previous_component_q = quantize_amount(previous_component, cfg.amount_quantize)
             allowed_q = quantize_amount(allowed, cfg.amount_quantize)
+            allowed_variance_calculation = (
+                f"({PLATFORM_REVENUE_RATE} * abs({platform_revenue if platform_revenue is not None else Decimal('0')})) + "
+                f"({PRIOR_VARIANCE_RATE} * abs({previous_variance_value})) = {allowed_q}"
+            )
+            platform_name_missing = len(platform_tokens) == 0
+            platform_revenue_missing = platform_revenue is None
 
-            if platform_missing:
+            review_comment = None
+            if platform_name_missing:
                 status = RuleStatus.NEEDS_REVIEW
+                review_comment = (
+                    "GENERIC UNDEPOSITED ACCOUNT: add specific platform/sales-channel name "
+                    "(e.g., 'Shopify Undeposited Funds')."
+                )
+            elif platform_revenue_missing:
+                status = RuleStatus.NEEDS_REVIEW
+                review_comment = (
+                    "No matching platform revenue line found in P&L for this undeposited account name."
+                )
             elif abs_bal == 0:
                 status = RuleStatus.PASS
-            elif not threshold_configured:
-                status = cfg.unconfigured_threshold_policy
             else:
                 status = RuleStatus.WARN if abs_bal <= allowed_q else RuleStatus.FAIL
 
@@ -156,65 +295,92 @@ class BS_UNDEPOSITED_FUNDS_ZERO(Rule):
             details.append(
                 RuleResultDetail(
                     key=acct_cfg.account_ref,
-                    message="Undeposited Funds balance evaluated.",
+                    message="Undeposited account balance evaluated.",
                     values={
-                        "account_name": acct_cfg.account_name,
+                        "account_name": account_name,
                         "period_end": ctx.period_end.isoformat(),
                         "balance": str(bal_q),
                         "abs_balance": str(abs_bal),
+                        "classification_rule": "undeposited accounts must be under assets",
+                        "variance_formula": (
+                            "allowed_variance = (10% * abs(platform_revenue)) + "
+                            "(3% * abs(previous_month_variance_value))"
+                        ),
+                        "platform_revenue_rate": str(PLATFORM_REVENUE_RATE),
+                        "platform_revenue": str(platform_revenue) if platform_revenue is not None else None,
+                        "platform_variance_component": str(platform_component_q),
+                        "previous_month_variance_rate": str(PRIOR_VARIANCE_RATE),
+                        "previous_month_variance_value": str(previous_variance_q),
+                        "previous_month_variance_component": str(previous_component_q),
+                        "previous_month_period_end": previous_period_end,
+                        "previous_month_variance_missing": previous_variance_missing,
                         "allowed_variance": str(allowed_q),
-                        "revenue_total": str(revenue_total) if revenue_total is not None else None,
-                        "platform_revenue": str(platform_revenue)
-                        if platform_revenue is not None
-                        else None,
+                        "allowed_variance_calculation": allowed_variance_calculation,
+                        "threshold_source": "platform_revenue_plus_previous_month_variance",
                         "platform_tokens": platform_tokens,
-                        "threshold_floor_amount": str(threshold.floor_amount),
-                        "threshold_pct_of_revenue": str(threshold.pct_of_revenue),
+                        "platform_name_missing": platform_name_missing,
+                        "platform_revenue_missing": platform_revenue_missing,
+                        "review_comment": review_comment,
                         "status": status.value,
-                        "threshold_configured": threshold_configured,
                         "inferred_by_name_match": used_name_inference,
-                        "threshold_source": threshold_source,
-                        "platform_name_missing": platform_missing,
                     },
                 )
             )
 
         overall = ordering.worst(statuses)
         severity = severity_for_status(overall)
+        n_accounts = len(accounts_to_eval)
 
         exemplar = next((d for d in details if d.values.get("status") == overall.value), None)
         if overall == RuleStatus.PASS:
-            summary = f"Undeposited Funds is exactly zero as of {ctx.period_end.isoformat()}."
+            summary = f"All {n_accounts} undeposited account(s) are exactly zero as of {ctx.period_end.isoformat()}."
         elif overall == RuleStatus.WARN and exemplar:
             summary = (
-                f"Undeposited Funds is non-zero ({exemplar.values.get('balance')}) as of {ctx.period_end.isoformat()} "
+                f"Undeposited account '{exemplar.values.get('account_name','')}' is non-zero "
+                f"({exemplar.values.get('balance')}) as of {ctx.period_end.isoformat()} "
                 f"({exemplar.values.get('allowed_variance')} allowed); verify."
             )
         elif overall == RuleStatus.FAIL and exemplar:
             summary = (
-                f"Undeposited Funds exceeds allowed variance ({exemplar.values.get('balance')} vs "
-                f"{exemplar.values.get('allowed_variance')}) as of {ctx.period_end.isoformat()}."
+                f"Undeposited account '{exemplar.values.get('account_name','')}' exceeds allowed variance "
+                f"({exemplar.values.get('balance')} vs {exemplar.values.get('allowed_variance')}) "
+                f"as of {ctx.period_end.isoformat()}."
             )
+        elif overall == RuleStatus.NEEDS_REVIEW and exemplar:
+            review_comment = exemplar.values.get("review_comment")
+            if review_comment:
+                summary = review_comment
+            else:
+                summary = (
+                    f"One or more undeposited accounts require review as of {ctx.period_end.isoformat()} "
+                    "(missing platform name, mapping, or data)."
+                )
         elif overall == RuleStatus.NEEDS_REVIEW:
-            summary = f"Missing data prevented evaluation as of {ctx.period_end.isoformat()}."
+            summary = (
+                f"One or more undeposited accounts require review as of {ctx.period_end.isoformat()} "
+                "(missing platform name, mapping, or data)."
+            )
         else:
             summary = "Not applicable."
 
         human_action = None
         if overall in (RuleStatus.WARN, RuleStatus.FAIL, RuleStatus.NEEDS_REVIEW):
-            human_action = (
-                "Verify undeposited items, deposit timing, and explain any non-zero balance at period end; "
-                "adjust tolerance if warranted."
-            )
-            if any(d.values.get("platform_name_missing") for d in details):
+            has_generic = any(d.values.get("platform_name_missing") for d in details)
+            has_missing_mapping = any(d.values.get("platform_revenue_missing") for d in details)
+            if has_generic:
                 human_action = (
-                    "Undeposited Funds account name is generic; add the sales platform name "
-                    "(e.g., Shopify) to apply platform-based thresholds."
+                    "GENERIC UNDEPOSITED ACCOUNT detected. Rename each undeposited account to include its associated "
+                    "platform/sales channel (e.g., Etsy, Shopify, Amazon)."
                 )
-            if not has_any_threshold and overall != RuleStatus.PASS:
+            elif has_missing_mapping:
                 human_action = (
-                    f"{human_action} Note: no acceptable variance was configured (TBD); "
-                    "set thresholds (floor and/or % of revenue)."
+                    "Ensure each undeposited account name maps to a platform revenue line in P&L "
+                    "(income_line:*), then re-run the variance check."
+                )
+            else:
+                human_action = (
+                    "Review non-zero undeposited balances and reconcile them using "
+                    "allowed_variance = 10% platform revenue + 3% previous-month variance value."
                 )
             if used_name_inference:
                 human_action = f"{human_action} Note: accounts were inferred by name match ('undeposited')."

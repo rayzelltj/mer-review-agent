@@ -39,4 +39,4 @@ Config model: `BalanceUnchangedPriorMonthRuleConfig`
 - `RuleResult.human_action`: prompt to confirm unchanged balances are expected.
 
 ## Tests
-- Add to `src/backend/tests/rules_engine/` (pending).
+- `src/backend/tests/rules_engine/test_bs_balance_unchanged_prior_month.py`

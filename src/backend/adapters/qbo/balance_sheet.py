@@ -90,8 +90,8 @@ def balance_sheet_snapshot_from_report(
     *,
     realm_id: str | None = None,
     account_types: dict[str, QBOAccountTypeInfo] | None = None,
-    include_rows_without_id: bool = False,
-    include_summary_totals: bool = False,
+    include_rows_without_id: bool = True,
+    include_summary_totals: bool = True,
 ) -> BalanceSheetSnapshot:
     """
     Convert a QBO Report Service BalanceSheet JSON payload into a BalanceSheetSnapshot.
@@ -130,80 +130,73 @@ def balance_sheet_snapshot_from_report(
     if not isinstance(rows, dict):
         raise QBOBalanceSheetAdapterError("Report.Rows missing or invalid.")
 
-    for row in _iter_rows(rows):
-        if row.get("type") == "Data":
-            coldata = row.get("ColData")
-            if not isinstance(coldata, list):
-                continue
-            if account_col >= len(coldata) or total_col >= len(coldata):
-                continue
-
-            acct_cell = coldata[account_col]
-            total_cell = coldata[total_col]
-            if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
-                continue
-
-            acct_id = acct_cell.get("id")
-            acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
-            if not isinstance(acct_id, str) or not acct_id.strip():
-                if not include_rows_without_id:
-                    continue
-                # Non-account rows are included only when explicitly requested.
-                acct_id = f"report::{acct_name}".strip() or "report::unknown"
-
-            bal = _parse_decimal(total_cell.get("value"))
-            if bal is None:
-                # Skip rows where the total cannot be parsed to a number.
-                continue
-
-            account_ref = acct_id.strip()
-            if realm_id:
-                account_ref = f"qbo::{realm_id}::{account_ref}"
-
-            type_info = None
-            if account_types and isinstance(acct_cell.get("id"), str):
-                type_info = account_types.get(acct_cell["id"])
-
-            accounts.append(
-                {
-                    "account_ref": account_ref,
-                    "name": acct_name,
-                    "type": (type_info.account_type if type_info else "") or "",
-                    "subtype": (type_info.account_subtype if type_info else "") or "",
-                    "balance": str(bal),
-                }
-            )
-            continue
-
-        if include_summary_totals and isinstance(row.get("Summary"), dict):
-            summary = row["Summary"].get("ColData")
-            if not isinstance(summary, list):
-                continue
-            if account_col >= len(summary) or total_col >= len(summary):
-                continue
-            acct_cell = summary[account_col]
-            total_cell = summary[total_col]
-            if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
-                continue
-            acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
-            if "total" not in (acct_name or "").lower():
-                continue
-            bal = _parse_decimal(total_cell.get("value"))
-            if bal is None:
-                continue
+    def _append_from_coldata(coldata: Any) -> None:
+        if not isinstance(coldata, list):
+            return
+        if account_col >= len(coldata) or total_col >= len(coldata):
+            return
+        acct_cell = coldata[account_col]
+        total_cell = coldata[total_col]
+        if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
+            return
+        acct_id = acct_cell.get("id")
+        acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
+        if not isinstance(acct_id, str) or not acct_id.strip():
+            if not include_rows_without_id:
+                return
             acct_id = f"report::{acct_name}".strip() or "report::unknown"
-            account_ref = acct_id
-            if realm_id:
-                account_ref = f"qbo::{realm_id}::{account_ref}"
-            accounts.append(
-                {
-                    "account_ref": account_ref,
-                    "name": acct_name,
-                    "type": "",
-                    "subtype": "",
-                    "balance": str(bal),
-                }
-            )
+        bal = _parse_decimal(total_cell.get("value"))
+        if bal is None:
+            return
+        account_ref = acct_id.strip()
+        if realm_id:
+            account_ref = f"qbo::{realm_id}::{account_ref}"
+        type_info = None
+        if account_types and isinstance(acct_cell.get("id"), str):
+            type_info = account_types.get(acct_cell["id"])
+        accounts.append(
+            {
+                "account_ref": account_ref,
+                "name": acct_name,
+                "type": (type_info.account_type if type_info else "") or "",
+                "subtype": (type_info.account_subtype if type_info else "") or "",
+                "balance": str(bal),
+            }
+        )
+
+    def _append_rows(row_container: dict[str, Any]) -> None:
+        row_list = row_container.get("Row")
+        if not isinstance(row_list, list):
+            return
+        for row in row_list:
+            if not isinstance(row, dict):
+                continue
+            row_type = row.get("type")
+            if row_type == "Data":
+                _append_from_coldata(row.get("ColData"))
+                continue
+
+            header = row.get("Header")
+            if isinstance(header, dict):
+                _append_from_coldata(header.get("ColData"))
+
+            nested = row.get("Rows")
+            if isinstance(nested, dict):
+                _append_rows(nested)
+
+            if include_summary_totals and isinstance(row.get("Summary"), dict):
+                summary = row["Summary"].get("ColData")
+                if isinstance(summary, list):
+                    acct_cell = summary[account_col] if account_col < len(summary) else None
+                    acct_name = (
+                        acct_cell.get("value")
+                        if isinstance(acct_cell, dict) and isinstance(acct_cell.get("value"), str)
+                        else ""
+                    )
+                    if "total" in (acct_name or "").lower():
+                        _append_from_coldata(summary)
+
+    _append_rows(rows)
 
     return BalanceSheetSnapshot(
         as_of_date=as_of,

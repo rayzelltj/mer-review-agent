@@ -41,6 +41,38 @@ def _parse_report_period(report: dict) -> date | None:
     return None
 
 
+def _statement_end_dates_by_account(evidence_items: list[object]) -> tuple[dict[str, date], dict[str, date]]:
+    by_ref: dict[str, date] = {}
+    by_id: dict[str, date] = {}
+
+    def _remember(target: dict[str, date], key: str, value: date) -> None:
+        if not key:
+            return
+        current = target.get(key)
+        if current is None or value > current:
+            target[key] = value
+
+    for item in evidence_items:
+        evidence_type = getattr(item, "evidence_type", None)
+        if evidence_type != "statement_balance_attachment":
+            continue
+        statement_end_date = getattr(item, "statement_end_date", None) or getattr(item, "as_of_date", None)
+        if statement_end_date is None:
+            continue
+        meta = getattr(item, "meta", None) or {}
+        account_ref = str(meta.get("account_ref") or "").strip()
+        account_id = str(meta.get("account_id") or "").strip()
+        if account_ref:
+            _remember(by_ref, account_ref, statement_end_date)
+            canonical_id = account_ref.split("::")[-1]
+            if canonical_id and canonical_id != account_ref:
+                _remember(by_id, canonical_id, statement_end_date)
+        if account_id:
+            _remember(by_id, account_id, statement_end_date)
+
+    return by_ref, by_id
+
+
 def _load_prior_balance_sheet_reports(
     fixtures_dir: Path,
     current_period: date,
@@ -966,13 +998,24 @@ def build_fixture_review_inputs(
         build_qbo_tax_evidence,
     )
     from adapters.qbo.balance_sheet import balance_sheet_snapshot_from_report
+    from adapters.qbo.bank_cc_reconciliation import (
+        active_bank_cc_accounts_from_accounts_payload,
+        transaction_list_unreconciled_sums_from_report,
+        trial_balance_register_balances_from_report,
+    )
     from adapters.qbo.accounts import account_type_map_from_accounts_payload
+    from adapters.qbo.fixed_assets import fixed_asset_ledger_transactions_from_report
+    from adapters.qbo.profit_and_loss import expense_month_over_month_from_report
     from adapters.mock_evidence.evidence_manifest import evidence_bundle_from_manifest
     from adapters.mock_evidence.reconciliation_report import (
         reconciliation_snapshot_from_report,
     )
+    from adapters.working_papers.fixed_asset_register import (
+        depreciation_schedule_to_evidence,
+        fixed_asset_register_csv_to_evidence,
+    )
     from adapters.working_papers.prepaid_schedule import prepaid_schedule_to_evidence
-    from common.rules_engine.models import EvidenceBundle
+    from common.rules_engine.models import EvidenceBundle, EvidenceItem
 
     balance_sheet_report = _load_json(fixtures_dir / "balance_sheet.json")
     profit_and_loss_report = _load_json(fixtures_dir / "profit_and_loss.json")
@@ -1023,6 +1066,127 @@ def build_fixture_review_inputs(
     items = []
     items += aging_bundle.items
     items += tax_bundle.items
+    try:
+        expense_variance_meta = expense_month_over_month_from_report(
+            profit_and_loss_report,
+            current_period_end=snapshots.balance_sheet.as_of_date,
+        )
+        items.append(
+            EvidenceItem(
+                evidence_type="qbo_pnl_expense_monthly",
+                source="fixture",
+                as_of_date=snapshots.balance_sheet.as_of_date,
+                meta=expense_variance_meta,
+            )
+        )
+    except Exception:
+        pass
+
+    manifest_payload = _load_optional_json(fixtures_dir / "evidence_manifest.json")
+    manifest_items: list[object] = []
+    if manifest_payload is not None:
+        manifest_items = list(evidence_bundle_from_manifest(manifest_payload).items)
+    statement_end_by_ref, statement_end_by_id = _statement_end_dates_by_account(manifest_items)
+
+    coa_rows = active_bank_cc_accounts_from_accounts_payload(accounts_payload, active_only=True)
+    items.append(
+        EvidenceItem(
+            evidence_type="qbo_chart_of_accounts_bank_cc_active",
+            source="fixture",
+            as_of_date=snapshots.balance_sheet.as_of_date,
+            meta={"accounts": coa_rows},
+        )
+    )
+
+    trial_balance_report = _load_optional_json(fixtures_dir / "trial_balance.json")
+    if trial_balance_report is not None:
+        trial_map = trial_balance_register_balances_from_report(trial_balance_report)
+        items.append(
+            EvidenceItem(
+                evidence_type="qbo_trial_balance_register_balance",
+                source="fixture",
+                as_of_date=snapshots.balance_sheet.as_of_date,
+                meta={"balances_by_account_ref": {ref: str(amount) for ref, amount in trial_map.items()}},
+            )
+        )
+
+    account_ref_by_id = {
+        str(row.get("account_id") or "").strip(): str(row.get("account_ref") or "").strip()
+        for row in coa_rows
+    }
+    fixed_asset_account_ids = {
+        str(account_id).strip()
+        for account_id, type_info in account_type_map.items()
+        if str(type_info.account_type or "").strip() == "Fixed Asset"
+    }
+    fixed_asset_period_start = snapshots.balance_sheet.as_of_date.replace(day=1)
+    for path in sorted(fixtures_dir.glob("transaction_list_by_account_*.json")):
+        tx_payload = _load_json(path)
+        extra = tx_payload.get("extra") if isinstance(tx_payload, dict) else {}
+        params = tx_payload.get("params") if isinstance(tx_payload, dict) else {}
+        account_id_hint = str(
+            (extra.get("account_id") if isinstance(extra, dict) else "")
+            or (params.get("account") if isinstance(params, dict) else "")
+            or ""
+        ).strip()
+        account_ref_hint = account_ref_by_id.get(account_id_hint, account_id_hint)
+        statement_end_date = (
+            statement_end_by_ref.get(account_ref_hint)
+            or statement_end_by_id.get(account_id_hint)
+            or snapshots.balance_sheet.as_of_date
+        )
+        tx_summary = transaction_list_unreconciled_sums_from_report(
+            tx_payload,
+            period_end=snapshots.balance_sheet.as_of_date,
+            statement_end_date=statement_end_date,
+        )
+        account_id = str(tx_summary.get("account_id") or "").strip()
+        account_ref = account_ref_by_id.get(account_id, account_id)
+        items.append(
+            EvidenceItem(
+                evidence_type="qbo_transaction_list_unreconciled",
+                source="fixture",
+                as_of_date=snapshots.balance_sheet.as_of_date,
+                meta={
+                    "account_id": account_id or None,
+                    "account_ref": account_ref or None,
+                    "source_file": path.name,
+                    "sum_not_reconciled_as_of_period_end": str(
+                        tx_summary["sum_not_reconciled_as_of_period_end"]
+                    ),
+                    "sum_not_reconciled_between_period_end_and_statement_end": str(
+                        tx_summary["sum_not_reconciled_between_period_end_and_statement_end"]
+                    ),
+                    "statement_end_date_used": statement_end_date.isoformat(),
+                    "clear_status_column_found": tx_summary["clear_status_column_found"],
+                    "parsed_rows": tx_summary["parsed_rows"],
+                    "ignored_rows": tx_summary["ignored_rows"],
+                    "report": tx_payload,
+                },
+            )
+        )
+
+        if account_id_hint in fixed_asset_account_ids:
+            fixed_asset_summary = fixed_asset_ledger_transactions_from_report(
+                tx_payload,
+                period_start=fixed_asset_period_start,
+                period_end=snapshots.balance_sheet.as_of_date,
+            )
+            items.append(
+                EvidenceItem(
+                    evidence_type="qbo_fixed_asset_ledger_transactions",
+                    source="fixture",
+                    as_of_date=snapshots.balance_sheet.as_of_date,
+                    meta={
+                        "account_id": account_id_hint or None,
+                        "account_ref": account_ref_hint or None,
+                        "source_file": path.name,
+                        "transactions": fixed_asset_summary.get("transactions") or [],
+                        "parsed_rows": fixed_asset_summary.get("parsed_rows"),
+                        "ignored_rows": fixed_asset_summary.get("ignored_rows"),
+                    },
+                )
+            )
 
     intercompany_payload = _load_optional_json(
         fixtures_dir / "intercompany_balance_sheets.json"
@@ -1034,15 +1198,29 @@ def build_fixture_review_inputs(
             )
         )
 
-    manifest_payload = _load_optional_json(fixtures_dir / "evidence_manifest.json")
-    if manifest_payload is not None:
-        items += evidence_bundle_from_manifest(manifest_payload).items
+    if manifest_items:
+        items += manifest_items
 
-    prepaid_csv = fixtures_dir / "Blackbird Fabrics _ Prepaid Schedule - Prepaid.csv"
-    if prepaid_csv.exists():
+    prepaid_candidates = sorted(fixtures_dir.glob("*Prepaid Schedule - Prepaid.csv"))
+    if prepaid_candidates:
         items.append(
             prepaid_schedule_to_evidence(
-                prepaid_csv, period_end=snapshots.balance_sheet.as_of_date
+                prepaid_candidates[0], period_end=snapshots.balance_sheet.as_of_date
+            )
+        )
+
+    depreciation_schedule_csv = fixtures_dir / "Fixed Asset_Depreciation Schedule 2026.csv"
+    if depreciation_schedule_csv.exists():
+        items.append(
+            depreciation_schedule_to_evidence(
+                depreciation_schedule_csv, period_end=snapshots.balance_sheet.as_of_date
+            )
+        )
+
+    for fixed_asset_register_csv in sorted(fixtures_dir.glob("*Fixed Asset Register - *.csv")):
+        items.append(
+            fixed_asset_register_csv_to_evidence(
+                fixed_asset_register_csv, period_end=snapshots.balance_sheet.as_of_date
             )
         )
 
@@ -1141,7 +1319,7 @@ def main() -> int:
     parser.add_argument(
         "--fixtures-dir",
         required=False,
-        help="Path to a fixtures directory (e.g. src/backend/tests/rules_engine/fixtures/blackbird_fabrics/2025-12-31).",
+        help="Path to a fixtures directory (e.g. src/backend/tests/rules_engine/fixtures/example_client/2025-12-31).",
     )
     parser.add_argument(
         "--output-dir",

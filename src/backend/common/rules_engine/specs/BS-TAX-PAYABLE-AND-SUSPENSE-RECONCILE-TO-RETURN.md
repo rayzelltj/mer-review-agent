@@ -1,7 +1,9 @@
 # BS-TAX-PAYABLE-AND-SUSPENSE-RECONCILE-TO-RETURN — Tax payable/suspense reconcile to most recent return
 
 ## Intent
-Verify tax payable/suspense balances reconcile to the expected return (most recent completed period) and tax payments/refunds.
+Verify tax payable/suspense balances reconcile to the most recent filed return, with strict placement policy:
+- Tax payable must be zero.
+- Tax suspense must tie to the most recent filed return amount, adjusted by mapped payments/refunds for that filing period.
 
 ## Inputs (required)
 - `RuleContext.period_end`
@@ -15,7 +17,6 @@ Config model: `TaxPayableAndSuspenseReconcileRuleConfig`
 - `tax_returns_evidence_type`
 - `tax_payments_evidence_type`
 - `account_name_patterns` (includes GST/HST/PST payable + suspense variants)
-- `refund_grace_days`
 - `missing_data_policy`
 - `delinquent_status`
 
@@ -25,11 +26,13 @@ Config model: `TaxPayableAndSuspenseReconcileRuleConfig`
 - `missing_data_policy`:
   - evidence missing, agency mapping missing (for those accounts), or return missing for expected period
 - PASS:
-  - Combined payable+suspense balance equals expected return balance
+  - `payable == 0` and `suspense == expected_suspense`
+- FAIL:
+  - payable is non-zero
 - WARN:
-  - Refund case is aged beyond grace window (balances match), or negative payable placement issue
+  - optional via `delinquent_status` when suspense does not match expected value
 - `delinquent_status` (default FAIL):
-  - Combined balance does not match expected return balance
+  - suspense does not match expected value
 - NEEDS_REVIEW:
   - Missing data or unmapped accounts
 

@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft. All rights reserved.
 """Factory for creating and managing magentic agents from JSON configurations."""
 
+import asyncio
 import json
 import logging
 from types import SimpleNamespace
@@ -50,6 +51,7 @@ class MagenticAgentFactory:
         agent_obj: SimpleNamespace,
         team_config: TeamConfiguration,
         memory_store: DatabaseBase,
+        user_auth_token: str | None = None,
     ) -> Union[FoundryAgentTemplate, ProxyAgent]:
         """
         Create an agent from configuration object.
@@ -129,6 +131,7 @@ class MagenticAgentFactory:
             team_service=self.team_service,
             team_config=team_config,
             memory_store=memory_store,
+            user_auth_token=user_auth_token,
         )
 
         await agent.open()
@@ -142,6 +145,7 @@ class MagenticAgentFactory:
         user_id: str,
         team_config_input: TeamConfiguration,
         memory_store: DatabaseBase,
+        user_auth_token: str | None = None,
     ) -> List:
         """
         Create and return a team of agents from JSON configuration.
@@ -153,53 +157,53 @@ class MagenticAgentFactory:
         Returns:
             List of initialized agent instances
         """
-        # self.logger.info(f"Loading team configuration from: {file_path}")
-
         try:
+            agents_configs = list(team_config_input.agents)
+            total = len(agents_configs)
 
-            initalized_agents = []
-
-            for i, agent_cfg in enumerate(team_config_input.agents, 1):
+            async def _create_one(i: int, agent_cfg) -> object | None:
+                self.logger.info(
+                    "Creating agent %d/%d: %s", i, total, agent_cfg.name
+                )
                 try:
-                    self.logger.info(
-                        "Creating agent %d/%d: %s",
-                        i,
-                        len(team_config_input.agents),
-                        agent_cfg.name
-                    )
-
                     agent = await self.create_agent_from_config(
-                        user_id, agent_cfg, team_config_input, memory_store
+                        user_id,
+                        agent_cfg,
+                        team_config_input,
+                        memory_store,
+                        user_auth_token=user_auth_token,
                     )
-                    initalized_agents.append(agent)
-                    self._agent_list.append(agent)  # Keep track for cleanup
-
                     self.logger.info(
-                        "✅ Agent %d/%d created: %s",
-                        i,
-                        len(team_config_input.agents),
-                        agent_cfg.name
+                        "✅ Agent %d/%d created: %s", i, total, agent_cfg.name
                     )
-
+                    return agent
                 except (UnsupportedModelError, InvalidConfigurationError) as e:
-                    self.logger.warning(f"Skipped agent {agent_cfg.name}: {e}")
-                    print(f"Skipped agent {agent_cfg.name}: {e}")
-                    continue
+                    self.logger.warning("Skipped agent %s: %s", agent_cfg.name, e)
+                    return None
                 except Exception as e:
-                    self.logger.error(f"Failed to create agent {agent_cfg.name}: {e}")
-                    print(f"Failed to create agent {agent_cfg.name}: {e}")
-                    continue
+                    self.logger.error("Failed to create agent %s: %s", agent_cfg.name, e)
+                    return None
+
+            # Create all agents in parallel to cut cold-start time significantly.
+            results = await asyncio.gather(
+                *[_create_one(i, cfg) for i, cfg in enumerate(agents_configs, 1)],
+                return_exceptions=False,
+            )
+
+            # Preserve original order; keep successful agents only.
+            initialized_agents = [a for a in results if a is not None]
+            self._agent_list.extend(initialized_agents)
 
             self.logger.info(
                 "Successfully created %d/%d agents for team '%s'",
-                len(initalized_agents),
-                len(team_config_input.agents),
-                team_config_input.name
+                len(initialized_agents),
+                total,
+                team_config_input.name,
             )
-            return initalized_agents
+            return initialized_agents
 
         except Exception as e:
-            self.logger.error(f"Failed to load team configuration: {e}")
+            self.logger.error("Failed to load team configuration: %s", e)
             raise
 
     @classmethod

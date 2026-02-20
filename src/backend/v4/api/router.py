@@ -1,12 +1,14 @@
 import asyncio
 import json
 import logging
+import os
+import time
 import uuid
 from typing import Optional
 
 import v4.models.messages as messages
 from v4.models.messages import WebsocketMessageType
-from auth.auth_utils import get_authenticated_user_details
+from auth.auth_utils import get_authenticated_user_details, is_easyauth_enabled
 from common.database.database_factory import DatabaseFactory
 from common.models.messages_af import (
     InputTask,
@@ -22,7 +24,6 @@ from common.utils.utils_af import (
 )
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     File,
     HTTPException,
     Query,
@@ -31,34 +32,81 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from opentelemetry import trace
 from v4.common.services.plan_service import PlanService
 from v4.common.services.team_service import TeamService
 from v4.config.settings import (
     connection_config,
     orchestration_config,
+    run_control_config,
     team_config,
 )
 from v4.orchestration.orchestration_manager import OrchestrationManager
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer("macae")
 
 app_v4 = APIRouter(
     prefix="/api/v4",
     responses={404: {"description": "Not found"}},
 )
 
+WEBSOCKET_PING_INTERVAL_SECONDS = 25
+
+
+def _preferred_user_auth_token(authenticated_user: dict) -> str | None:
+    """Choose the most useful token for downstream MCP->backend auth forwarding."""
+    for key in ("aad_id_token", "auth_token"):
+        token = str(authenticated_user.get(key) or "").strip()
+        if token:
+            return token
+    return None
+
 
 @app_v4.websocket("/socket/{process_id}")
 async def start_comms(
-    websocket: WebSocket, process_id: str, user_id: str = Query(None)
+    websocket: WebSocket,
+    process_id: str,
+    user_id: str = Query(None),
+    auth_token: str | None = Query(None),
 ):
     """Web-Socket endpoint for real-time process status updates."""
 
     # Always accept the WebSocket connection first
     await websocket.accept()
 
-    user_id = user_id or "00000000-0000-0000-0000-000000000000"
+    resolved_user_id: str | None = None
+    auth_headers = dict(websocket.headers)
+    provided_token = str(auth_token or "").strip()
+    if provided_token and "authorization" not in {
+        str(key).lower() for key in auth_headers.keys()
+    }:
+        auth_headers["authorization"] = f"Bearer {provided_token}"
+    try:
+        ws_user = get_authenticated_user_details(request_headers=auth_headers)
+        resolved_user_id = str(ws_user.get("user_principal_id") or "").strip() or None
+    except Exception:
+        resolved_user_id = None
+
+    # Development-only fallback for local runs without EasyAuth.
+    if not resolved_user_id and user_id and os.getenv("APP_ENV", "").strip().lower() == "dev":
+        resolved_user_id = user_id
+
+    require_ws_auth_env = os.getenv("WEBSOCKET_REQUIRE_AUTH", "").strip().lower()
+    if require_ws_auth_env in {"1", "true", "yes"}:
+        require_ws_auth = True
+    elif require_ws_auth_env in {"0", "false", "no"}:
+        require_ws_auth = False
+    else:
+        # In production with EasyAuth, default to requiring identity on WS.
+        require_ws_auth = is_easyauth_enabled()
+
+    if require_ws_auth and not resolved_user_id:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
+    user_id = resolved_user_id or f"anonymous::{process_id}"
 
     # Add to the connection manager for backend updates
     connection_config.add_connection(
@@ -70,19 +118,59 @@ async def start_comms(
 
     # Keep the connection open - FastAPI will close the connection if this returns
     try:
-        # Keep the connection open - FastAPI will close the connection if this returns
         while True:
-            # no expectation that we will receive anything from the client but this keeps
-            # the connection open and does not take cpu cycle
             try:
-                message = await websocket.receive_text()
-                logging.debug(f"Received WebSocket message from {user_id}: {message}")
-            except asyncio.TimeoutError:
-                # Ignore timeouts to keep the WebSocket connection open, but avoid a tight loop.
-                logging.debug(
-                    f"WebSocket receive timeout for user {user_id}, process {process_id}"
+                raw_message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=WEBSOCKET_PING_INTERVAL_SECONDS,
                 )
-                await asyncio.sleep(0.1)
+                if not raw_message:
+                    continue
+                parsed: dict[str, object] | None = None
+                try:
+                    parsed = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    parsed = None
+
+                message_type = str((parsed or {}).get("type", "")).strip().lower()
+                if message_type in {"ping", "heartbeat"}:
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": WebsocketMessageType.SYSTEM_MESSAGE,
+                                "data": {
+                                    "pong": True,
+                                    "process_id": process_id,
+                                    "timestamp": time.time(),
+                                },
+                            }
+                        )
+                    )
+                    continue
+
+                logging.debug("Received WebSocket message from %s: %s", user_id, raw_message)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": WebsocketMessageType.SYSTEM_MESSAGE,
+                                "data": {
+                                    "heartbeat": True,
+                                    "process_id": process_id,
+                                    "timestamp": time.time(),
+                                },
+                            }
+                        )
+                    )
+                except Exception as heartbeat_error:
+                    logging.debug(
+                        "WebSocket heartbeat failed for user %s, process %s: %s",
+                        user_id,
+                        process_id,
+                        heartbeat_error,
+                    )
+                    break
             except WebSocketDisconnect:
                 track_event_if_configured(
                     "WebSocketDisconnect",
@@ -91,11 +179,10 @@ async def start_comms(
                 logging.info(f"Client disconnected from batch {process_id}")
                 break
     except Exception as e:
-        # Fixed logging syntax - removed the error= parameter
         logging.error(f"Error in WebSocket connection: {str(e)}")
     finally:
-        # Always clean up the connection
-        await connection_config.close_connection(process_id=process_id)
+        # Always clean up only this socket instance.
+        await connection_config.close_connection(process_id=process_id, connection=websocket)
 
 
 @app_v4.get("/init_team")
@@ -118,10 +205,24 @@ async def init_team(
                 "UserIdNotFound", {"status_code": 400, "detail": "no user"}
             )
             raise HTTPException(status_code=400, detail="no user")
+        token_changed = orchestration_config.set_user_auth_token(
+            user_id,
+            _preferred_user_auth_token(authenticated_user),
+        )
 
         # Initialize memory store and service
         memory_store = await DatabaseFactory.get_database(user_id=user_id)
         team_service = TeamService(memory_store)
+
+        # Ensure each user has at least one team available.
+        try:
+            await team_service.ensure_default_balance_sheet_team(user_id)
+        except Exception as seed_exc:
+            logger.warning(
+                "Default team provisioning failed for user_id=%s: %s",
+                user_id,
+                seed_exc,
+            )
 
         init_team_id = await find_first_available_team(team_service, user_id)
 
@@ -174,7 +275,7 @@ async def init_team(
         await OrchestrationManager.get_current_or_new_orchestration(
             user_id=user_id,
             team_config=team_configuration,
-            team_switched=team_switched,
+            team_switched=bool(team_switched or token_changed),
             team_service=team_service,
         )
 
@@ -198,7 +299,7 @@ async def init_team(
 
 @app_v4.post("/process_request")
 async def process_request(
-    background_tasks: BackgroundTasks, input_task: InputTask, request: Request
+    input_task: InputTask, request: Request
 ):
     """
     Create a new plan without full processing.
@@ -255,104 +356,356 @@ async def process_request(
             "UserIdNotFound", {"status_code": 400, "detail": "no user"}
         )
         raise HTTPException(status_code=400, detail="no user found")
-    try:
-        memory_store = await DatabaseFactory.get_database(user_id=user_id)
-        user_current_team = await memory_store.get_current_team(user_id=user_id)
-        team_id = None
-        if user_current_team:
-            team_id = user_current_team.team_id
-        team = await memory_store.get_team_by_id(team_id=team_id)
-        if not team:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Team configuration '{team_id}' not found or access denied",
-            )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error retrieving team configuration: {e}",
-        ) from e
-
-    if not await rai_success(input_task.description, team, memory_store):
-        track_event_if_configured(
-            "RAI failed",
-            {
-                "status": "Plan not created - RAI check failed",
-                "description": input_task.description,
-                "session_id": input_task.session_id,
-            },
-        )
-        raise HTTPException(
-            status_code=400,
-            detail="Request contains content that doesn't meet our safety guidelines, try again.",
-        )
+    token_changed = orchestration_config.set_user_auth_token(
+        user_id,
+        _preferred_user_auth_token(authenticated_user),
+    )
 
     if not input_task.session_id:
         input_task.session_id = str(uuid.uuid4())
-    try:
-        plan_id = str(uuid.uuid4())
-        # Initialize memory store and service
-        plan = Plan(
-            id=plan_id,
-            plan_id=plan_id,
-            user_id=user_id,
-            session_id=input_task.session_id,
-            team_id=team_id,
-            initial_goal=input_task.description,
-            overall_status=PlanStatus.in_progress,
-        )
-        await memory_store.add_plan(plan)
 
-        track_event_if_configured(
-            "PlanCreated",
-            {
-                "status": "success",
-                "plan_id": plan.plan_id,
-                "session_id": input_task.session_id,
-                "user_id": user_id,
-                "team_id": team_id,
-                "description": input_task.description,
+    plan_id = str(uuid.uuid4())
+    run_id = plan_id
+    acquired, active_state = await run_control_config.acquire_run(
+        user_id=user_id,
+        session_id=input_task.session_id,
+        run_id=run_id,
+        plan_id=plan_id,
+        process_id=plan_id,
+    )
+    if not acquired:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Workflow is already running for this user.",
+                "run_id": active_state.run_id,
+                "plan_id": active_state.plan_id,
+                "session_id": active_state.session_id,
+                "started_at": active_state.started_at,
+                "expires_at": active_state.expires_at,
             },
         )
-    except Exception as e:
-        print(f"Error creating plan: {e}")
-        track_event_if_configured(
-            "PlanCreationFailed",
-            {
-                "status": "error",
-                "description": input_task.description,
-                "session_id": input_task.session_id,
-                "user_id": user_id,
-                "error": str(e),
-            },
-        )
-        raise HTTPException(status_code=500, detail="Failed to create plan") from e
 
     try:
+        with tracer.start_as_current_span(
+            "orchestration.process_request",
+            attributes={
+                "user.id": user_id,
+                "plan.id": plan_id,
+                "run.id": run_id,
+                "session.id": input_task.session_id,
+            },
+        ):
+            memory_store = await DatabaseFactory.get_database(user_id=user_id)
+            user_current_team = await memory_store.get_current_team(user_id=user_id)
+            team_id = user_current_team.team_id if user_current_team else None
+            team = await memory_store.get_team_by_id(team_id=team_id)
+            if not team:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Team configuration '{team_id}' not found or access denied",
+                )
+            team_service = TeamService(memory_store)
 
-        async def run_orchestration_task():
-            await OrchestrationManager().run_orchestration(user_id, input_task)
+            if not await rai_success(input_task.description, team, memory_store):
+                track_event_if_configured(
+                    "RAI failed",
+                    {
+                        "status": "Plan not created - RAI check failed",
+                        "description": input_task.description,
+                        "session_id": input_task.session_id,
+                    },
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Request contains content that doesn't meet our safety guidelines, try again.",
+                )
 
-        background_tasks.add_task(run_orchestration_task)
+            await OrchestrationManager.get_current_or_new_orchestration(
+                user_id=user_id,
+                team_config=team,
+                team_switched=token_changed,
+                team_service=team_service,
+            )
 
-        return {
-            "status": "Request started successfully",
-            "session_id": input_task.session_id,
-            "plan_id": plan_id,
-        }
+            plan = Plan(
+                id=plan_id,
+                plan_id=plan_id,
+                user_id=user_id,
+                session_id=input_task.session_id,
+                team_id=team_id,
+                initial_goal=input_task.description,
+                overall_status=PlanStatus.in_progress,
+            )
+            await memory_store.add_plan(plan)
 
+            track_event_if_configured(
+                "PlanCreated",
+                {
+                    "status": "success",
+                    "plan_id": plan.plan_id,
+                    "session_id": input_task.session_id,
+                    "user_id": user_id,
+                    "team_id": team_id,
+                    "description": input_task.description,
+                    "run_id": run_id,
+                },
+            )
+
+            async def run_orchestration_task():
+                try:
+                    await OrchestrationManager().run_orchestration(
+                        user_id=user_id,
+                        input_task=input_task,
+                        plan_id=plan_id,
+                        run_id=run_id,
+                    )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "Orchestration task cancelled user=%s plan_id=%s run_id=%s",
+                        user_id,
+                        plan_id,
+                        run_id,
+                    )
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Orchestration task failed user=%s plan_id=%s run_id=%s",
+                        user_id,
+                        plan_id,
+                        run_id,
+                    )
+
+            orchestration_task = asyncio.create_task(
+                run_orchestration_task(),
+                name=f"orchestration:{run_id}",
+            )
+            await run_control_config.register_task(
+                user_id=user_id,
+                run_id=run_id,
+                task=orchestration_task,
+            )
+
+            return {
+                "status": "Request started successfully",
+                "session_id": input_task.session_id,
+                "plan_id": plan_id,
+                "run_id": run_id,
+            }
+
+    except HTTPException:
+        await run_control_config.release_run(user_id=user_id, run_id=run_id)
+        raise
     except Exception as e:
+        await run_control_config.release_run(user_id=user_id, run_id=run_id)
         track_event_if_configured(
             "RequestStartFailed",
             {
                 "session_id": input_task.session_id,
                 "description": input_task.description,
                 "error": str(e),
+                "run_id": run_id,
             },
         )
         raise HTTPException(
             status_code=400, detail=f"Error starting request: {e}"
         ) from e
+
+
+@app_v4.get("/run_status")
+async def get_run_status(request: Request):
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="no user found")
+
+    active = await run_control_config.get_active_run(user_id=user_id)
+    if not active:
+        return {"active": False}
+
+    # Self-heal stale in-memory run locks so users are never blocked by
+    # "run in progress" when the referenced plan no longer exists.
+    try:
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        plan = await memory_store.get_plan_by_plan_id(plan_id=active.plan_id)
+        if not plan:
+            await run_control_config.release_run(user_id=user_id, run_id=active.run_id)
+            logger.warning(
+                "Released stale run lock user=%s run_id=%s plan_id=%s (plan missing)",
+                user_id,
+                active.run_id,
+                active.plan_id,
+            )
+            return {"active": False, "cleared_stale_run": True}
+
+        plan_owner = str(getattr(plan, "user_id", "")).strip()
+        if plan_owner and plan_owner != str(user_id):
+            await run_control_config.release_run(user_id=user_id, run_id=active.run_id)
+            logger.warning(
+                "Released stale run lock user=%s run_id=%s plan_id=%s (owner mismatch)",
+                user_id,
+                active.run_id,
+                active.plan_id,
+            )
+            return {"active": False, "cleared_stale_run": True}
+
+        plan_status = str(getattr(plan, "overall_status", "")).strip().lower()
+        terminal_statuses = {
+            PlanStatus.completed.value,
+            PlanStatus.failed.value,
+            PlanStatus.canceled.value,
+        }
+        if plan_status in terminal_statuses:
+            await run_control_config.release_run(user_id=user_id, run_id=active.run_id)
+            logger.info(
+                "Released stale terminal run lock user=%s run_id=%s plan_id=%s status=%s",
+                user_id,
+                active.run_id,
+                active.plan_id,
+                plan_status,
+            )
+            return {"active": False, "cleared_stale_run": True, "plan_status": plan_status}
+    except Exception as consistency_error:
+        logger.warning(
+            "Run status consistency check failed user=%s run_id=%s: %s",
+            user_id,
+            active.run_id,
+            consistency_error,
+        )
+
+    return {
+        "active": True,
+        "run_id": active.run_id,
+        "plan_id": active.plan_id,
+        "session_id": active.session_id,
+        "started_at": active.started_at,
+        "expires_at": active.expires_at,
+        "process_id": active.process_id,
+    }
+
+
+@app_v4.post("/cancel_run")
+async def cancel_run(request: Request, run_id: Optional[str] = Query(None)):
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="no user found")
+
+    active = await run_control_config.get_active_run(user_id=user_id)
+    if not active:
+        return {
+            "cancelled": False,
+            "active": False,
+            "message": "No active run found for this user.",
+        }
+
+    if run_id and active.run_id != run_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Requested run_id does not match the active run for this user.",
+                "requested_run_id": run_id,
+                "active_run_id": active.run_id,
+                "plan_id": active.plan_id,
+            },
+        )
+
+    cancelled, cancelled_state, task_cancel_requested = await run_control_config.cancel_run(
+        user_id=user_id,
+        run_id=run_id,
+    )
+    if not cancelled or not cancelled_state:
+        return {
+            "cancelled": False,
+            "active": False,
+            "message": "No active run found for this user.",
+        }
+
+    cancel_message = "Run cancelled by user."
+    try:
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        plan = await memory_store.get_plan_by_plan_id(plan_id=cancelled_state.plan_id)
+        if plan:
+            plan.overall_status = PlanStatus.canceled
+            plan.streaming_message = cancel_message
+            await memory_store.update_plan(plan)
+    except Exception as e:
+        logger.warning(
+            "Unable to persist cancelled status for run_id=%s plan_id=%s: %s",
+            cancelled_state.run_id,
+            cancelled_state.plan_id,
+            e,
+        )
+
+    try:
+        await connection_config.send_status_update_async(
+            {
+                "content": cancel_message,
+                "status": "canceled",
+                "timestamp": asyncio.get_event_loop().time(),
+                "plan_id": cancelled_state.plan_id,
+                "run_id": cancelled_state.run_id,
+            },
+            user_id,
+            message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
+        )
+    except Exception as e:
+        logger.warning(
+            "Unable to send cancellation websocket update run_id=%s: %s",
+            cancelled_state.run_id,
+            e,
+        )
+
+    track_event_if_configured(
+        "RunCancelled",
+        {
+            "user_id": user_id,
+            "run_id": cancelled_state.run_id,
+            "plan_id": cancelled_state.plan_id,
+            "task_cancel_requested": task_cancel_requested,
+        },
+    )
+
+    return {
+        "cancelled": True,
+        "active": False,
+        "run_id": cancelled_state.run_id,
+        "plan_id": cancelled_state.plan_id,
+        "status": "canceled",
+        "task_cancel_requested": task_cancel_requested,
+    }
+
+
+@app_v4.get("/plan_status")
+async def get_plan_status(plan_id: str, request: Request):
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="no user found")
+
+    memory_store = await DatabaseFactory.get_database(user_id=user_id)
+    plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+    if not plan:
+        active_run = await run_control_config.get_active_run(user_id=user_id)
+        if active_run and active_run.plan_id == plan_id:
+            await run_control_config.release_run(user_id=user_id, run_id=active_run.run_id)
+        raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found")
+    if str(getattr(plan, "user_id", "")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Plan does not belong to this user")
+
+    active_run = await run_control_config.get_active_run(user_id=user_id)
+    is_active = bool(active_run and active_run.plan_id == plan_id)
+
+    return {
+        "plan_id": plan_id,
+        "session_id": plan.session_id,
+        "overall_status": plan.overall_status,
+        "streaming_message": getattr(plan, "streaming_message", None),
+        "timestamp": getattr(plan, "timestamp", None),
+        "active": is_active,
+        "run_id": active_run.run_id if is_active else None,
+        "expires_at": active_run.expires_at if is_active else None,
+    }
 
 
 @app_v4.post("/plan_approval")
@@ -966,6 +1319,14 @@ async def get_team_configs(request: Request):
         # Initialize memory store and service
         memory_store = await DatabaseFactory.get_database(user_id=user_id)
         team_service = TeamService(memory_store)
+        try:
+            await team_service.ensure_default_balance_sheet_team(user_id)
+        except Exception as seed_exc:
+            logger.warning(
+                "Default team provisioning failed during team list for user_id=%s: %s",
+                user_id,
+                seed_exc,
+            )
 
         # Retrieve all team configurations
         team_configs = await team_service.get_all_team_configurations()
@@ -1395,6 +1756,11 @@ async def get_plan_by_id(
         if plan_id:
             plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
             if not plan:
+                active_run = await run_control_config.get_active_run(user_id=user_id)
+                if active_run and active_run.plan_id == plan_id:
+                    await run_control_config.release_run(
+                        user_id=user_id, run_id=active_run.run_id
+                    )
                 track_event_if_configured(
                     "GetPlanBySessionNotFound",
                     {"status_code": 400, "detail": "Plan not found"},
@@ -1407,8 +1773,6 @@ async def get_plan_by_id(
             agent_messages = await memory_store.get_agent_messages(plan_id=plan.plan_id)
             mplan = plan.m_plan if plan.m_plan else None
             streaming_message = plan.streaming_message if plan.streaming_message else ""
-            plan.streaming_message = ""  # clear streaming message after retrieval
-            plan.m_plan = None  # remove m_plan from plan object for response
             return {
                 "plan": plan,
                 "team": team if team else None,
@@ -1421,6 +1785,8 @@ async def get_plan_by_id(
                 "GetPlanId", {"status_code": 400, "detail": "no plan id"}
             )
             raise HTTPException(status_code=400, detail="no plan id")
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error retrieving plan: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error occurred")

@@ -11,7 +11,10 @@ from typing import Any
 from agent_framework import ChatMessage
 # Removed: from agent_framework._content import FunctionCallContent  (does not exist)
 
-from agent_framework._workflows._magentic import AgentRunResponseUpdate  # Streaming update type from workflows
+try:
+    from agent_framework._workflows._magentic import AgentRunResponseUpdate  # Streaming update type from workflows
+except ImportError:  # Older/newer local package version — fall back to Any for the type hint
+    from typing import Any as AgentRunResponseUpdate  # type: ignore[assignment]
 
 from v4.config.settings import connection_config
 from v4.models.messages import (
@@ -23,6 +26,37 @@ from v4.models.messages import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Single-writer output gate
+# ---------------------------------------------------------------------------
+# ONLY agents whose name appears in this set are allowed to emit
+# WebsocketMessageType.AGENT_MESSAGE / AGENT_MESSAGE_STREAMING to the UI.
+# All other agents are re-typed as INTERNAL_AGENT_MESSAGE so the frontend
+# (and any logging middleware) can distinguish orchestrator output from
+# intermediate agent chatter without dropping the data.
+#
+# Add the exact agent_name string as it appears in the team JSON / ChatAgent
+# constructor.  The comparison is case-insensitive.
+#
+# Sub-agents (ConnectorAgent, NormalizationAgent, RulesAgent, ReportAgent,
+# HITLAgent) are intentionally excluded: they must return structured JSON
+# to the orchestrator, not prose to the end-user.
+ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
+    {
+        "magenticmanager",
+        "magentic_manager",       # agent_framework MAGENTIC_MANAGER_NAME constant
+        "standardmagenticmanager",
+        "humanapprovalmagenticmanager",
+        "groupchatmanager",
+        "proxyagent",         # ProxyAgent relays the user-facing summary
+    }
+)
+
+
+def _is_orchestrator_agent(agent_name: str) -> bool:
+    """Return True if this agent is allowed to emit visible messages to the UI."""
+    return agent_name.strip().lower() in ORCHESTRATOR_AGENT_NAMES
 
 
 def clean_citations(text: str) -> str:
@@ -72,6 +106,10 @@ def agent_response_callback(
 ) -> None:
     """
     Final (non-streaming) agent response callback using agent_framework ChatMessage.
+
+    Output gate: only orchestrator agents emit WebsocketMessageType.AGENT_MESSAGE.
+    All other agents are emitted as INTERNAL_AGENT_MESSAGE so the UI can suppress
+    them, while the raw text is still logged and available for debugging.
     """
     agent_name = getattr(message, "author_name", None) or agent_id or "Unknown Agent"
     role = getattr(message, "role", "assistant")
@@ -91,6 +129,20 @@ def agent_response_callback(
         logger.debug("No user_id provided; skipping websocket send for final message.")
         return
 
+    # ----- Output gate -----
+    is_orchestrator = _is_orchestrator_agent(agent_name)
+    ws_type = (
+        WebsocketMessageType.AGENT_MESSAGE
+        if is_orchestrator
+        else WebsocketMessageType.INTERNAL_AGENT_MESSAGE
+    )
+    if not is_orchestrator:
+        logger.debug(
+            "output_gate: routing %s message as INTERNAL_AGENT_MESSAGE (len=%d)",
+            agent_name,
+            len(text),
+        )
+
     try:
         final_message = AgentMessage(
             agent_name=agent_name,
@@ -101,10 +153,10 @@ def agent_response_callback(
             connection_config.send_status_update_async(
                 final_message,
                 user_id,
-                message_type=WebsocketMessageType.AGENT_MESSAGE,
+                message_type=ws_type,
             )
         )
-        logger.info("%s message (agent=%s): %s", str(role).capitalize(), agent_name, text[:200])
+        logger.info("%s message (agent=%s type=%s): %s", str(role).capitalize(), agent_name, ws_type, text[:200])
     except Exception as e:
         logger.error("agent_response_callback error sending WebSocket message: %s", e)
 
@@ -117,6 +169,12 @@ async def streaming_agent_response_callback(
 ) -> None:
     """
     Streaming callback for incremental agent output (AgentRunResponseUpdate).
+
+    Output gate: only orchestrator agents emit AGENT_MESSAGE_STREAMING.
+    Sub-agents' streaming chunks are suppressed entirely (they must return
+    structured JSON, not prose, so streaming chunks are noise).
+    Tool-call events are always forwarded regardless of agent identity so the
+    UI can display activity indicators.
     """
     if not user_id:
         return
@@ -134,6 +192,7 @@ async def streaming_agent_response_callback(
 
         cleaned = clean_citations(chunk_text or "")
 
+        # Tool-call messages: always forward (show spinner / activity) for ALL agents
         contents = getattr(update, "contents", []) or []
         tool_calls = _extract_tool_calls_from_contents(contents)
         if tool_calls:
@@ -146,7 +205,8 @@ async def streaming_agent_response_callback(
             )
             logger.info("Tool calls streamed from %s: %d", agent_id, len(tool_calls))
 
-        if cleaned:
+        # Text streaming: gate to orchestrator agents only
+        if cleaned and _is_orchestrator_agent(agent_id):
             streaming_payload = AgentMessageStreaming(
                 agent_name=agent_id,
                 content=cleaned,
@@ -158,5 +218,11 @@ async def streaming_agent_response_callback(
                 message_type=WebsocketMessageType.AGENT_MESSAGE_STREAMING,
             )
             logger.debug("Streaming chunk (agent=%s final=%s len=%d)", agent_id, is_final, len(cleaned))
+        elif cleaned:
+            logger.debug(
+                "output_gate: suppressing streaming chunk from sub-agent %s (len=%d)",
+                agent_id,
+                len(cleaned),
+            )
     except Exception as e:
         logger.error("streaming_agent_response_callback error: %s", e)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import date
@@ -11,7 +12,20 @@ from urllib.parse import urlencode
 from adapters.qbo.intercompany import intercompany_balance_sheets_to_evidence
 from adapters.qbo.pipeline import build_qbo_aging_evidence, build_qbo_snapshots, build_qbo_tax_evidence
 from adapters.qbo.balance_sheet import balance_sheet_snapshot_from_report
+from adapters.qbo.bank_cc_reconciliation import (
+    active_bank_cc_accounts_from_accounts_payload,
+    transaction_list_unreconciled_sums_from_report,
+    trial_balance_register_balances_from_report,
+)
+from adapters.qbo.fixed_assets import (
+    active_fixed_asset_accounts_from_accounts_payload,
+    fixed_asset_ledger_transactions_from_report,
+)
+from adapters.mock_evidence.evidence_manifest import evidence_bundle_from_manifest
+from adapters.qbo.profit_and_loss import expense_month_over_month_from_report
 from common.rules_engine.models import EvidenceBundle, EvidenceItem
+from connectors.drive.client import download_file_bytes
+from connectors.drive.config import build_drive_config, is_drive_evidence_enabled
 from connectors.qbo.accounts import fetch_accounts_all
 from connectors.qbo.aging import (
     fetch_aged_payables_detail,
@@ -19,9 +33,15 @@ from connectors.qbo.aging import (
     fetch_aged_receivables_detail,
     fetch_aged_receivables_summary,
 )
-from connectors.qbo.config import QBOConfig, get_qbo_config
+from connectors.qbo.client_store import get_qbo_client_record
+from connectors.qbo.config import QBOConfig, build_qbo_config, get_client_store_mode
 from connectors.qbo.intercompany import fetch_counterparty_balance_sheets
-from connectors.qbo.reports import fetch_balance_sheet, fetch_profit_and_loss
+from connectors.qbo.reports import (
+    fetch_balance_sheet,
+    fetch_profit_and_loss,
+    fetch_transaction_list_by_account,
+    fetch_trial_balance,
+)
 from connectors.qbo.tax import (
     fetch_tax_agencies_payload,
     fetch_tax_payments_payload,
@@ -30,6 +50,7 @@ from connectors.qbo.tax import (
     tax_payments_from_payload,
     tax_returns_from_payload,
 )
+from common.telemetry import traced_phase
 
 from .data_source import ReviewInputs
 from .snapshots import (
@@ -51,6 +72,7 @@ class ClientConfig:
     client_id: str
     realm_id: str
     counterparties: tuple[CounterpartyConfig, ...] = ()
+    refresh_token: str | None = None
 
 
 INTERCOMPANY_NAME_PATTERNS = (
@@ -62,6 +84,7 @@ INTERCOMPANY_NAME_PATTERNS = (
     "loan to",
     "shareholder loan",
 )
+LOGGER = logging.getLogger(__name__)
 
 
 class LiveQBODataSource:
@@ -70,293 +93,709 @@ class LiveQBODataSource:
         *,
         snapshot_store: SnapshotStore | None = None,
         client_config_path: Path | None = None,
+        client_store_mode: str | None = None,
+        user_principal_id: str | None = None,
     ) -> None:
-        self._client_config_path = client_config_path or _default_client_config_path()
-        self._clients = _load_client_configs(self._client_config_path)
+        self._client_store_mode = (client_store_mode or get_client_store_mode()).strip().lower()
+        self._user_principal_id = str(user_principal_id or "").strip() or None
+        if self._client_store_mode == "file":
+            self._client_config_path = client_config_path or _default_client_config_path()
+            self._clients = _load_client_configs(self._client_config_path)
+        else:
+            self._client_config_path = client_config_path
+            self._clients = {}
         self._snapshot_store = snapshot_store or _default_snapshot_store()
 
-    def build_review_inputs(self, *, client_id: str, period_end: date) -> ReviewInputs:
-        client = self._clients.get(client_id)
+    def fetch_raw_data(self, *, client_id: str, period_end: date) -> dict[str, Any]:
+        """Phase 1: Fetch all raw QBO API payloads and save them as snapshots.
+
+        Does NOT run normalization (no build_qbo_snapshots / build_qbo_aging_evidence etc.).
+        Returns a serializable dict of raw payloads so the caller can persist it as an artifact
+        for the normalization phase.  All payloads are also saved individually via the snapshot
+        store so the NormalizationAgent can inspect them with list_snapshots / get_snapshot.
+        """
+        client = self._get_client_config(client_id)
         if client is None:
+            if self._client_store_mode == "cosmos":
+                raise ValueError(f"Unknown client_id '{client_id}' in Cosmos store.")
             raise ValueError(f"Unknown client_id '{client_id}' in {self._client_config_path}.")
 
-        primary_config = _config_for_realm(client.realm_id)
-
-        balance_sheet_report = fetch_balance_sheet(
-            primary_config,
-            end_date=period_end.isoformat(),
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_balance_sheet",
-            payload=balance_sheet_report,
-        )
-        _validate_report_payload(
-            balance_sheet_report,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/reports/BalanceSheet",
-                {
-                    "end_date": period_end.isoformat(),
-                    "accounting_method": "Accrual",
-                },
-            ),
-            snapshot_name="qbo_balance_sheet",
-            client_id=client_id,
-            period_end=period_end,
-            header_keys=("EndPeriod",),
+        primary_config = _config_for_realm(
+            client.realm_id,
+            refresh_token=client.refresh_token,
+            client_record_id=client.client_id,
+            user_principal_id=self._user_principal_id,
         )
 
-        pnl_start = _first_day_months_ago(period_end, 4)
-        profit_and_loss_report = fetch_profit_and_loss(
-            primary_config,
-            start_date=pnl_start.isoformat(),
-            end_date=period_end.isoformat(),
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_profit_and_loss",
-            payload=profit_and_loss_report,
-        )
-        _validate_report_payload(
-            profit_and_loss_report,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/reports/ProfitAndLoss",
-                {
-                    "start_date": pnl_start.isoformat(),
-                    "end_date": period_end.isoformat(),
-                    "accounting_method": "Accrual",
-                },
-            ),
-            snapshot_name="qbo_profit_and_loss",
-            client_id=client_id,
-            period_end=period_end,
-            header_keys=("StartPeriod", "EndPeriod"),
-        )
+        raw: dict[str, Any] = {
+            "client_id": client_id,
+            "realm_id": primary_config.realm_id,
+            "period_end": period_end.isoformat(),
+        }
 
-        accounts_payload = fetch_accounts_all(primary_config)
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_accounts",
-            payload=accounts_payload,
-        )
-        _validate_accounts_payload(
-            accounts_payload,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/query",
-                {
-                    "query": "select * from Account startposition 1 maxresults 1000",
-                },
-            ),
-            snapshot_name="qbo_accounts",
-            client_id=client_id,
-            period_end=period_end,
-        )
-
-        ap_summary = fetch_aged_payables_summary(primary_config, as_of_date=period_end.isoformat())
-        ap_detail = fetch_aged_payables_detail(primary_config, as_of_date=period_end.isoformat())
-        ar_summary = fetch_aged_receivables_summary(primary_config, as_of_date=period_end.isoformat())
-        ar_detail = fetch_aged_receivables_detail(primary_config, as_of_date=period_end.isoformat())
-
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_aged_payables_summary",
-            payload=ap_summary,
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_aged_payables_detail",
-            payload=ap_detail,
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_aged_receivables_summary",
-            payload=ar_summary,
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_aged_receivables_detail",
-            payload=ar_detail,
-        )
-        _validate_report_payload(
-            ap_summary,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/reports/AgedPayables",
-                {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
-            ),
-            snapshot_name="qbo_aged_payables_summary",
-            client_id=client_id,
-            period_end=period_end,
-            header_keys=("EndPeriod",),
-        )
-        _validate_report_payload(
-            ap_detail,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/reports/AgedPayables",
-                {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
-            ),
-            snapshot_name="qbo_aged_payables_detail",
-            client_id=client_id,
-            period_end=period_end,
-            header_keys=("EndPeriod",),
-        )
-        _validate_report_payload(
-            ar_summary,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/reports/AgedReceivables",
-                {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
-            ),
-            snapshot_name="qbo_aged_receivables_summary",
-            client_id=client_id,
-            period_end=period_end,
-            header_keys=("EndPeriod",),
-        )
-        _validate_report_payload(
-            ar_detail,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/reports/AgedReceivables",
-                {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
-            ),
-            snapshot_name="qbo_aged_receivables_detail",
-            client_id=client_id,
-            period_end=period_end,
-            header_keys=("EndPeriod",),
-        )
-
-        tax_agencies_payload = fetch_tax_agencies_payload(primary_config)
-        tax_returns_payload = fetch_tax_returns_payload(primary_config)
-        tax_payments_payload = fetch_tax_payments_payload(primary_config)
-
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_tax_agencies",
-            payload=tax_agencies_payload,
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_tax_returns",
-            payload=tax_returns_payload,
-        )
-        self._snapshot_store.save_json(
-            client_id=client_id,
-            period_end=period_end,
-            name="qbo_tax_payments",
-            payload=tax_payments_payload,
-        )
-        _validate_tax_payload(
-            tax_agencies_payload,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/taxagency",
-            ),
-            snapshot_name="qbo_tax_agencies",
-            client_id=client_id,
-            period_end=period_end,
-            item_key="TaxAgency",
-        )
-        _validate_tax_payload(
-            tax_returns_payload,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/taxreturn",
-            ),
-            snapshot_name="qbo_tax_returns",
-            client_id=client_id,
-            period_end=period_end,
-            item_key="TaxReturn",
-        )
-        _validate_tax_payload(
-            tax_payments_payload,
-            endpoint=_format_endpoint(
-                primary_config.base_url,
-                f"/v3/company/{primary_config.realm_id}/taxpayment",
-            ),
-            snapshot_name="qbo_tax_payments",
-            client_id=client_id,
-            period_end=period_end,
-            item_key="TaxPayment",
-        )
-
-        tax_agencies = tax_agencies_from_payload(tax_agencies_payload)
-        tax_returns = tax_returns_from_payload(tax_returns_payload)
-        tax_payments = tax_payments_from_payload(tax_payments_payload)
-
-        counterparty_payloads: list[dict[str, Any]] = []
-        if client.counterparties:
-            counterparty_configs = [
-                _config_for_realm(cp.realm_id) for cp in client.counterparties
-            ]
-            counterparty_payloads = fetch_counterparty_balance_sheets(
-                counterparty_configs=counterparty_configs,
+        with traced_phase(
+            "balance_sheet.connector",
+            logger=LOGGER,
+            attributes={"client.id": client_id, "qbo.realm_id": primary_config.realm_id},
+        ):
+            balance_sheet_report = fetch_balance_sheet(
+                primary_config,
                 end_date=period_end.isoformat(),
             )
-            for cp, payload in zip(client.counterparties, counterparty_payloads):
-                safe_name = _safe_slug(cp.name or cp.realm_id)
-                snapshot_name = f"qbo_balance_sheet_counterparty_{safe_name}"
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_balance_sheet",
+                payload=balance_sheet_report,
+            )
+            _validate_report_payload(
+                balance_sheet_report,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/BalanceSheet",
+                    {
+                        "end_date": period_end.isoformat(),
+                        "accounting_method": "Accrual",
+                    },
+                ),
+                snapshot_name="qbo_balance_sheet",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("EndPeriod",),
+            )
+            raw["qbo_balance_sheet"] = balance_sheet_report
+
+            pnl_start = _first_day_months_ago(period_end, 4)
+            profit_and_loss_report = fetch_profit_and_loss(
+                primary_config,
+                start_date=pnl_start.isoformat(),
+                end_date=period_end.isoformat(),
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_profit_and_loss",
+                payload=profit_and_loss_report,
+            )
+            _validate_report_payload(
+                profit_and_loss_report,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/ProfitAndLoss",
+                    {
+                        "start_date": pnl_start.isoformat(),
+                        "end_date": period_end.isoformat(),
+                        "accounting_method": "Accrual",
+                    },
+                ),
+                snapshot_name="qbo_profit_and_loss",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("StartPeriod", "EndPeriod"),
+            )
+            raw["qbo_profit_and_loss"] = profit_and_loss_report
+
+            profit_and_loss_monthly_report: dict[str, Any] | None = None
+            pnl_monthly_start = _first_day_months_ago(period_end, 1)
+            try:
+                profit_and_loss_monthly_report = fetch_profit_and_loss(
+                    primary_config,
+                    start_date=pnl_monthly_start.isoformat(),
+                    end_date=period_end.isoformat(),
+                    summarize_column_by="Month",
+                )
                 self._snapshot_store.save_json(
                     client_id=client_id,
                     period_end=period_end,
-                    name=snapshot_name,
-                    payload=payload,
+                    name="qbo_profit_and_loss_monthly",
+                    payload=profit_and_loss_monthly_report,
                 )
                 _validate_report_payload(
-                    payload,
+                    profit_and_loss_monthly_report,
                     endpoint=_format_endpoint(
                         primary_config.base_url,
-                        f"/v3/company/{cp.realm_id}/reports/BalanceSheet",
+                        f"/v3/company/{primary_config.realm_id}/reports/ProfitAndLoss",
                         {
+                            "start_date": pnl_monthly_start.isoformat(),
                             "end_date": period_end.isoformat(),
                             "accounting_method": "Accrual",
+                            "summarize_column_by": "Month",
                         },
                     ),
-                    snapshot_name=snapshot_name,
+                    snapshot_name="qbo_profit_and_loss_monthly",
                     client_id=client_id,
                     period_end=period_end,
-                    header_keys=("EndPeriod",),
+                    header_keys=("StartPeriod", "EndPeriod"),
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Unable to fetch monthly ProfitAndLoss report for client_id=%s period_end=%s: %s",
+                    client_id,
+                    period_end,
+                    exc,
+                )
+            raw["qbo_profit_and_loss_monthly"] = profit_and_loss_monthly_report
+
+            trial_balance_start = date(period_end.year, period_end.month, 1)
+            trial_balance_report = fetch_trial_balance(
+                primary_config,
+                start_date=trial_balance_start.isoformat(),
+                end_date=period_end.isoformat(),
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_trial_balance",
+                payload=trial_balance_report,
+            )
+            _validate_report_payload(
+                trial_balance_report,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/TrialBalance",
+                    {
+                        "start_date": trial_balance_start.isoformat(),
+                        "end_date": period_end.isoformat(),
+                        "accounting_method": "Accrual",
+                    },
+                ),
+                snapshot_name="qbo_trial_balance",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("StartPeriod", "EndPeriod"),
+            )
+            raw["qbo_trial_balance"] = trial_balance_report
+
+            accounts_payload = fetch_accounts_all(primary_config)
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_accounts",
+                payload=accounts_payload,
+            )
+            _validate_accounts_payload(
+                accounts_payload,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/query",
+                    {
+                        "query": "select * from Account startposition 1 maxresults 1000",
+                    },
+                ),
+                snapshot_name="qbo_accounts",
+                client_id=client_id,
+                period_end=period_end,
+            )
+            raw["qbo_accounts"] = accounts_payload
+
+            manifest_payload, drive_items = _load_drive_manifest_evidence(
+                client_id=client_id,
+                period_end=period_end,
+                user_principal_id=self._user_principal_id,
+            )
+            statement_end_by_ref, statement_end_by_id = _statement_end_dates_by_account(drive_items)
+
+            bank_cc_scope = active_bank_cc_accounts_from_accounts_payload(
+                accounts_payload,
+                realm_id=primary_config.realm_id,
+                active_only=True,
+            )
+            tx_list_payloads: list[dict[str, Any]] = []
+            tx_list_start = date(period_end.year, period_end.month, 1).isoformat()
+            for scoped_account in bank_cc_scope:
+                account_id = str(scoped_account.get("account_id") or "").strip()
+                if not account_id:
+                    continue
+                account_ref = str(scoped_account.get("account_ref") or "").strip()
+                statement_end_date = (
+                    statement_end_by_ref.get(account_ref)
+                    or statement_end_by_id.get(account_id)
+                    or period_end
+                )
+                tx_payload = fetch_transaction_list_by_account(
+                    primary_config,
+                    account_id=account_id,
+                    start_date=tx_list_start,
+                    end_date=statement_end_date.isoformat(),
+                    include_split_detail=True,
+                )
+                tx_list_payloads.append(
+                    {
+                        "account_id": account_id,
+                        "account_ref": account_ref,
+                        "account_name": scoped_account.get("account_name"),
+                        "statement_end_date": statement_end_date.isoformat()
+                        if isinstance(statement_end_date, date) else str(statement_end_date),
+                        "payload": tx_payload,
+                    }
+                )
+                self._snapshot_store.save_json(
+                    client_id=client_id,
+                    period_end=period_end,
+                    name=f"qbo_transaction_list_by_account_{account_id}",
+                    payload=tx_payload,
                 )
 
-        snapshots = build_qbo_snapshots(
-            balance_sheet_report=balance_sheet_report,
-            profit_and_loss_report=profit_and_loss_report,
-            accounts_payload=accounts_payload,
-            realm_id=primary_config.realm_id,
-            pnl_summarize_by_month=False,
-        )
+            fixed_asset_scope = active_fixed_asset_accounts_from_accounts_payload(
+                accounts_payload,
+                realm_id=primary_config.realm_id,
+                active_only=True,
+            )
+            fixed_asset_tx_payloads: list[dict[str, Any]] = []
+            for scoped_account in fixed_asset_scope:
+                account_id = str(scoped_account.get("account_id") or "").strip()
+                if not account_id:
+                    continue
+                try:
+                    tx_payload = fetch_transaction_list_by_account(
+                        primary_config,
+                        account_id=account_id,
+                        start_date=tx_list_start,
+                        end_date=period_end.isoformat(),
+                        include_split_detail=True,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Failed to fetch fixed-asset transaction list for account_id=%s client_id=%s period_end=%s: %s",
+                        account_id,
+                        client_id,
+                        period_end,
+                        exc,
+                    )
+                    continue
 
-        aging_bundle = build_qbo_aging_evidence(
-            ap_summary_report=ap_summary,
-            ap_detail_report=ap_detail,
-            ar_summary_report=ar_summary,
-            ar_detail_report=ar_detail,
-        )
-        tax_bundle = build_qbo_tax_evidence(
-            tax_agencies_payload=tax_agencies,
-            tax_returns_payload=tax_returns,
-            tax_payments_payload=tax_payments,
-        )
+                fixed_asset_tx_payloads.append(
+                    {
+                        "account_id": account_id,
+                        "account_ref": str(scoped_account.get("account_ref") or "").strip(),
+                        "account_name": scoped_account.get("account_name"),
+                        "payload": tx_payload,
+                    }
+                )
+                self._snapshot_store.save_json(
+                    client_id=client_id,
+                    period_end=period_end,
+                    name=f"qbo_transaction_list_fixed_asset_{account_id}",
+                    payload=tx_payload,
+                )
+
+            ap_summary = fetch_aged_payables_summary(primary_config, as_of_date=period_end.isoformat())
+            ap_detail = fetch_aged_payables_detail(primary_config, as_of_date=period_end.isoformat())
+            ar_summary = fetch_aged_receivables_summary(primary_config, as_of_date=period_end.isoformat())
+            ar_detail = fetch_aged_receivables_detail(primary_config, as_of_date=period_end.isoformat())
+
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_aged_payables_summary",
+                payload=ap_summary,
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_aged_payables_detail",
+                payload=ap_detail,
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_aged_receivables_summary",
+                payload=ar_summary,
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_aged_receivables_detail",
+                payload=ar_detail,
+            )
+            _validate_report_payload(
+                ap_summary,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/AgedPayables",
+                    {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
+                ),
+                snapshot_name="qbo_aged_payables_summary",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("EndPeriod",),
+            )
+            _validate_report_payload(
+                ap_detail,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/AgedPayables",
+                    {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
+                ),
+                snapshot_name="qbo_aged_payables_detail",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("EndPeriod",),
+            )
+            _validate_report_payload(
+                ar_summary,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/AgedReceivables",
+                    {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
+                ),
+                snapshot_name="qbo_aged_receivables_summary",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("EndPeriod",),
+            )
+            _validate_report_payload(
+                ar_detail,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/reports/AgedReceivables",
+                    {"report_date": period_end.isoformat(), "aging_method": "Report_Date"},
+                ),
+                snapshot_name="qbo_aged_receivables_detail",
+                client_id=client_id,
+                period_end=period_end,
+                header_keys=("EndPeriod",),
+            )
+            raw["qbo_aged_payables_summary"] = ap_summary
+            raw["qbo_aged_payables_detail"] = ap_detail
+            raw["qbo_aged_receivables_summary"] = ar_summary
+            raw["qbo_aged_receivables_detail"] = ar_detail
+
+            tax_agencies_payload = fetch_tax_agencies_payload(primary_config)
+            tax_returns_payload = fetch_tax_returns_payload(primary_config)
+            tax_payments_payload = fetch_tax_payments_payload(primary_config)
+
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_tax_agencies",
+                payload=tax_agencies_payload,
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_tax_returns",
+                payload=tax_returns_payload,
+            )
+            self._snapshot_store.save_json(
+                client_id=client_id,
+                period_end=period_end,
+                name="qbo_tax_payments",
+                payload=tax_payments_payload,
+            )
+            _validate_tax_payload(
+                tax_agencies_payload,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/taxagency",
+                ),
+                snapshot_name="qbo_tax_agencies",
+                client_id=client_id,
+                period_end=period_end,
+                item_key="TaxAgency",
+            )
+            _validate_tax_payload(
+                tax_returns_payload,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/taxreturn",
+                ),
+                snapshot_name="qbo_tax_returns",
+                client_id=client_id,
+                period_end=period_end,
+                item_key="TaxReturn",
+            )
+            _validate_tax_payload(
+                tax_payments_payload,
+                endpoint=_format_endpoint(
+                    primary_config.base_url,
+                    f"/v3/company/{primary_config.realm_id}/taxpayment",
+                ),
+                snapshot_name="qbo_tax_payments",
+                client_id=client_id,
+                period_end=period_end,
+                item_key="TaxPayment",
+            )
+            raw["qbo_tax_agencies"] = tax_agencies_payload
+            raw["qbo_tax_returns"] = tax_returns_payload
+            raw["qbo_tax_payments"] = tax_payments_payload
+
+            counterparty_payloads: list[dict[str, Any]] = []
+            if client.counterparties:
+                counterparty_configs = [
+                    _config_for_realm(
+                        cp.realm_id,
+                        refresh_token=client.refresh_token,
+                        client_record_id=client.client_id,
+                        user_principal_id=self._user_principal_id,
+                    )
+                    for cp in client.counterparties
+                ]
+                counterparty_payloads = fetch_counterparty_balance_sheets(
+                    counterparty_configs=counterparty_configs,
+                    end_date=period_end.isoformat(),
+                )
+                for cp, payload in zip(client.counterparties, counterparty_payloads):
+                    safe_name = _safe_slug(cp.name or cp.realm_id)
+                    snapshot_name = f"qbo_balance_sheet_counterparty_{safe_name}"
+                    self._snapshot_store.save_json(
+                        client_id=client_id,
+                        period_end=period_end,
+                        name=snapshot_name,
+                        payload=payload,
+                    )
+                    _validate_report_payload(
+                        payload,
+                        endpoint=_format_endpoint(
+                            primary_config.base_url,
+                            f"/v3/company/{cp.realm_id}/reports/BalanceSheet",
+                            {
+                                "end_date": period_end.isoformat(),
+                                "accounting_method": "Accrual",
+                            },
+                        ),
+                        snapshot_name=snapshot_name,
+                        client_id=client_id,
+                        period_end=period_end,
+                        header_keys=("EndPeriod",),
+                    )
+            raw["counterparty_names"] = [cp.name for cp in client.counterparties]
+            raw["counterparty_payloads"] = counterparty_payloads
+
+            raw["tx_list_payloads"] = tx_list_payloads
+            raw["fixed_asset_tx_payloads"] = fixed_asset_tx_payloads
+            if manifest_payload is not None:
+                raw["drive_evidence_manifest"] = manifest_payload
+                raw["drive_evidence_items"] = [
+                    item.model_dump(mode="json") for item in drive_items
+                ]
+
+        return raw
+
+    def normalize_raw_data(self, *, raw: dict[str, Any]) -> ReviewInputs:
+        """Phase 2: Normalize raw QBO payloads (from fetch_raw_data) into a ReviewInputs object.
+
+        Accepts the dict returned by fetch_raw_data() (or deserialized from the raw_qbo_inputs artifact).
+        Runs build_qbo_snapshots, build_qbo_aging_evidence, build_qbo_tax_evidence, and all
+        evidence item construction.  Does NOT make any QBO API calls.
+        """
+        from connectors.qbo.client_store import get_qbo_client_record
+
+        period_end = date.fromisoformat(raw["period_end"])
+        realm_id = str(raw.get("realm_id") or "").strip()
+
+        balance_sheet_report = raw["qbo_balance_sheet"]
+        profit_and_loss_report = raw["qbo_profit_and_loss"]
+        profit_and_loss_monthly_report: dict[str, Any] | None = raw.get("qbo_profit_and_loss_monthly")
+        trial_balance_report = raw["qbo_trial_balance"]
+        accounts_payload = raw["qbo_accounts"]
+        ap_summary = raw["qbo_aged_payables_summary"]
+        ap_detail = raw["qbo_aged_payables_detail"]
+        ar_summary = raw["qbo_aged_receivables_summary"]
+        ar_detail = raw["qbo_aged_receivables_detail"]
+        tax_agencies_payload = raw["qbo_tax_agencies"]
+        tax_returns_payload = raw["qbo_tax_returns"]
+        tax_payments_payload = raw["qbo_tax_payments"]
+
+        # Re-hydrate tx_list_payloads — statement_end_date was serialized as ISO string
+        tx_list_payloads_raw: list[dict[str, Any]] = raw.get("tx_list_payloads") or []
+        tx_list_payloads: list[dict[str, Any]] = []
+        for entry in tx_list_payloads_raw:
+            rehydrated = dict(entry)
+            sed = entry.get("statement_end_date")
+            if isinstance(sed, str):
+                try:
+                    rehydrated["statement_end_date"] = date.fromisoformat(sed)
+                except ValueError:
+                    rehydrated["statement_end_date"] = period_end
+            elif not isinstance(sed, date):
+                rehydrated["statement_end_date"] = period_end
+            tx_list_payloads.append(rehydrated)
+
+        fixed_asset_tx_payloads: list[dict[str, Any]] = raw.get("fixed_asset_tx_payloads") or []
+
+        manifest_payload: dict[str, Any] | None = raw.get("drive_evidence_manifest")
+        drive_evidence_items_raw: list[dict[str, Any]] = raw.get("drive_evidence_items") or []
+        drive_items: list[EvidenceItem] = []
+        for item_dict in drive_evidence_items_raw:
+            try:
+                drive_items.append(EvidenceItem.model_validate(item_dict))
+            except Exception as exc:
+                LOGGER.warning("Failed to rehydrate drive evidence item: %s", exc)
+
+        counterparty_payloads: list[dict[str, Any]] = raw.get("counterparty_payloads") or []
+        counterparty_names: list[str | None] = raw.get("counterparty_names") or []
+
+        with traced_phase(
+            "balance_sheet.normalization",
+            logger=LOGGER,
+            attributes={"qbo.realm_id": realm_id},
+        ):
+            snapshots = build_qbo_snapshots(
+                balance_sheet_report=balance_sheet_report,
+                profit_and_loss_report=profit_and_loss_report,
+                accounts_payload=accounts_payload,
+                realm_id=realm_id,
+                pnl_summarize_by_month=False,
+            )
+
+            tax_agencies = tax_agencies_from_payload(tax_agencies_payload)
+            tax_returns = tax_returns_from_payload(tax_returns_payload)
+            tax_payments = tax_payments_from_payload(tax_payments_payload)
+
+            aging_bundle = build_qbo_aging_evidence(
+                ap_summary_report=ap_summary,
+                ap_detail_report=ap_detail,
+                ar_summary_report=ar_summary,
+                ar_detail_report=ar_detail,
+            )
+            tax_bundle = build_qbo_tax_evidence(
+                tax_agencies_payload=tax_agencies,
+                tax_returns_payload=tax_returns,
+                tax_payments_payload=tax_payments,
+            )
 
         items: list[EvidenceItem] = []
         items += aging_bundle.items
         items += tax_bundle.items
 
+        coa_rows = active_bank_cc_accounts_from_accounts_payload(
+            accounts_payload,
+            realm_id=realm_id,
+            active_only=True,
+        )
+        items.append(
+            EvidenceItem(
+                evidence_type="qbo_chart_of_accounts_bank_cc_active",
+                source="qbo",
+                as_of_date=period_end,
+                meta={"accounts": coa_rows},
+            )
+        )
+
+        trial_map = trial_balance_register_balances_from_report(
+            trial_balance_report,
+            realm_id=realm_id,
+        )
+        items.append(
+            EvidenceItem(
+                evidence_type="qbo_trial_balance_register_balance",
+                source="qbo",
+                as_of_date=period_end,
+                meta={
+                    "balances_by_account_ref": {ref: str(amount) for ref, amount in trial_map.items()},
+                },
+            )
+        )
+
+        if profit_and_loss_monthly_report is not None:
+            try:
+                expense_variance_meta = expense_month_over_month_from_report(
+                    profit_and_loss_monthly_report,
+                    current_period_end=period_end,
+                )
+                items.append(
+                    EvidenceItem(
+                        evidence_type="qbo_pnl_expense_monthly",
+                        source="qbo",
+                        as_of_date=period_end,
+                        meta=expense_variance_meta,
+                    )
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Unable to parse month-over-month expense lines period_end=%s: %s",
+                    period_end,
+                    exc,
+                )
+
+        for tx_payload in tx_list_payloads:
+            account_id = str(tx_payload.get("account_id") or "").strip()
+            account_ref = str(tx_payload.get("account_ref") or "").strip()
+            report_payload = tx_payload.get("payload")
+            summary = transaction_list_unreconciled_sums_from_report(
+                {"payload": report_payload, "extra": {"account_id": account_id}},
+                period_end=period_end,
+                statement_end_date=tx_payload.get("statement_end_date") or period_end,
+            )
+            items.append(
+                EvidenceItem(
+                    evidence_type="qbo_transaction_list_unreconciled",
+                    source="qbo",
+                    as_of_date=period_end,
+                    meta={
+                        "account_id": account_id,
+                        "account_ref": account_ref,
+                        "account_name": tx_payload.get("account_name"),
+                        "sum_not_reconciled_as_of_period_end": str(
+                            summary["sum_not_reconciled_as_of_period_end"]
+                        ),
+                        "sum_not_reconciled_between_period_end_and_statement_end": str(
+                            summary["sum_not_reconciled_between_period_end_and_statement_end"]
+                        ),
+                        "statement_end_date_used": (
+                            tx_payload["statement_end_date"].isoformat()
+                            if isinstance(tx_payload.get("statement_end_date"), date)
+                            else None
+                        ),
+                        "clear_status_column_found": summary["clear_status_column_found"],
+                        "parsed_rows": summary["parsed_rows"],
+                        "ignored_rows": summary["ignored_rows"],
+                    },
+                )
+            )
+
+        fixed_asset_period_start = date(period_end.year, period_end.month, 1)
+        for tx_payload in fixed_asset_tx_payloads:
+            account_id = str(tx_payload.get("account_id") or "").strip()
+            account_ref = str(tx_payload.get("account_ref") or "").strip()
+            report_payload = tx_payload.get("payload")
+            summary = fixed_asset_ledger_transactions_from_report(
+                {"payload": report_payload, "extra": {"account_id": account_id}},
+                period_start=fixed_asset_period_start,
+                period_end=period_end,
+            )
+            items.append(
+                EvidenceItem(
+                    evidence_type="qbo_fixed_asset_ledger_transactions",
+                    source="qbo",
+                    as_of_date=period_end,
+                    meta={
+                        "account_id": account_id,
+                        "account_ref": account_ref,
+                        "account_name": tx_payload.get("account_name"),
+                        "transactions": summary.get("transactions") or [],
+                        "parsed_rows": summary.get("parsed_rows"),
+                        "ignored_rows": summary.get("ignored_rows"),
+                    },
+                )
+            )
+
+        if manifest_payload is not None:
+            items += drive_items
+
+        # Reconstruct a minimal ClientConfig-like object for intercompany
+        @dataclass(frozen=True)
+        class _MinimalClient:
+            client_id: str
+            counterparties: tuple
+
+        @dataclass(frozen=True)
+        class _MinimalCP:
+            name: str | None
+            realm_id: str
+
+        minimal_cps = tuple(
+            _MinimalCP(name=name, realm_id="")
+            for name in counterparty_names
+        )
+        minimal_client = _MinimalClient(
+            client_id=str(raw.get("client_id") or ""),
+            counterparties=minimal_cps,
+        )
         intercompany_payload = _build_intercompany_payload(
             counterparty_payloads,
-            client,
+            minimal_client,  # type: ignore[arg-type]
             period_end,
         )
         if intercompany_payload is not None:
@@ -375,6 +814,11 @@ class LiveQBODataSource:
             reconciliations=tuple(),
         )
 
+    def build_review_inputs(self, *, client_id: str, period_end: date) -> ReviewInputs:
+        """Backward-compatible monolith: fetch raw data then normalize in one call."""
+        raw = self.fetch_raw_data(client_id=client_id, period_end=period_end)
+        return self.normalize_raw_data(raw=raw)
+
     def save_snapshot(
         self,
         *,
@@ -388,6 +832,39 @@ class LiveQBODataSource:
             period_end=period_end,
             name=name,
             payload=payload,
+        )
+
+    def _get_client_config(self, client_id: str) -> ClientConfig | None:
+        if self._client_store_mode == "file":
+            return self._clients.get(client_id)
+
+        record = get_qbo_client_record(
+            client_id,
+            user_principal_id=self._user_principal_id,
+        )
+        if record is None:
+            return None
+
+        realm_id = str(record.get("realm_id") or "").strip()
+        refresh_token = str(record.get("refresh_token") or "").strip()
+        if not realm_id or not refresh_token:
+            raise ValueError(f"Client record for '{client_id}' missing realm_id or refresh_token.")
+
+        counterparties = []
+        for cp in record.get("counterparties", []) or []:
+            if not isinstance(cp, dict):
+                continue
+            cp_name = str(cp.get("name") or "").strip()
+            cp_realm = str(cp.get("realm_id") or "").strip()
+            if not cp_realm:
+                continue
+            counterparties.append(CounterpartyConfig(name=cp_name, realm_id=cp_realm))
+
+        return ClientConfig(
+            client_id=str(client_id),
+            realm_id=realm_id,
+            counterparties=tuple(counterparties),
+            refresh_token=refresh_token,
         )
 
 
@@ -437,17 +914,26 @@ def _load_client_configs(path: Path) -> dict[str, ClientConfig]:
     return clients
 
 
-def _config_for_realm(realm_id: str) -> QBOConfig:
-    base = get_qbo_config()
-    return QBOConfig(
-        env=base.env,
-        base_url=base.base_url,
-        client_id=base.client_id,
-        client_secret=base.client_secret,
+def _config_for_realm(
+    realm_id: str,
+    *,
+    refresh_token: str | None = None,
+    client_record_id: str | None = None,
+    user_principal_id: str | None = None,
+) -> QBOConfig:
+    if refresh_token:
+        return build_qbo_config(
+            realm_id=realm_id,
+            access_token="",
+            refresh_token=refresh_token,
+            token_expires_at="",
+            client_record_id=client_record_id,
+            user_principal_id=user_principal_id,
+        )
+    return build_qbo_config(
         realm_id=realm_id,
-        access_token=base.access_token,
-        refresh_token=base.refresh_token,
-        token_expires_at=base.token_expires_at,
+        client_record_id=client_record_id,
+        user_principal_id=user_principal_id,
     )
 
 
@@ -501,6 +987,89 @@ def _matches_intercompany(name: str) -> bool:
 def _safe_slug(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip())
     return cleaned or "unknown"
+
+
+def _statement_end_dates_by_account(items: list[EvidenceItem]) -> tuple[dict[str, date], dict[str, date]]:
+    by_ref: dict[str, date] = {}
+    by_id: dict[str, date] = {}
+
+    def _remember(target: dict[str, date], key: str, value: date) -> None:
+        if not key:
+            return
+        current = target.get(key)
+        if current is None or value > current:
+            target[key] = value
+
+    for item in items:
+        if item.evidence_type != "statement_balance_attachment":
+            continue
+        statement_end = item.statement_end_date or item.as_of_date
+        if statement_end is None:
+            continue
+        meta = item.meta or {}
+        account_ref = str(meta.get("account_ref") or "").strip()
+        account_id = str(meta.get("account_id") or "").strip()
+        if account_ref:
+            _remember(by_ref, account_ref, statement_end)
+            canonical_id = account_ref.split("::")[-1]
+            if canonical_id and canonical_id != account_ref:
+                _remember(by_id, canonical_id, statement_end)
+        if account_id:
+            _remember(by_id, account_id, statement_end)
+
+    return by_ref, by_id
+
+
+def _load_drive_manifest_evidence(
+    *,
+    client_id: str,
+    period_end: date,
+    user_principal_id: str | None,
+) -> tuple[dict[str, Any] | None, list[EvidenceItem]]:
+    if not is_drive_evidence_enabled():
+        return None, []
+
+    try:
+        cfg = build_drive_config(
+            client_id=client_id,
+            user_principal_id=user_principal_id,
+        )
+    except Exception as exc:
+        LOGGER.info("Drive evidence disabled for client %s: %s", client_id, exc)
+        return None, []
+
+    file_id = str(cfg.evidence_manifest_file_id or "").strip()
+    if not file_id:
+        return None, []
+
+    try:
+        with traced_phase(
+            "balance_sheet.drive_evidence",
+            logger=LOGGER,
+            attributes={"client.id": client_id, "drive.file_id": file_id},
+        ):
+            raw = download_file_bytes(
+                cfg,
+                file_id=file_id,
+                export_mime_type="application/json",
+            )
+            manifest = json.loads(raw.decode("utf-8"))
+            bundle = evidence_bundle_from_manifest(manifest, source_default="google_drive")
+    except Exception as exc:
+        LOGGER.warning(
+            "Drive evidence manifest load failed client_id=%s period_end=%s file_id=%s error=%s",
+            client_id,
+            period_end.isoformat(),
+            file_id,
+            exc,
+        )
+        return None, []
+
+    if not isinstance(manifest, dict):
+        LOGGER.warning("Drive evidence manifest file is not a JSON object: %s", file_id)
+        return None, []
+
+    return manifest, list(bundle.items)
 
 
 def _format_endpoint(base_url: str, path: str, params: dict[str, Any] | None = None) -> str:

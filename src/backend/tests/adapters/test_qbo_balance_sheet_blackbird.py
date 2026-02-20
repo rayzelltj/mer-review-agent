@@ -24,7 +24,7 @@ def test_balance_sheet_blackbird_includes_total_lines_when_enabled():
 
     ap_total = next(a for a in snapshot.accounts if a.account_ref == "report::Total Accounts Payable (A/P)")
     ar_total = next(a for a in snapshot.accounts if a.account_ref == "report::Total Accounts Receivable (A/R)")
-    assert str(ap_total.balance) == "-209.01"
+    assert str(ap_total.balance) == "52156.14"
     assert str(ar_total.balance) == "0.00"
 
 

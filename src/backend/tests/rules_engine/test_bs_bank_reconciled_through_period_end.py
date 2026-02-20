@@ -1,357 +1,329 @@
 from datetime import date
+from decimal import Decimal
 
-from common.rules_engine.models import EvidenceBundle, EvidenceItem
-from common.rules_engine.models import RuleStatus, Severity
+from common.rules_engine.models import EvidenceBundle, EvidenceItem, RuleStatus, Severity
 from common.rules_engine.rules.bs_bank_reconciled_through_period_end import (
     BS_BANK_RECONCILED_THROUGH_PERIOD_END,
 )
 
 
-def test_bank_reconciled_pass_when_ties_out_and_through_period_end(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1"]}}
-    bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
+RULE_ID = "BS-BANK-CC-RECONCILED-THROUGH-PERIOD-END"
+
+
+def _coa_item(accounts: list[dict]) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_type="qbo_chart_of_accounts_bank_cc_active",
+        source="fixture",
+        as_of_date=date(2025, 12, 31),
+        meta={"accounts": accounts},
     )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end="5000",
-            book_balance_as_of_period_end="5000",
-        ),
+
+
+def _trial_item(balances_by_account_ref: dict[str, str]) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_type="qbo_trial_balance_register_balance",
+        source="fixture",
+        as_of_date=date(2025, 12, 31),
+        meta={"balances_by_account_ref": balances_by_account_ref},
+    )
+
+
+def _tx_item(account_ref: str, s1: str, s2: str, clear_col: bool = True) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_type="qbo_transaction_list_unreconciled",
+        source="fixture",
+        as_of_date=date(2025, 12, 31),
+        meta={
+            "account_ref": account_ref,
+            "account_id": account_ref,
+            "sum_not_reconciled_as_of_period_end": s1,
+            "sum_not_reconciled_between_period_end_and_statement_end": s2,
+            "clear_status_column_found": clear_col,
+            "parsed_rows": 12,
+            "ignored_rows": 0,
+        },
+    )
+
+
+def _statement_item(account_ref: str, amount: str) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_type="statement_balance_attachment",
+        source="fixture",
+        statement_end_date=date(2025, 12, 31),
+        amount=amount,
+        meta={"account_ref": account_ref},
+    )
+
+
+def test_bank_cc_reconciled_pass_when_expected_equals_s1(make_balance_sheet, make_ctx):
+    bs = make_balance_sheet(
+        accounts=[
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
+        ]
     )
     evidence = EvidenceBundle(
         items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="5000",
-                meta={"account_ref": "B1"},
-            )
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    }
+                ]
+            ),
+            _trial_item({"67": "13261.63"}),
+            _statement_item("67", "13000.00"),
+            _tx_item("67", "261.63", "0"),
         ]
     )
     res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
     )
     assert res.status == RuleStatus.PASS
     assert res.severity == Severity.INFO
+    assert res.details[0].values["account_active"] is True
+    assert res.details[0].values["account_type"] == "Bank"
 
 
-def test_bank_reconciled_fail_when_statement_before_period_end(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx, period_end
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1"]}}
-    bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_end_date=date(2025, 11, 30),
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end="5000",
-            book_balance_as_of_period_end="5000",
-        ),
-    )
-    evidence = EvidenceBundle(
-        items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 11, 30),
-                amount="5000",
-                meta={"account_ref": "B1"},
-            )
-        ]
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.FAIL
-    assert period_end.isoformat() in res.details[0].values.get("period_end", "")
-
-
-def test_bank_reconciled_needs_review_when_missing_book_balance(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1"]}}
-    bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end=None,
-            book_balance_as_of_period_end="5000",
-        ),
-    )
-    evidence = EvidenceBundle(
-        items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="5000",
-                meta={"account_ref": "B1"},
-            )
-        ]
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.NEEDS_REVIEW
-
-
-def test_bank_reconciled_needs_review_when_missing_snapshot_for_a_balance_sheet_account(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1", "CC1"]}}
+def test_bank_cc_reconciled_pass_when_expected_minus_s1_equals_s2(make_balance_sheet, make_ctx):
     bs = make_balance_sheet(
         accounts=[
-            {"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"},
-            {"account_ref": "CC1", "name": "Corporate Card", "type": "Credit Card", "balance": "0"},
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
         ]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end="5000",
-            book_balance_as_of_period_end="5000",
-        ),
     )
     evidence = EvidenceBundle(
         items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="5000",
-                meta={"account_ref": "B1"},
-            )
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    }
+                ]
+            ),
+            _trial_item({"67": "13261.63"}),
+            _statement_item("67", "13000.00"),
+            _tx_item("67", "200.00", "61.63"),
         ]
     )
     res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.NEEDS_REVIEW
-
-
-def test_bank_reconciled_needs_review_when_cannot_infer_accounts_without_types(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1"]}}
-    bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "", "balance": "5000"}]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end="5000",
-            book_balance_as_of_period_end="5000",
-        ),
-    )
-    evidence = EvidenceBundle(
-        items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="5000",
-                meta={"account_ref": "B1"},
-            )
-        ]
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.NEEDS_REVIEW
-
-
-def test_bank_reconciled_expected_accounts_are_enforced(make_balance_sheet, make_ctx):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B2"]}}
-    bs = make_balance_sheet(accounts=[])
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.FAIL
-
-
-def test_bank_reconciled_infers_scope_by_type_when_no_explicit_list(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {}}
-    bs = make_balance_sheet(accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "100"}])
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="100",
-            book_balance_as_of_statement_end="100",
-            book_balance_as_of_period_end="100",
-        ),
-    )
-    evidence = EvidenceBundle(
-        items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="100",
-                meta={"account_ref": "B1"},
-            )
-        ]
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
     )
     assert res.status == RuleStatus.PASS
+    assert res.details[0].values["pass_if_expected_minus_s1_equals_s2"] is True
 
 
-def test_bank_reconciled_needs_review_when_inference_types_missing(make_balance_sheet, make_ctx):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {}}
+def test_bank_cc_reconciled_warn_when_equation_mismatch(make_balance_sheet, make_ctx):
     bs = make_balance_sheet(
         accounts=[
-            {"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "0"},
-            {"account_ref": "A1", "name": "Some Other Account", "type": "", "balance": "0"},
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
         ]
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.NEEDS_REVIEW
-
-
-def test_bank_reconciled_exclude_overrides_inferred_scope(make_balance_sheet, make_ctx):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"exclude_accounts": ["B1"]}}
-    bs = make_balance_sheet(accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "0"}])
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(make_ctx(balance_sheet=bs, client_rules=rule_cfg))
-    assert res.status == RuleStatus.NOT_APPLICABLE
-
-
-def test_bank_reconciled_period_end_tie_out_is_required(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {
-        "BS-BANK-RECONCILED-THROUGH-PERIOD-END": {
-            "expected_accounts": ["B1"],
-        }
-    }
-    bs = make_balance_sheet(accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "100"}])
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="100",
-            book_balance_as_of_statement_end="100",
-            book_balance_as_of_period_end="90",
-        ),
     )
     evidence = EvidenceBundle(
         items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="100",
-                meta={"account_ref": "B1"},
-            )
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    }
+                ]
+            ),
+            _trial_item({"67": "13261.63"}),
+            _statement_item("67", "13000.00"),
+            _tx_item("67", "100.00", "50.00"),
         ]
     )
     res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
     )
-    assert res.status == RuleStatus.FAIL
+    assert res.status == RuleStatus.WARN
+    assert res.severity == Severity.LOW
 
 
-def test_bank_reconciled_needs_review_when_attachment_missing(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {"BS-BANK-RECONCILED-THROUGH-PERIOD-END": {"expected_accounts": ["B1"]}}
+def test_bank_cc_reconciled_needs_review_when_missing_transaction_data(make_balance_sheet, make_ctx):
     bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end="5000",
-            book_balance_as_of_period_end="5000",
-        ),
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=EvidenceBundle(items=[]), client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.NEEDS_REVIEW
-
-
-def test_bank_reconciled_fail_when_statement_tie_has_any_difference(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {
-        "BS-BANK-RECONCILED-THROUGH-PERIOD-END": {
-            "expected_accounts": ["B1"],
-        }
-    }
-    bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance="5000",
-            book_balance_as_of_statement_end="5008",
-            book_balance_as_of_period_end="5000",
-        ),
+        accounts=[
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
+        ]
     )
     evidence = EvidenceBundle(
         items=[
-            EvidenceItem(
-                evidence_type="statement_balance_attachment",
-                source="fixture",
-                statement_end_date=date(2025, 12, 31),
-                amount="5000",
-                meta={"account_ref": "B1"},
-            )
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    }
+                ]
+            ),
+            _trial_item({"67": "13261.63"}),
+            _statement_item("67", "13000.00"),
         ]
     )
     res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, evidence=evidence, client_rules=rule_cfg)
-    )
-    assert res.status == RuleStatus.FAIL
-    assert res.severity == Severity.HIGH
-    assert "Checking" in res.summary
-
-
-def test_bank_reconciled_needs_review_when_missing_statement_balance(
-    make_balance_sheet, make_reconciliation_snapshot, make_ctx
-):
-    rule_cfg = {
-        "BS-BANK-RECONCILED-THROUGH-PERIOD-END": {
-            "expected_accounts": ["B1"],
-        }
-    }
-    bs = make_balance_sheet(
-        accounts=[{"account_ref": "B1", "name": "Checking", "type": "Bank", "balance": "5000"}]
-    )
-    recs = (
-        make_reconciliation_snapshot(
-            account_ref="B1",
-            account_name="Checking",
-            statement_ending_balance=None,
-            book_balance_as_of_statement_end="5000",
-            book_balance_as_of_period_end="5000",
-        ),
-    )
-    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
-        make_ctx(balance_sheet=bs, reconciliations=recs, client_rules=rule_cfg)
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
     )
     assert res.status == RuleStatus.NEEDS_REVIEW
+    assert "transaction_list_s1_s2" in res.details[0].values["missing_fields"]
+
+
+def test_bank_cc_reconciled_uses_active_bank_and_credit_card_scope_only(make_balance_sheet, make_ctx):
+    bs = make_balance_sheet(
+        accounts=[
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
+            {"account_ref": "132", "name": "RBC - VISA 1752/1760", "type": "Credit Card", "balance": "-54715.04"},
+            {"account_ref": "999", "name": "Inactive Card", "type": "Credit Card", "balance": "0"},
+        ]
+    )
+    evidence = EvidenceBundle(
+        items=[
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    },
+                    {
+                        "account_ref": "132",
+                        "account_id": "132",
+                        "account_name": "RBC - VISA 1752/1760",
+                        "account_type": "Credit Card",
+                        "active": True,
+                    },
+                    {
+                        "account_ref": "999",
+                        "account_id": "999",
+                        "account_name": "Inactive Card",
+                        "account_type": "Credit Card",
+                        "active": False,
+                    },
+                ]
+            ),
+            _trial_item({"67": "13261.63", "132": "-54715.04"}),
+            _statement_item("67", "13000.00"),
+            _statement_item("132", "54715.04"),
+            _tx_item("67", "261.63", "0"),
+            _tx_item("132", "0.00", "0"),
+        ]
+    )
+    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
+    )
+    assert res.status == RuleStatus.PASS
+    evaluated = {d.key for d in res.details}
+    assert evaluated == {"67", "132"}
+
+
+def test_bank_cc_reconciled_needs_review_when_no_coa_and_fallback_disabled(make_balance_sheet, make_ctx):
+    bs = make_balance_sheet(
+        accounts=[
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "", "balance": "13261.63"},
+        ]
+    )
+    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
+        make_ctx(
+            balance_sheet=bs,
+            evidence=EvidenceBundle(items=[]),
+            client_rules={RULE_ID: {"allow_fallback_name_heuristics_when_coa_missing": False}},
+        )
+    )
+    assert res.status == RuleStatus.NEEDS_REVIEW
+
+
+def test_bank_cc_reconciled_warn_when_register_does_not_match_bs_line(make_balance_sheet, make_ctx):
+    """
+    Rule 2 sub-check: when the trial-balance register balance differs from the
+    balance-sheet line by more than $0.02, the overall result is WARN even if the
+    reconciliation equation itself passes.
+    """
+    # BS shows 13261.63, TB register shows 13000.00 → mismatch > 0.02
+    bs = make_balance_sheet(
+        accounts=[
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
+        ]
+    )
+    evidence = EvidenceBundle(
+        items=[
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    }
+                ]
+            ),
+            # TB register = 13000.00 (different from BS 13261.63)
+            _trial_item({"67": "13000.00"}),
+            # Statement = 12738.37 → expected_outstanding = 13000.00 - 12738.37 = 261.63
+            _statement_item("67", "12738.37"),
+            # S1 = 261.63 → equation PASS
+            _tx_item("67", "261.63", "0"),
+        ]
+    )
+    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
+    )
+    # Equation passes but Rule 2 sub-check fires → overall WARN
+    assert res.status == RuleStatus.WARN
+    detail_vals = res.details[0].values
+    assert detail_vals["register_matches_bs_line"] is False
+    assert detail_vals["sub_check_register_vs_bs"] == "WARN"
+    assert detail_vals["equation_result"] == "PASS_BUT_REGISTER_VS_BS_MISMATCH"
+
+
+def test_bank_cc_reconciled_pass_includes_bs_line_match_when_register_equals_bs(make_balance_sheet, make_ctx):
+    """
+    Rule 2 sub-check: when register == BS line (within $0.02) the sub-check passes
+    and does not degrade the overall status.
+    """
+    bs = make_balance_sheet(
+        accounts=[
+            {"account_ref": "67", "name": "Paypal CAD Account", "type": "Bank", "balance": "13261.63"},
+        ]
+    )
+    evidence = EvidenceBundle(
+        items=[
+            _coa_item(
+                [
+                    {
+                        "account_ref": "67",
+                        "account_id": "67",
+                        "account_name": "Paypal CAD Account",
+                        "account_type": "Bank",
+                        "active": True,
+                    }
+                ]
+            ),
+            _trial_item({"67": "13261.63"}),
+            _statement_item("67", "13000.00"),
+            _tx_item("67", "261.63", "0"),
+        ]
+    )
+    res = BS_BANK_RECONCILED_THROUGH_PERIOD_END().evaluate(
+        make_ctx(balance_sheet=bs, evidence=evidence, client_rules={RULE_ID: {}})
+    )
+    assert res.status == RuleStatus.PASS
+    detail_vals = res.details[0].values
+    assert detail_vals["register_matches_bs_line"] is True
+    assert detail_vals["sub_check_register_vs_bs"] == "PASS"
+    assert detail_vals["bs_line_balance"] == "13261.63"
+    assert detail_vals["bs_vs_register_diff"] == "0.00"

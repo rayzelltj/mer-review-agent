@@ -1,0 +1,234 @@
+# deploy-release.yml
+# Wraps infra/scripts/deploy_prod.sh with four callable jobs:
+#
+#   stage     → build + test + deploy to staging slot/revision
+#   promote   → swap staging → production  (manual, requires confirm=true)
+#   rollback  → roll production back to previous revision  (manual, requires confirm=true)
+#   health    → run health checks only (no build)
+#
+# Required GitHub secrets:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET, AZURE_SUBSCRIPTION_ID
+#   ACR_NAME, ACR_LOGIN_SERVER
+#   CONTAINER_APP_NAME, FRONTEND_APP_NAME, RG
+#
+# Optional overrides (GitHub variables or per-run inputs):
+#   BACKEND_TAG, STAGING_LABEL (default: staging), REVISION_READY_WAIT (default: 60)
+
+name: Deploy Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Which operation to run"
+        required: true
+        type: choice
+        options:
+          - stage
+          - promote
+          - rollback
+          - health-check-only
+      confirm:
+        description: "Type 'yes' to confirm production-touching operations (promote / rollback)"
+        required: false
+        default: ""
+      backend_tag:
+        description: "Docker image tag override (leave blank for auto timestamp)"
+        required: false
+        default: ""
+      staging_label:
+        description: "Staging revision/slot label (default: staging)"
+        required: false
+        default: "staging"
+
+permissions:
+  contents: read
+
+env:
+  RG:                  ${{ secrets.RG }}
+  ACR_NAME:            ${{ secrets.ACR_NAME }}
+  ACR_LOGIN_SERVER:    ${{ secrets.ACR_LOGIN_SERVER }}
+  CONTAINER_APP_NAME:  ${{ secrets.CONTAINER_APP_NAME }}
+  FRONTEND_APP_NAME:   ${{ secrets.FRONTEND_APP_NAME }}
+  STAGING_LABEL:       ${{ inputs.staging_label || 'staging' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Guard job — prevents accidental production deploys
+  # ---------------------------------------------------------------------------
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirm for production-touching jobs
+        if: >
+          (inputs.job == 'promote' || inputs.job == 'rollback') &&
+          inputs.confirm != 'yes'
+        run: |
+          echo "❌ The '${JOB}' operation requires confirm='yes'. Re-run with confirm set." >&2
+          exit 1
+        env:
+          JOB: ${{ inputs.job }}
+
+  # ---------------------------------------------------------------------------
+  # Verify — runs tests + frontend build (shared pre-condition)
+  # Only runs for 'stage' (promote/rollback skip this — artefact already built)
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: guard
+    if: inputs.job == 'stage'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        run: pip install -r src/backend/requirements.txt
+
+      - name: Run backend tests
+        run: |
+          pytest --tb=short -q \
+            --ignore=tests/e2e-test/tests \
+            --ignore=src/backend/tests/test_app.py \
+            --ignore=src/tests/agents/test_foundry_integration.py \
+            --ignore=src/tests/mcp_server/test_factory.py \
+            --ignore=src/tests/mcp_server/test_hr_service.py \
+            --ignore=src/backend/tests/test_config.py \
+            --ignore=src/tests/agents/test_human_approval_manager.py \
+            --ignore=src/backend/tests/test_team_specific_methods.py \
+            --ignore=src/backend/tests/models/test_messages.py \
+            --ignore=src/backend/tests/test_otlp_tracing.py \
+            --ignore=src/backend/tests/auth/test_auth_utils.py
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: src/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: src/frontend
+        run: npm ci
+
+      - name: Run frontend unit tests
+        working-directory: src/frontend
+        run: npx vitest run
+
+      - name: Frontend build
+        working-directory: src/frontend
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Stage — build images + deploy to staging slot/revision at 0% traffic
+  # ---------------------------------------------------------------------------
+  stage:
+    needs: [guard, verify]
+    if: inputs.job == 'stage'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          client-secret:   ${{ secrets.AZURE_CLIENT_SECRET }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to staging
+        env:
+          BACKEND_TAG: ${{ inputs.backend_tag || format('stage-{0}', github.run_number) }}
+        run: |
+          chmod +x infra/scripts/deploy_prod.sh
+          # --staging flag + no --confirm required (staging never touches prod traffic)
+          infra/scripts/deploy_prod.sh --staging
+
+      - name: Summarise staging URLs
+        run: |
+          BACKEND_FQDN="$(az containerapp show -g "${RG}" -n "${CONTAINER_APP_NAME}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)"
+          echo "## Staging deploy complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Resource | URL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-----|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Backend (staging revision) | https://${BACKEND_FQDN} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Frontend (staging slot) | https://${FRONTEND_APP_NAME}-${STAGING_LABEL}.azurewebsites.net |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "To promote: re-run this workflow with **job=promote** and **confirm=yes**" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Promote — swap staging → production (manual, guarded)
+  # ---------------------------------------------------------------------------
+  promote:
+    needs: guard
+    if: inputs.job == 'promote'
+    runs-on: ubuntu-latest
+    environment:
+      name: production           # optional: configure required reviewers in GitHub Environments
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          client-secret:   ${{ secrets.AZURE_CLIENT_SECRET }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Promote staging → production
+        run: |
+          chmod +x infra/scripts/deploy_prod.sh
+          infra/scripts/deploy_prod.sh --promote --confirm
+
+  # ---------------------------------------------------------------------------
+  # Rollback — restore previous revision/slot (manual, guarded)
+  # ---------------------------------------------------------------------------
+  rollback:
+    needs: guard
+    if: inputs.job == 'rollback'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          client-secret:   ${{ secrets.AZURE_CLIENT_SECRET }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Roll back production
+        run: |
+          chmod +x infra/scripts/deploy_prod.sh
+          infra/scripts/deploy_prod.sh --rollback --confirm
+
+  # ---------------------------------------------------------------------------
+  # Health-check-only
+  # ---------------------------------------------------------------------------
+  health-check:
+    needs: guard
+    if: inputs.job == 'health-check-only'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          client-secret:   ${{ secrets.AZURE_CLIENT_SECRET }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run health checks
+        run: |
+          chmod +x infra/scripts/deploy_prod.sh
+          infra/scripts/deploy_prod.sh --health-check-only

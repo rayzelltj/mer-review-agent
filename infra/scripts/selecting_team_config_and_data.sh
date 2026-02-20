@@ -409,6 +409,7 @@ echo "3. HR Employee Onboarding"
 echo "4. Marketing Press Release"
 echo "5. Contract Compliance Review"
 echo "6. All"
+echo "7. Balance Sheet Review"
 echo "==============================================="
 echo ""
 
@@ -447,9 +448,14 @@ while [[ "$useCaseValid" != true ]]; do
         useCaseValid=true
         echo "Selected: Contract Compliance Review"
         echo "Note: If you choose to install a single use case, installation of other use cases will require re-running this script."
+    elif [[ "$useCaseSelection" == "7" ]]; then
+        selectedUseCase="Balance Sheet Review"
+        useCaseValid=true
+        echo "Selected: Balance Sheet Review"
+        echo "Note: If you choose to install a single use case, installation of other use cases will require re-running this script."
     else
         useCaseValid=false
-        echo -e "\033[31mInvalid selection. Please enter a number from 1-6.\033[0m"
+        echo -e "\033[31mInvalid selection. Please enter a number from 1-7.\033[0m"
     fi
 done
 
@@ -547,6 +553,21 @@ if [[ "$useCaseSelection" == "4" || "$useCaseSelection" == "all" || "$useCaseSel
         echo "Successfully uploaded team configuration for Marketing Press Release."
     else
         echo "Error: Team configuration for Marketing Press Release upload failed."
+        isTeamConfigFailed=true
+        ((failedTeamConfigs++))
+    fi
+fi
+
+# Use Case 7 - Balance Sheet Review
+if [[ "$useCaseSelection" == "7" || "$useCaseSelection" == "all" || "$useCaseSelection" == "6" ]]; then
+    echo "Uploading Team Configuration for Balance Sheet Review..."
+    directoryPath="data/agent_teams"
+    teamId="00000000-0000-0000-0000-000000000006"
+
+    if $pythonCmd infra/scripts/upload_team_config.py "$backendUrl" "$directoryPath" "$userPrincipalId" "$teamId"; then
+        echo "Successfully uploaded team configuration for Balance Sheet Review."
+    else
+        echo "Error: Team configuration for Balance Sheet Review upload failed."
         isTeamConfigFailed=true
         ((failedTeamConfigs++))
     fi

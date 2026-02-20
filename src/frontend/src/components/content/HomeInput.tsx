@@ -15,6 +15,8 @@ import "./../../styles/HomeInput.css";
 import { HomeInputProps, iconMap, QuickTask } from "../../models/homeInput";
 import { TaskService } from "../../services/TaskService";
 import { NewTaskService } from "../../services/NewTaskService";
+import { apiService } from "@/api";
+import { APIClientError } from "@/api/apiClient";
 
 import ChatInput from "@/coral/modules/ChatInput";
 import InlineToaster, { useInlineToaster } from "../toast/InlineToaster";
@@ -60,6 +62,8 @@ interface ExtendedQuickTask extends QuickTask {
 const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [input, setInput] = useState<string>("");
+  const [activeRunPlanId, setActiveRunPlanId] = useState<string | null>(null);
+  const [activeRunMessage, setActiveRunMessage] = useState<string>("");
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
@@ -90,12 +94,79 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
     return cleanup;
   }, []);
 
+  useEffect(() => {
+    const loadRunStatus = async () => {
+      try {
+        const status = await apiService.getRunStatus();
+        if (status?.active && status.plan_id) {
+          setActiveRunPlanId(status.plan_id);
+          setActiveRunMessage(
+            `Run in progress (run_id: ${status.run_id || "unknown"}). Open the active stream.`
+          );
+          return;
+        }
+        setActiveRunPlanId(null);
+        setActiveRunMessage("");
+      } catch {
+        // Keep current state on transient status check errors.
+      }
+    };
+    loadRunStatus();
+  }, [selectedTeam?.team_id]);
+
+  const handleOpenActiveStream = async () => {
+    if (!activeRunPlanId) {
+      return;
+    }
+    try {
+      await apiService.getPlanStatus(activeRunPlanId);
+      navigate(`/plan/${activeRunPlanId}`);
+      return;
+    } catch {
+      try {
+        const status = await apiService.getRunStatus();
+        if (status?.active && status.plan_id) {
+          setActiveRunPlanId(status.plan_id);
+          setActiveRunMessage(
+            `Run in progress (run_id: ${status.run_id || "unknown"}). Open the active stream.`
+          );
+          navigate(`/plan/${status.plan_id}`);
+          return;
+        }
+      } catch {
+        // Fall through to reset local stale UI state.
+      }
+      setActiveRunPlanId(null);
+      setActiveRunMessage("");
+      showToast(
+        "The previous active run was stale and has been cleared. You can submit a new prompt.",
+        "info"
+      );
+    }
+  };
+
   const handleSubmit = async () => {
+    if (activeRunPlanId) {
+      await handleOpenActiveStream();
+      return;
+    }
     if (input.trim()) {
       setSubmitting(true);
       let id = showToast("Creating a plan", "progress");
 
       try {
+        const status = await apiService.getRunStatus();
+        if (status?.active && status.plan_id) {
+          dismissToast(id);
+          setActiveRunPlanId(status.plan_id);
+          setActiveRunMessage(
+            `Run in progress (run_id: ${status.run_id || "unknown"}). Open the active stream.`
+          );
+          showToast("Run already in progress. Opening active stream.", "progress");
+          navigate(`/plan/${status.plan_id}`);
+          return;
+        }
+
         const response = await TaskService.createPlan(
           input.trim(),
           selectedTeam?.team_id
@@ -119,15 +190,25 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
       } catch (error: any) {
         console.log("Error creating plan:", error);
         let errorMessage = "Unable to create plan. Please try again.";
-        dismissToast(id);
-        // Check if this is an RAI validation error
-        try {
-          // errorDetail = JSON.parse(error);
-          errorMessage = error?.message || errorMessage;
-        } catch (parseError) {
-          console.error("Error parsing error detail:", parseError);
+        if (error instanceof APIClientError && error.status === 409) {
+          const detail = error.data?.detail || error.data || {};
+          const planId = detail?.plan_id || null;
+          const runId = detail?.run_id || "unknown";
+          if (planId) {
+            setActiveRunPlanId(planId);
+            setActiveRunMessage(
+              `Run in progress (run_id: ${runId}). Open the active stream.`
+            );
+            dismissToast(id);
+            showToast("Run already in progress. Opening active stream.", "progress");
+            navigate(`/plan/${planId}`);
+            return;
+          }
+          errorMessage = detail?.message || "Run already in progress.";
+        } else if (error?.message) {
+          errorMessage = String(error.message);
         }
-
+        dismissToast(id);
         showToast(errorMessage, "error");
       } finally {
         setInput("");
@@ -225,16 +306,37 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
             placeholder="Tell us what needs planning, building, or connecting—we'll handle the rest."
             onChange={setInput}
             onEnter={handleSubmit}
-            disabledChat={submitting}
+            disabledChat={submitting || !!activeRunPlanId}
           >
             <Button
               appearance="subtle"
               className="home-input-send-button"
               onClick={handleSubmit}
-              disabled={submitting}
+              disabled={submitting || !!activeRunPlanId}
               icon={<Send />}
             />
           </ChatInput>
+
+          {activeRunPlanId && (
+            <div
+              style={{
+                marginTop: "10px",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: "12px",
+              }}
+            >
+              <Caption1>{activeRunMessage || "Run in progress."}</Caption1>
+              <Button
+                appearance="secondary"
+                size="small"
+                onClick={handleOpenActiveStream}
+              >
+                Open Active Stream
+              </Button>
+            </div>
+          )}
 
           <InlineToaster />
 
@@ -254,7 +356,7 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
                         icon={task.icon}
                         description={task.description}
                         onClick={() => handleQuickTaskClick(task)}
-                        disabled={submitting}
+                        disabled={submitting || !!activeRunPlanId}
                       />
                     ))}
                   </div>

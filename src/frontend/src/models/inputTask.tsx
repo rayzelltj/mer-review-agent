@@ -20,6 +20,8 @@ export interface InputTaskResponse {
     session_id: string;
     /** Plan identifier */
     plan_id: string;
+    /** Active run identifier */
+    run_id?: string;
     /** The original task description */
-    description: string;
+    description?: string;
 }

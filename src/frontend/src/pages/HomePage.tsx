@@ -14,6 +14,8 @@ import ContentToolbar from '@/coral/components/Content/ContentToolbar';
 import { TeamConfig } from '../models/Team';
 import { TeamService } from '../services/TeamService';
 import InlineToaster, { useInlineToaster } from "../components/toast/InlineToaster";
+import QboConnectButton from "@/components/content/QboConnectButton";
+import QboStatusBanner from "@/components/content/QboStatusBanner";
 
 /**
  * HomePage component - displays task lists and provides navigation
@@ -33,10 +35,24 @@ const HomePage: React.FC = () => {
                 console.log('Initializing team from backend...');
                 // Call the backend init_team endpoint (takes ~20 seconds)
                 const initResponse = await TeamService.initializeTeam();
+                if (!initResponse.success) {
+                    throw new Error(initResponse.error || 'Failed to initialize team');
+                }
 
                 // Handle successful team initialization
                 if (initResponse.data?.status === 'Request started successfully' && initResponse.data?.team_id) {
                     console.log('Team initialization completed:', initResponse.data?.team_id);
+
+                    const initializedTeamFromInit = initResponse.data?.team as TeamConfig | undefined;
+                    if (initializedTeamFromInit && initializedTeamFromInit.team_id) {
+                        setSelectedTeam(initializedTeamFromInit);
+                        TeamService.storageTeam(initializedTeamFromInit);
+                        showToast(
+                            `${initializedTeamFromInit.name} team initialized successfully with ${initializedTeamFromInit.agents?.length || 0} agents`,
+                            "success"
+                        );
+                        return;
+                    }
 
                     // Now fetch the actual team details using the team_id
                     const teams = await TeamService.getUserTeams();
@@ -79,7 +95,8 @@ const HomePage: React.FC = () => {
 
             } catch (error) {
                 console.error('Error initializing team from backend:', error);
-                showToast("Team initialization failed. You can still upload a custom team configuration.", "info");
+                const message = error instanceof Error ? error.message : 'Team initialization failed.';
+                showToast(`${message} You can still upload a custom team configuration.`, "info");
 
                 // Don't block the user - allow them to upload custom teams
                 setSelectedTeam(null);
@@ -111,9 +128,24 @@ const HomePage: React.FC = () => {
             try {
                 setIsLoadingTeam(true);
                 const initResponse = await TeamService.initializeTeam(true);
+                if (!initResponse.success) {
+                    throw new Error(initResponse.error || 'Failed to initialize team');
+                }
 
                 if (initResponse.data?.status === 'Request started successfully' && initResponse.data?.team_id) {
                     console.log('handleTeamSelect:', initResponse.data?.team_id);
+
+                    const initializedTeamFromInit = initResponse.data?.team as TeamConfig | undefined;
+                    if (initializedTeamFromInit && initializedTeamFromInit.team_id) {
+                        setSelectedTeam(initializedTeamFromInit);
+                        TeamService.storageTeam(initializedTeamFromInit);
+                        setReloadLeftList(true);
+                        showToast(
+                            `${initializedTeamFromInit.name} team initialized successfully with ${initializedTeamFromInit.agents?.length || 0} agents`,
+                            "success"
+                        );
+                        return;
+                    }
 
                     // Now fetch the actual team details using the team_id
                     const teams = await TeamService.getUserTeams();
@@ -143,7 +175,8 @@ const HomePage: React.FC = () => {
                 }
             } catch (error) {
                 console.error('Error setting current team:', error);
-                showToast("Error switching team. Please try again.", "warning");
+                const message = error instanceof Error ? error.message : 'Error switching team.';
+                showToast(`${message} Please try again.`, "warning");
             } finally {
                 setIsLoadingTeam(false);
             }
@@ -205,7 +238,10 @@ const HomePage: React.FC = () => {
                     <Content>
                         <ContentToolbar
                             panelTitle={"Multi-Agent Planner"}
-                        ></ContentToolbar>
+                        >
+                            <QboConnectButton />
+                        </ContentToolbar>
+                        <QboStatusBanner />
                         {!isLoadingTeam ? (
                             <HomeInput
                                 selectedTeam={selectedTeam}

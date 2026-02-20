@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for React frontend with Python backend support using UV
 
 # Stage 1: Node build environment for React
-FROM node:18-alpine AS frontend-builder
+FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
 
@@ -33,10 +33,10 @@ WORKDIR /app
 # Copy Python project definition files
 COPY pyproject.toml requirements.txt* uv.lock* ./
 
-# Install Python dependencies using UV
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -f "requirements.txt" ]; then \
-      uv pip install --system -r requirements.txt && uv pip install --system "uvicorn[standard]";  \
+# Install Python dependencies using UV.
+# BuildKit mounts are intentionally avoided so `az acr build` works reliably.
+RUN if [ -f "requirements.txt" ]; then \
+      uv pip install --system -r requirements.txt && uv pip install --system "uvicorn[standard]"; \
     else \
       uv pip install --system pyproject.toml && uv pip install --system "uvicorn[standard]"; \
     fi

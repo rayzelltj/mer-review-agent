@@ -171,13 +171,14 @@ const useStyles = makeStyles({
 
 // Function to get agent name from backend data using the centralized utility
 const getAgentDisplayNameFromPlan = (planApprovalRequest: MPlanData | null): string => {
-    if (planApprovalRequest?.steps?.length) {
-        const firstAgent = planApprovalRequest.steps.find(step => step.agent)?.agent;
-        if (firstAgent) {
-            return getAgentDisplayName(firstAgent);
-        }
+    const orchestratorStep = planApprovalRequest?.steps?.find(step => {
+        const agent = String(step.agent || "").toLowerCase();
+        return agent.includes("magentic") || agent.includes("orchestrator");
+    });
+    if (orchestratorStep?.agent) {
+        return getAgentDisplayName(orchestratorStep.agent);
     }
-    return getAgentDisplayName('Planning Agent');
+    return "Orchestrator Agent";
 };
 
 // Dynamically extract content from whatever fields contain data

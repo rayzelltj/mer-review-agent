@@ -8,7 +8,6 @@
     "@fluentui/react-components": "^9.64.0",
     "@fluentui/react-icons": "^2.0.300",
     "@testing-library/dom": "^10.4.0",
-    "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^13.5.0",
     "@types/jest": "^27.5.2",
@@ -56,6 +55,7 @@
     ]
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
     "@types/node": "^20.0.0",
     "@typescript-eslint/eslint-plugin": "^5.62.0",
     "@typescript-eslint/parser": "^5.62.0",

@@ -6,6 +6,11 @@ import { resolve } from 'path'
 export default defineConfig({
     plugins: [react()],
 
+    test: {
+        environment: 'jsdom',
+        globals: true,
+    },
+
     // Define path aliases (similar to Create React App)
     resolve: {
         alias: {

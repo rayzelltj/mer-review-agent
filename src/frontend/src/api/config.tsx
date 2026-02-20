@@ -113,18 +113,32 @@ export function getUserId(): string {
     return userId;
 }
 
+export function getAuthToken(): string | null {
+    const user = getUserInfoGlobal();
+    // Prefer id_token because its audience is the signed-in app client id,
+    // which is what the backend validates for EasyAuth/AAD bearer auth.
+    const idToken = String(user?.id_token || "").trim();
+    if (idToken) {
+        return idToken;
+    }
+    const accessToken = String(user?.access_token || "").trim();
+    if (accessToken) {
+        return accessToken;
+    }
+    return null;
+}
+
 /**
  * Build headers with authentication information
  * @param headers Optional additional headers to merge
  * @returns Combined headers object with authentication
  */
 export function headerBuilder(headers?: Record<string, string>): Record<string, string> {
-    let userId = getUserId();
-    //console.log('headerBuilder: Using user ID:', userId);
-    let defaultHeaders = {
-        "x-ms-client-principal-id": String(userId) || "",  // Custom header
-    };
-    //console.log('headerBuilder: Created headers:', defaultHeaders);
+    const token = getAuthToken();
+    const defaultHeaders: Record<string, string> = {};
+    if (token) {
+        defaultHeaders["Authorization"] = `Bearer ${token}`;
+    }
     return {
         ...defaultHeaders,
         ...(headers ? headers : {})
@@ -142,6 +156,7 @@ export default {
     getApiUrl,
     toBoolean,
     getUserId,
+    getAuthToken,
     getConfigData,
     setEnvData,
     config,

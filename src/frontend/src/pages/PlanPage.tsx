@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Spinner, Text } from "@fluentui/react-components";
 import { PlanDataService } from "../services/PlanDataService";
+import { TaskService } from "../services/TaskService";
 import { ProcessedPlanData, WebsocketMessageType, MPlanData, AgentMessageData, AgentMessageType, ParsedUserClarification, AgentType, PlanStatus, TeamConfig } from "../models";
 import PlanChat from "../components/content/PlanChat";
 import PlanPanelRight from "../components/content/PlanPanelRight";
@@ -20,6 +21,7 @@ import { APIService } from "../api/apiService";
 import { StreamMessage, StreamingPlanUpdate } from "../models";
 import { usePlanCancellationAlert } from "../hooks/usePlanCancellationAlert";
 import PlanCancellationDialog from "../components/common/PlanCancellationDialog";
+import QboConnectButton from "../components/content/QboConnectButton";
 import "../styles/PlanPage.css"
 
 // Create API service instance
@@ -34,6 +36,8 @@ const PlanPage: React.FC = () => {
     const navigate = useNavigate();
     const { showToast, dismissToast } = useInlineToaster();
     const messagesContainerRef = useRef<HTMLDivElement>(null);
+    /** Tracks stable message keys already added to agentMessages — prevents duplicates on WS reconnect / double-send. */
+    const seenMessageIds = useRef<Set<string>>(new Set());
     const [input, setInput] = useState<string>("");
     const [planData, setPlanData] = useState<ProcessedPlanData | any>(null);
     const [loading, setLoading] = useState<boolean>(true);
@@ -50,6 +54,7 @@ const PlanPage: React.FC = () => {
     const [selectedTeam, setSelectedTeam] = useState<TeamConfig | null>(null);
     // WebSocket connection state
     const [wsConnected, setWsConnected] = useState<boolean>(false);
+    const [pollingFallbackActive, setPollingFallbackActive] = useState<boolean>(false);
     const [streamingMessages, setStreamingMessages] = useState<StreamingPlanUpdate[]>([]);
     const [streamingMessageBuffer, setStreamingMessageBuffer] = useState<string>("");
     const [showBufferingText, setShowBufferingText] = useState<boolean>(false);
@@ -69,6 +74,49 @@ const PlanPage: React.FC = () => {
         return formattedLines.join('\n');
     }, []);
 
+    const extractClarificationFromMessages = useCallback((messages: AgentMessageData[]): ParsedUserClarification | null => {
+        if (!messages || messages.length === 0) {
+            return null;
+        }
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            const raw = messages[index]?.raw_data;
+            if (!raw) {
+                continue;
+            }
+
+            let candidate: any = raw;
+            if (typeof candidate === "string") {
+                const trimmed = candidate.trim();
+                if (!trimmed) {
+                    continue;
+                }
+                try {
+                    candidate = JSON.parse(trimmed);
+                } catch {
+                    candidate = trimmed;
+                }
+            }
+
+            const parsed = PlanDataService.parseUserClarificationRequest(candidate);
+            if (parsed) {
+                return parsed;
+            }
+
+            if (candidate && typeof candidate === "object") {
+                const requestId = String((candidate as any).request_id || "").trim();
+                const question = String((candidate as any).question || "").trim();
+                if (requestId && question) {
+                    return {
+                        type: WebsocketMessageType.USER_CLARIFICATION_REQUEST,
+                        request_id: requestId,
+                        question,
+                    };
+                }
+            }
+        }
+        return null;
+    }, []);
+
     // Plan cancellation dialog state
     const [showCancellationDialog, setShowCancellationDialog] = useState<boolean>(false);
     const [pendingNavigation, setPendingNavigation] = useState<(() => void) | null>(null);
@@ -79,7 +127,6 @@ const PlanPage: React.FC = () => {
     // Plan cancellation alert hook
     const { isPlanActive } = usePlanCancellationAlert({
         planData,
-        planApprovalRequest,
         onNavigate: pendingNavigation || (() => { })
     });
 
@@ -101,14 +148,7 @@ const PlanPage: React.FC = () => {
         setCancellingPlan(true);
 
         try {
-            if (planApprovalRequest?.id) {
-                await apiService.approvePlan({
-                    m_plan_id: planApprovalRequest.id,
-                    plan_id: planData?.plan?.id,
-                    approved: false,
-                    feedback: 'Plan cancelled by user navigation'
-                });
-            }
+            await apiService.cancelRun(planData?.plan?.id);
 
             // Execute the pending navigation
             if (pendingNavigation) {
@@ -127,7 +167,7 @@ const PlanPage: React.FC = () => {
             setShowCancellationDialog(false);
             setPendingNavigation(null);
         }
-    }, [planApprovalRequest, planData, pendingNavigation, showToast]);
+    }, [planData, pendingNavigation, showToast]);
 
     const handleCancelDialog = useCallback(() => {
         setShowCancellationDialog(false);
@@ -187,6 +227,7 @@ const PlanPage: React.FC = () => {
         setShowApprovalButtons(true);
         setContinueWithWebsocketFlow(false);
         setWsConnected(false);
+        setPollingFallbackActive(false);
         setStreamingMessages([]);
         setStreamingMessageBuffer("");
         setShowBufferingText(false);
@@ -206,6 +247,7 @@ const PlanPage: React.FC = () => {
         setShowApprovalButtons,
         setContinueWithWebsocketFlow,
         setWsConnected,
+        setPollingFallbackActive,
         setStreamingMessages,
         setStreamingMessageBuffer,
         setShowBufferingText,
@@ -348,18 +390,24 @@ const PlanPage: React.FC = () => {
 
 
             console.log('✅ Parsed final result message:', agentMessageData);
-            // we ignore the terminated message 
-            if (finalMessage?.data?.status === PlanStatus.COMPLETED) {
+            const finalStatus = finalMessage?.data?.status as PlanStatus | undefined;
+            if (
+                finalStatus === PlanStatus.COMPLETED ||
+                finalStatus === PlanStatus.FAILED ||
+                finalStatus === PlanStatus.CANCELED
+            ) {
 
                 setShowBufferingText(true);
                 setShowProcessingPlanSpinner(false);
+                setWaitingForPlan(false);
+                setSubmittingChatDisableInput(false);
                 setAgentMessages(prev => [...prev, agentMessageData]);
                 setSelectedTeam(planData?.team || null);
                 scrollToBottom();
                 // Persist the agent message
                 const is_final = true;
                 if (planData?.plan) {
-                    planData.plan.overall_status = PlanStatus.COMPLETED;
+                    planData.plan.overall_status = finalStatus || PlanStatus.COMPLETED;
                     setPlanData({ ...planData });
                 }
 
@@ -423,6 +471,7 @@ const PlanPage: React.FC = () => {
             setAgentMessages(prev => [...prev, errorAgentMessage]);
             setShowProcessingPlanSpinner(false);
             setShowBufferingText(false);
+            setWaitingForPlan(false);
             setSubmittingChatDisableInput(false);
             scrollToBottom();
             showToast(errorContent, "error");
@@ -439,6 +488,18 @@ const PlanPage: React.FC = () => {
             const agentMessageData = agentMessage.data as AgentMessageData;
             if (agentMessageData) {
                 agentMessageData.content = PlanDataService.simplifyHumanClarification(agentMessageData?.content);
+
+                // Dedup: build a stable key and silently drop messages we have already seen
+                // (covers WS reconnect storms, double-sends, and duplicate run_id emissions).
+                const msgKey = `${agentMessageData.agent}|${agentMessageData.timestamp}|${(agentMessageData.content || '').slice(0, 100)}`;
+                if (seenMessageIds.current.has(msgKey)) {
+                    console.debug('🔁 Duplicate agent message suppressed:', msgKey);
+                    return;
+                }
+                seenMessageIds.current.add(msgKey);
+                // Attach the key as message_id so the render layer can use it as a stable React key.
+                agentMessageData.message_id = msgKey;
+
                 setAgentMessages(prev => [...prev, agentMessageData]);
                 setShowProcessingPlanSpinner(true);
                 scrollToBottom();
@@ -482,6 +543,7 @@ const PlanPage: React.FC = () => {
 
             const handleConnectionChange = (connected: boolean) => {
                 setWsConnected(connected);
+                setPollingFallbackActive(!connected);
                 console.log('🔗 WebSocket connection status:', connected);
             };
 
@@ -505,23 +567,112 @@ const PlanPage: React.FC = () => {
             const unsubscribeConnection = webSocketService.on('connection_status', (message) => {
                 handleConnectionChange(message.data?.connected || false);
             });
+            const unsubscribeReconnecting = webSocketService.on('reconnecting', (message) => {
+                const reconnecting = Boolean(message.data?.active);
+                if (reconnecting) {
+                    setPollingFallbackActive(true);
+                }
+            });
 
             const unsubscribeStreaming = webSocketService.on(WebsocketMessageType.AGENT_MESSAGE, handleStreamingMessage);
             const unsubscribePlanApproval = webSocketService.on(WebsocketMessageType.PLAN_APPROVAL_RESPONSE, handlePlanApprovalResponse);
             const unsubscribePlanApprovalRequest = webSocketService.on(WebsocketMessageType.PLAN_APPROVAL_REQUEST, handlePlanApprovalRequest);
-            const unsubscribeParsedPlanApprovalRequest = webSocketService.on(WebsocketMessageType.PLAN_APPROVAL_REQUEST, handlePlanApprovalRequest);
 
             return () => {
                 console.log('🔌 Cleaning up WebSocket connections');
                 unsubscribeConnection();
+                unsubscribeReconnecting();
                 unsubscribeStreaming();
                 unsubscribePlanApproval();
                 unsubscribePlanApprovalRequest();
-                unsubscribeParsedPlanApprovalRequest();
                 webSocketService.disconnect();
             };
         }
-    }, [planId, loading, continueWithWebsocketFlow]);
+    }, [planId, continueWithWebsocketFlow]);
+
+    useEffect(() => {
+        if (!planId || !continueWithWebsocketFlow || wsConnected || loading) {
+            return;
+        }
+
+        setPollingFallbackActive(true);
+        let cancelled = false;
+        let pollCount = 0;
+
+        const pollPlanState = async () => {
+            if (cancelled) {
+                return;
+            }
+            try {
+                pollCount += 1;
+                const status = await apiService.getPlanStatus(planId);
+                if (cancelled || !status) {
+                    return;
+                }
+
+                const streamed = status.streaming_message || "";
+                if (streamed.trim() !== "") {
+                    setStreamingMessageBuffer(streamed);
+                    setShowBufferingText(true);
+                }
+
+                const planStatus = status.overall_status as PlanStatus;
+                const shouldRefreshFullPlan =
+                    pollCount % 3 === 0 ||
+                    planStatus === PlanStatus.COMPLETED ||
+                    planStatus === PlanStatus.FAILED;
+
+                if (shouldRefreshFullPlan) {
+                    const refreshed = await PlanDataService.fetchPlanData(planId, false);
+                    if (!refreshed || cancelled) {
+                        return;
+                    }
+                    setPlanData(refreshed);
+                    if (refreshed.messages) {
+                        setAgentMessages(refreshed.messages);
+                    }
+                    if (refreshed.mplan) {
+                        setPlanApprovalRequest(refreshed.mplan);
+                        setWaitingForPlan(false);
+                    }
+                    if (refreshed.streaming_message && refreshed.streaming_message.trim() !== "") {
+                        setStreamingMessageBuffer(refreshed.streaming_message);
+                        setShowBufferingText(true);
+                        setWaitingForPlan(false);
+                    }
+                    if (
+                        refreshed.plan?.overall_status === PlanStatus.COMPLETED ||
+                        refreshed.plan?.overall_status === PlanStatus.FAILED ||
+                        refreshed.plan?.overall_status === PlanStatus.CANCELED
+                    ) {
+                        setWaitingForPlan(false);
+                    }
+                }
+
+                if (
+                    planStatus === PlanStatus.COMPLETED ||
+                    planStatus === PlanStatus.FAILED ||
+                    planStatus === PlanStatus.CANCELED
+                ) {
+                    setContinueWithWebsocketFlow(false);
+                    setShowProcessingPlanSpinner(false);
+                    setWaitingForPlan(false);
+                    setSubmittingChatDisableInput(false);
+                    setPollingFallbackActive(false);
+                }
+            } catch (error) {
+                console.warn("Polling fallback failed:", error);
+            }
+        };
+
+        const interval = setInterval(pollPlanState, 5000);
+        pollPlanState();
+
+        return () => {
+            cancelled = true;
+            clearInterval(interval);
+        };
+    }, [planId, continueWithWebsocketFlow, wsConnected, loading]);
 
     // Create loadPlanData function with useCallback to memoize it
     const loadPlanData = useCallback(
@@ -542,18 +693,39 @@ const PlanPage: React.FC = () => {
                     setShowApprovalButtons(false);
                     setWaitingForPlan(false);
                 }
-                if (planResult?.plan?.overall_status !== PlanStatus.COMPLETED) {
+                if (
+                    planResult?.plan?.overall_status !== PlanStatus.COMPLETED &&
+                    planResult?.plan?.overall_status !== PlanStatus.FAILED
+                ) {
                     setContinueWithWebsocketFlow(true);
+                }
+                if (
+                    planResult?.plan?.overall_status === PlanStatus.COMPLETED ||
+                    planResult?.plan?.overall_status === PlanStatus.FAILED
+                ) {
+                    setSubmittingChatDisableInput(false);
                 }
                 if (planResult?.messages) {
                     setAgentMessages(planResult.messages);
                 }
+                const restoredClarification = extractClarificationFromMessages(planResult?.messages || []);
+                if (restoredClarification) {
+                    setClarificationMessage(restoredClarification);
+                    setWaitingForPlan(false);
+                    setShowProcessingPlanSpinner(false);
+                    setSubmittingChatDisableInput(false);
+                }
                 if (planResult?.mplan) {
                     setPlanApprovalRequest(planResult.mplan);
+                    setWaitingForPlan(false);
+                }
+                if (planResult?.messages && planResult.messages.length > 0) {
+                    setWaitingForPlan(false);
                 }
                 if (planResult?.streaming_message && planResult.streaming_message.trim() !== "") {
                     setStreamingMessageBuffer(planResult.streaming_message);
                     setShowBufferingText(true);
+                    setWaitingForPlan(false);
                 }
                 setPlanData(planResult);
                 return planResult;
@@ -566,8 +738,54 @@ const PlanPage: React.FC = () => {
                 setLoading(false);
             }
         },
-        [planId, navigate, resetPlanVariables]
+        [planId, navigate, resetPlanVariables, extractClarificationFromMessages]
     );
+
+    useEffect(() => {
+        const refreshAfterQboConnect = async (rawClientId: unknown) => {
+            const clientId = String(rawClientId || "").trim();
+            const suffix = clientId ? ` for ${clientId}` : "";
+            showToast(`QBO connected${suffix}. Refreshing this plan.`, "success");
+            try {
+                await loadPlanData(false);
+            } catch (error) {
+                console.warn("Failed to refresh plan after QBO connection:", error);
+            }
+        };
+
+        const handleWindowMessage = (event: MessageEvent) => {
+            if (event.origin !== window.location.origin) {
+                return;
+            }
+            const payload = event.data as { type?: string; client_id?: string } | null;
+            if (!payload || payload.type !== "qbo_connected") {
+                return;
+            }
+            void refreshAfterQboConnect(payload.client_id);
+        };
+
+        const handleStorage = (event: StorageEvent) => {
+            if (event.key !== "qbo_connect_event" || !event.newValue) {
+                return;
+            }
+            try {
+                const payload = JSON.parse(event.newValue) as { type?: string; client_id?: string };
+                if (payload.type !== "qbo_connected") {
+                    return;
+                }
+                void refreshAfterQboConnect(payload.client_id);
+            } catch {
+                // Ignore malformed localStorage events.
+            }
+        };
+
+        window.addEventListener("message", handleWindowMessage);
+        window.addEventListener("storage", handleStorage);
+        return () => {
+            window.removeEventListener("message", handleWindowMessage);
+            window.removeEventListener("storage", handleStorage);
+        };
+    }, [loadPlanData, showToast]);
 
 
     // Handle plan approval
@@ -636,11 +854,34 @@ const PlanPage: React.FC = () => {
             setInput("");
 
             if (!planData?.plan) return;
+            const isCompleted =
+                planData.plan.overall_status === PlanStatus.COMPLETED ||
+                planData.plan.overall_status === PlanStatus.FAILED;
+            const hasClarificationRequest =
+                Boolean(clarificationMessage?.request_id) && Boolean(planApprovalRequest?.id);
+
             setSubmittingChatDisableInput(true);
-            let id = showToast("Submitting clarification", "progress");
+            const progressMessage = hasClarificationRequest
+                ? "Submitting clarification"
+                : "Starting follow-up analysis";
+            let id = showToast(progressMessage, "progress");
 
             try {
-                // Use legacy method for non-v4 backends
+                if (!hasClarificationRequest && isCompleted) {
+                    const followUpSessionId = planData.plan.session_id;
+                    const followUpTeamId = planData.team?.team_id || planData.plan.team_id;
+                    const response = await TaskService.createPlan(
+                        chatInput,
+                        followUpTeamId,
+                        followUpSessionId,
+                    );
+
+                    dismissToast(id);
+                    showToast("Follow-up prompt started in this thread", "success");
+                    navigate(`/plan/${response.plan_id}`);
+                    return;
+                }
+
                 const response = await PlanDataService.submitClarification({
                     request_id: clarificationMessage?.request_id || "",
                     answer: chatInput,
@@ -657,8 +898,8 @@ const PlanPage: React.FC = () => {
                     agent: 'human',
                     agent_type: AgentMessageType.HUMAN_AGENT,
                     timestamp: Date.now(),
-                    steps: [],   // intentionally always empty
-                    next_steps: [],  // intentionally always empty
+                    steps: [],
+                    next_steps: [],
                     content: chatInput || '',
                     raw_data: chatInput || '',
                 } as AgentMessageData;
@@ -672,16 +913,24 @@ const PlanPage: React.FC = () => {
                 setShowProcessingPlanSpinner(false);
                 dismissToast(id);
                 setSubmittingChatDisableInput(false);
-                showToast(
-                    "Failed to submit clarification",
-                    "error"
-                );
+                const failedMessage = hasClarificationRequest
+                    ? "Failed to submit clarification"
+                    : "Failed to start follow-up prompt";
+                showToast(failedMessage, "error");
 
             } finally {
 
             }
         },
-        [planData?.plan, showToast, dismissToast, loadPlanData]
+        [
+            clarificationMessage?.request_id,
+            dismissToast,
+            navigate,
+            planApprovalRequest?.id,
+            planData,
+            scrollToBottom,
+            showToast,
+        ]
     );
 
 
@@ -780,10 +1029,25 @@ const PlanPage: React.FC = () => {
                             <ContentToolbar
                                 panelTitle="Multi-Agent Planner"
                             >
-                                {/* <PanelRightToggles>
-                                    <TaskListSquareLtr />
-                                </PanelRightToggles> */}
+                                <QboConnectButton />
                             </ContentToolbar>
+
+                            {pollingFallbackActive && (
+                                <div
+                                    style={{
+                                        margin: "8px auto 0",
+                                        maxWidth: "800px",
+                                        width: "100%",
+                                        padding: "8px 12px",
+                                        background: "#fff4ce",
+                                        border: "1px solid #f8d22a",
+                                        borderRadius: "6px",
+                                        fontSize: "12px",
+                                    }}
+                                >
+                                    WebSocket reconnecting. Showing progress via polling every 5 seconds.
+                                </div>
+                            )}
                             
                             <PlanChat
                                 planData={planData}
@@ -792,6 +1056,13 @@ const PlanPage: React.FC = () => {
                                 setInput={setInput}
                                 submittingChatDisableInput={submittingChatDisableInput}
                                 input={input}
+                                inputPlaceholder={
+                                    clarificationMessage?.request_id
+                                        ? "Provide clarification for this plan..."
+                                        : planData?.plan?.overall_status === PlanStatus.COMPLETED
+                                            ? "Ask a follow-up question about failed rules, evidence, or specific accounts..."
+                                            : "Type your message here..."
+                                }
                                 streamingMessages={streamingMessages}
                                 wsConnected={wsConnected}
                                 planApprovalRequest={planApprovalRequest}

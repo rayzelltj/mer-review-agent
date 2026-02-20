@@ -1,5 +1,19 @@
 import { headerBuilder, getApiUrl } from './config';
 
+export class APIClientError extends Error {
+    status: number;
+    data: any;
+    rawBody: string;
+
+    constructor(message: string, status: number, data: any, rawBody: string) {
+        super(message);
+        this.name = 'APIClientError';
+        this.status = status;
+        this.data = data;
+        this.rawBody = rawBody;
+    }
+}
+
 // Helper function to build URL with query parameters
 const buildUrl = (url: string, params?: Record<string, any>): string => {
     if (!params) return url;
@@ -17,16 +31,11 @@ const buildUrl = (url: string, params?: Record<string, any>): string => {
 
 // Fetch with Authentication Headers
 const fetchWithAuth = async (url: string, method: string = "GET", body: BodyInit | null = null) => {
-    const token = localStorage.getItem('token'); // Get the token from localStorage
     const authHeaders = headerBuilder(); // Get authentication headers
 
     const headers: Record<string, string> = {
         ...authHeaders, // Include auth headers from headerBuilder
     };
-
-    if (token) {
-        headers['Authorization'] = `Bearer ${token}`; // Add the token to the Authorization header
-    }
 
     // If body is FormData, do not set Content-Type header
     if (body && body instanceof FormData) {
@@ -48,13 +57,26 @@ const fetchWithAuth = async (url: string, method: string = "GET", body: BodyInit
         // Log the request details
         const response = await fetch(finalUrl, options);
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(errorText || 'Something went wrong');
+        const contentType = response.headers.get('content-type') || '';
+        const isJson = contentType.includes('application/json');
+        const rawBody = await response.text();
+        let responseData: any = rawBody || null;
+        if (isJson && rawBody) {
+            try {
+                responseData = JSON.parse(rawBody);
+            } catch {
+                responseData = rawBody;
+            }
         }
 
-        const isJson = response.headers.get('content-type')?.includes('application/json');
-        const responseData = isJson ? await response.json() : null;
+        if (!response.ok) {
+            const detailValue = typeof responseData === 'object' && responseData
+                ? (responseData.detail ?? responseData.message ?? responseData)
+                : (rawBody || 'Something went wrong');
+            const detail = typeof detailValue === 'string' ? detailValue : JSON.stringify(detailValue);
+            throw new APIClientError(detail, response.status, responseData, rawBody);
+        }
+
         return responseData;
     } catch (error) {
         console.info('API Error:', (error as Error).message);
@@ -78,12 +100,25 @@ const fetchWithoutAuth = async (url: string, method: string = "POST", body: Body
         const apiUrl = getApiUrl();
         const response = await fetch(`${apiUrl}${url}`, options);
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(errorText || 'Login failed');
+        const contentType = response.headers.get('content-type') || '';
+        const isJson = contentType.includes('application/json');
+        const rawBody = await response.text();
+        let responseData: any = rawBody || null;
+        if (isJson && rawBody) {
+            try {
+                responseData = JSON.parse(rawBody);
+            } catch {
+                responseData = rawBody;
+            }
         }
-        const isJson = response.headers.get('content-type')?.includes('application/json');
-        return isJson ? await response.json() : null;
+        if (!response.ok) {
+            const detailValue = typeof responseData === 'object' && responseData
+                ? (responseData.detail ?? responseData.message ?? responseData)
+                : (rawBody || 'Login failed');
+            const detail = typeof detailValue === 'string' ? detailValue : JSON.stringify(detailValue);
+            throw new APIClientError(detail, response.status, responseData, rawBody);
+        }
+        return responseData;
     } catch (error) {
         console.log('Login Error:', (error as Error).message);
         throw error;

@@ -24,6 +24,7 @@ interface SimplifiedPlanChatProps extends PlanChatProps {
   handleApprovePlan: () => Promise<void>;
   handleRejectPlan: () => Promise<void>;
   processingApproval: boolean;
+  inputPlaceholder?: string;
 
 }
 
@@ -46,7 +47,8 @@ const PlanChat: React.FC<SimplifiedPlanChatProps> = ({
   showApprovalButtons,
   handleApprovePlan,
   handleRejectPlan,
-  processingApproval
+  processingApproval,
+  inputPlaceholder
 }) => {
   // States
 
@@ -102,6 +104,7 @@ const PlanChat: React.FC<SimplifiedPlanChatProps> = ({
         submittingChatDisableInput={submittingChatDisableInput}
         OnChatSubmit={OnChatSubmit}
         waitingForPlan={waitingForPlan}
+        inputPlaceholder={inputPlaceholder}
         loading={false} />
 
     </div>

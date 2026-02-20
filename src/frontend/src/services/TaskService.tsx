@@ -182,25 +182,18 @@ export class TaskService {
    */
   static async createPlan(
     description: string,
-    teamId?: string
+    teamId?: string,
+    sessionId?: string
   ): Promise<InputTaskResponse> {
-    const sessionId = this.generateSessionId();
+    const resolvedSessionId = sessionId || this.generateSessionId();
 
     const inputTask: InputTask = {
-      session_id: sessionId,
+      session_id: resolvedSessionId,
       description: description,
       team_id: teamId,
     };
 
-    try {
-      return await apiService.createPlan(inputTask);
-    } catch (error: any) {
-
-      // You can customize this logic as needed
-      let message = "Unable to create plan. Please try again.";
-
-      throw new Error(message);
-    }
+    return apiService.createPlan(inputTask);
   }
 }
 

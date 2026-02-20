@@ -136,16 +136,11 @@ export class TeamService {
      * Get user's custom teams
      */
     static async getUserTeams(): Promise<TeamConfig[]> {
-        try {
-            const response = await apiClient.get('/v4/team_configs');
-
-            // The apiClient returns the response data directly, not wrapped in a data property
-            const teams = Array.isArray(response) ? response : [];
-
-            return teams;
-        } catch (error: any) {
-            return [];
+        const response = await apiClient.get('/v4/team_configs');
+        if (!Array.isArray(response)) {
+            throw new Error('Invalid team configuration response');
         }
+        return response as TeamConfig[];
     }
 
     /**

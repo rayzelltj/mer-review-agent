@@ -242,6 +242,8 @@ export enum HumanFeedbackStatus {
 export enum WebsocketMessageType {
     SYSTEM_MESSAGE = "system_message",
     AGENT_MESSAGE = "agent_message",
+    /** Sub-agent structured JSON payloads — intentionally NOT rendered in the UI. */
+    INTERNAL_AGENT_MESSAGE = "internal_agent_message",
     AGENT_STREAM_START = "agent_stream_start",
     AGENT_STREAM_END = "agent_stream_end",
     AGENT_MESSAGE_STREAMING = "agent_message_streaming",

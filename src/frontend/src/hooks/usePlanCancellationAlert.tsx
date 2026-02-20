@@ -4,7 +4,6 @@ import { APIService } from '../api/apiService';
 
 interface UsePlanCancellationAlertProps {
   planData: any;
-  planApprovalRequest: any;
   onNavigate: () => void;
 }
 
@@ -13,7 +12,6 @@ interface UsePlanCancellationAlertProps {
  */
 export const usePlanCancellationAlert = ({
   planData,
-  planApprovalRequest,
   onNavigate
 }: UsePlanCancellationAlertProps) => {
   const apiService = new APIService();
@@ -47,14 +45,7 @@ export const usePlanCancellationAlert = ({
 
     try {
       // User confirmed, cancel the plan
-      if (planApprovalRequest?.id) {
-        await apiService.approvePlan({
-          m_plan_id: planApprovalRequest.id,
-          plan_id: planData?.plan?.id,
-          approved: false,
-          feedback: 'Plan cancelled by user navigation'
-        });
-      }
+      await apiService.cancelRun(planData?.plan?.id);
 
       // Navigate after successful cancellation
       onNavigate();
@@ -64,7 +55,7 @@ export const usePlanCancellationAlert = ({
       alert('Failed to cancel the plan properly, but navigation will continue.');
       onNavigate();
     }
-  }, [isPlanActive, onNavigate, planApprovalRequest, planData, apiService]);
+  }, [isPlanActive, onNavigate, planData, apiService]);
 
   return {
     isPlanActive,

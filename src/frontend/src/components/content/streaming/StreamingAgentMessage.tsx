@@ -7,6 +7,7 @@ import { Body1, Tag, makeStyles, tokens } from "@fluentui/react-components";
 import { TaskService } from "@/services";
 import { PersonRegular } from "@fluentui/react-icons";
 import { getAgentIcon, getAgentDisplayName } from '@/utils/agentIconUtils';
+import BalanceSheetReviewPanel from "./BalanceSheetReviewPanel";
 
 interface StreamingAgentMessageProps {
   agentMessages: AgentMessageData[];
@@ -132,6 +133,23 @@ const isClarificationMessage = (content: string): boolean => {
   return clarificationKeywords.some(keyword => lowerContent.includes(keyword));
 };
 
+const RUN_ID_PATTERNS = [
+  /run_id\"?\s*[:=]\s*\"?([a-f0-9]{32})/i,
+  /run id[:\s]*([a-f0-9]{32})/i,
+  /runs\/[^/]+\/[^/]+\/([a-f0-9]{32})\//i,
+];
+
+const extractRunId = (content: string): string | null => {
+  if (!content) return null;
+  for (const pattern of RUN_ID_PATTERNS) {
+    const match = content.match(pattern);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+  return null;
+};
+
 const renderAgentMessages = (
   agentMessages: AgentMessageData[], 
   planData?: any, 
@@ -145,15 +163,25 @@ const renderAgentMessages = (
   const validMessages = agentMessages.filter(msg => msg.content?.trim());
   if (!validMessages.length) return null;
 
+  // Each unique run_id should only produce ONE BalanceSheetReviewPanel across all messages.
+  // Use a local Set — it is rebuilt on every render pass but that is fine because the
+  // agentMessages array itself is the source of truth (and deduped upstream in PlanPage).
+  const seenRunIds = new Set<string>();
+
   return (
     <>
       {validMessages.map((msg, index) => {
         const isHuman = msg.agent_type === AgentMessageType.HUMAN_AGENT;
         const isClarification = !isHuman && isClarificationMessage(msg.content || '');
+        const runId = !isHuman ? extractRunId(msg.content || '') : null;
+
+        // Render the Balance Sheet panel only for the first message that carries each run_id.
+        const shouldRenderPanel = runId !== null && !seenRunIds.has(runId);
+        if (shouldRenderPanel && runId) seenRunIds.add(runId);
 
         return (
           <div
-            key={index}
+            key={msg.message_id || `${msg.agent}-${msg.timestamp}-${index}`}
             className={styles.container}
             style={{
               flexDirection: isHuman ? 'row-reverse' : 'row'
@@ -215,6 +243,7 @@ const renderAgentMessages = (
                 >
                   {TaskService.cleanHRAgent(msg.content) || ""}
                 </ReactMarkdown>
+                {shouldRenderPanel && runId && <BalanceSheetReviewPanel runId={runId} />}
               </div>
             </div>
           </div>

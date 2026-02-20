@@ -17,6 +17,9 @@ import {
 // Constants for endpoints
 const API_ENDPOINTS = {
     PROCESS_REQUEST: '/v4/process_request',
+    RUN_STATUS: '/v4/run_status',
+    CANCEL_RUN: '/v4/cancel_run',
+    PLAN_STATUS: '/v4/plan_status',
     PLANS: '/v4/plans',
     PLAN: '/v4/plan',
     PLAN_APPROVAL: '/v4/plan_approval',
@@ -113,6 +116,43 @@ export class APIService {
 
     async createPlan(inputTask: InputTask): Promise<InputTaskResponse> {
         return apiClient.post(API_ENDPOINTS.PROCESS_REQUEST, inputTask);
+    }
+
+    async getRunStatus(): Promise<{
+        active: boolean;
+        run_id?: string;
+        plan_id?: string;
+        session_id?: string;
+        started_at?: string;
+        expires_at?: string;
+    }> {
+        return apiClient.get(API_ENDPOINTS.RUN_STATUS);
+    }
+
+    async cancelRun(runId?: string): Promise<{
+        cancelled: boolean;
+        active: boolean;
+        run_id?: string;
+        plan_id?: string;
+        status?: string;
+        message?: string;
+        task_cancel_requested?: boolean;
+    }> {
+        const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+        return apiClient.post(`${API_ENDPOINTS.CANCEL_RUN}${query}`);
+    }
+
+    async getPlanStatus(planId: string): Promise<{
+        plan_id: string;
+        session_id: string;
+        overall_status: string;
+        streaming_message?: string | null;
+        timestamp?: string | null;
+        active?: boolean;
+        run_id?: string | null;
+        expires_at?: string | null;
+    }> {
+        return apiClient.get(API_ENDPOINTS.PLAN_STATUS, { params: { plan_id: planId } });
     }
 
     /**

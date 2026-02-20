@@ -35,6 +35,13 @@ const AppWrapper = () => {
         setApiUrl(config.API_URL);
         setConfig(config);
         let defaultUserInfo = await getUserInfo();
+        const isAuthPath = window.location.pathname.startsWith('/.auth/');
+        if (config.ENABLE_AUTH && !defaultUserInfo?.user_id && !isAuthPath) {
+          const postLoginRedirect = `${window.location.pathname}${window.location.search || ''}`;
+          const loginUrl = `/.auth/login/aad?post_login_redirect_uri=${encodeURIComponent(postLoginRedirect || '/')}`;
+          window.location.assign(loginUrl);
+          return;
+        }
         window.userInfo = defaultUserInfo;
         setUserInfoGlobal(defaultUserInfo);
         await apiService.sendUserBrowserLanguage();

@@ -27,6 +27,8 @@ export interface AgentMessageData {
     next_steps: any[];
     content: string;
     raw_data: string;
+    /** Stable client-side dedup key: `${agent}|${timestamp}|${content.slice(0,100)}`. Set by PlanPage before pushing to state. */
+    message_id?: string;
 }
 
 /**

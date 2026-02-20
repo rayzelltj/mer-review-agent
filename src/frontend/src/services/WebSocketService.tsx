@@ -1,4 +1,4 @@
-import { getApiUrl, getUserId } from '../api/config';
+import { getApiUrl, getAuthToken } from '../api/config';
 import { PlanDataService } from './PlanDataService';
 import { ParsedPlanApprovalRequest, StreamingPlanUpdate, StreamMessage, WebsocketMessageType } from '../models';
 
@@ -6,12 +6,17 @@ import { ParsedPlanApprovalRequest, StreamingPlanUpdate, StreamMessage, Websocke
 class WebSocketService {
     private ws: WebSocket | null = null;
     private reconnectAttempts = 0;
-    private maxReconnectAttempts = 5;
-    private reconnectDelay = 12000;
+    private maxReconnectAttempts = 8;
+    private reconnectBaseDelayMs = 1000;
+    private reconnectMaxDelayMs = 30000;
     private listeners: Map<string, Set<(message: StreamMessage) => void>> = new Map();
-    private planSubscriptions: Set<string> = new Set();
     private reconnectTimer: NodeJS.Timeout | null = null;
     private isConnecting = false;
+    private heartbeatTimer: NodeJS.Timeout | null = null;
+    private heartbeatIntervalMs = 25000;
+    private shouldReconnect = false;
+    private lastPlanId: string | null = null;
+    private lastProcessId: string | undefined = undefined;
 
 
     private buildSocketUrl(processId?: string, planId?: string): string {
@@ -25,20 +30,29 @@ class WebSocketService {
         // Leave ws/wss as-is; anything else is assumed already correct
 
         // Decide path addition
-        let userId = getUserId();
         const hasApiSegment = /\/api(\/|$)/i.test(base);
         const socketPath = hasApiSegment ? '/v4/socket' : '/api/v4/socket';
-        const url = `${base}${socketPath}${processId ? `/${processId}` : `/${planId}`}?user_id=${userId || ''}`;
-        console.log("Constructed WebSocket URL:", url);
-        return url;
+        const path = `${base}${socketPath}${processId ? `/${processId}` : `/${planId}`}`;
+        const authToken = getAuthToken();
+        if (!authToken) {
+            return path;
+        }
+        const separator = path.includes('?') ? '&' : '?';
+        return `${path}${separator}auth_token=${encodeURIComponent(authToken)}`;
     }
     connect(planId: string, processId?: string): Promise<void> {
         return new Promise((resolve, reject) => {
+            let opened = false;
+            this.lastPlanId = planId;
+            this.lastProcessId = processId;
+            this.shouldReconnect = true;
+
             if (this.isConnecting) {
-                reject(new Error('Connection already in progress'));
+                resolve();
                 return;
             }
             if (this.ws?.readyState === WebSocket.OPEN) {
+                this.startHeartbeat();
                 resolve();
                 return;
             }
@@ -48,13 +62,16 @@ class WebSocketService {
                 this.ws = new WebSocket(wsUrl);
 
                 this.ws.onopen = () => {
+                    opened = true;
                     this.isConnecting = false;
                     this.reconnectAttempts = 0;
                     if (this.reconnectTimer) {
                         clearTimeout(this.reconnectTimer);
                         this.reconnectTimer = null;
                     }
+                    this.startHeartbeat();
                     this.emit('connection_status', { connected: true });
+                    this.emit('reconnecting', { active: false, attempts: this.reconnectAttempts });
                     resolve();
                 };
 
@@ -69,16 +86,17 @@ class WebSocketService {
 
                 this.ws.onclose = (event) => {
                     this.isConnecting = false;
+                    this.stopHeartbeat();
                     this.ws = null;
                     this.emit('connection_status', { connected: false });
-                    if (this.reconnectAttempts < this.maxReconnectAttempts && event.code !== 1000) {
+                    if (this.shouldReconnect && event.code !== 1000) {
                         this.attemptReconnect();
                     }
                 };
 
                 this.ws.onerror = () => {
                     this.isConnecting = false;
-                    if (this.reconnectAttempts === 0) {
+                    if (!opened && this.reconnectAttempts === 0) {
                         reject(new Error('WebSocket connection failed'));
                     }
                     this.emit('error', { error: 'WebSocket connection error' });
@@ -92,16 +110,17 @@ class WebSocketService {
 
     disconnect(): void {
         console.log('WebSocketService: Disconnecting WebSocket');
+        this.shouldReconnect = false;
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
-        this.reconnectAttempts = this.maxReconnectAttempts;
+        this.reconnectAttempts = 0;
         if (this.ws) {
             this.ws.close(1000, 'Manual disconnect');
             this.ws = null;
         }
-        this.planSubscriptions.clear();
+        this.stopHeartbeat();
         this.isConnecting = false;
     }
 
@@ -247,6 +266,12 @@ class WebSocketService {
             this.emit(WebsocketMessageType.ERROR_MESSAGE, message.data); // Emit the data
             break;
             }
+            case WebsocketMessageType.INTERNAL_AGENT_MESSAGE: {
+                // Sub-agent structured JSON — intentionally suppressed from the UI.
+                // Logged at debug level only; do NOT emit to any UI listener.
+                console.debug('INTERNAL_AGENT_MESSAGE (suppressed):', message.data);
+                break;
+            }
             case WebsocketMessageType.USER_CLARIFICATION_RESPONSE:
             case WebsocketMessageType.REPLAN_APPROVAL_REQUEST:
             case WebsocketMessageType.REPLAN_APPROVAL_RESPONSE:
@@ -268,16 +293,28 @@ class WebSocketService {
     }
 
     private attemptReconnect(): void {
+        if (!this.shouldReconnect) {
+            return;
+        }
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
             this.emit('error', { error: 'Max reconnection attempts reached' });
             return;
         }
         if (this.isConnecting || this.reconnectTimer) return;
         this.reconnectAttempts++;
-        const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+        const exponentialDelay = this.reconnectBaseDelayMs * Math.pow(2, this.reconnectAttempts - 1);
+        const delay = Math.min(exponentialDelay, this.reconnectMaxDelayMs);
+        this.emit('reconnecting', { active: true, attempts: this.reconnectAttempts, delay });
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            this.emit('error', { error: 'Connection lost - manual reconnection required' });
+            if (!this.lastPlanId) {
+                this.emit('error', { error: 'Connection lost and no plan context for reconnect' });
+                return;
+            }
+            this.connect(this.lastPlanId, this.lastProcessId).catch((error) => {
+                this.emit('error', { error: `Reconnect failed: ${error?.message || error}` });
+                this.attemptReconnect();
+            });
         }, delay);
     }
 
@@ -318,6 +355,22 @@ class WebSocketService {
             this.ws.send(JSON.stringify(message));
         } catch {
             this.emit('error', { error: 'Failed to send plan approval response' });
+        }
+    }
+
+    private startHeartbeat(): void {
+        if (this.heartbeatTimer || !this.ws) return;
+        this.heartbeatTimer = setInterval(() => {
+            if (this.ws?.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'ping', timestamp: new Date().toISOString() }));
+            }
+        }, this.heartbeatIntervalMs);
+    }
+
+    private stopHeartbeat(): void {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
         }
     }
 }

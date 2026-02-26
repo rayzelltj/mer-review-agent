@@ -183,6 +183,26 @@ class TestFindLatestRun:
 class TestOutputGate:
     """Tests for the _is_orchestrator_agent gate and its effect on message routing."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_v4_settings(self, monkeypatch):
+        """
+        response_handlers.py has a module-level import:
+            from v4.config.settings import connection_config
+        which transitively loads AppConfig and requires APPLICATIONINSIGHTS_CONNECTION_STRING.
+        Stub the module in sys.modules so the import succeeds without real env vars.
+        After each test monkeypatch restores sys.modules to its original state.
+        """
+        import sys
+
+        mock_settings = MagicMock()
+        mock_settings.connection_config = MagicMock()
+
+        # Evict any previously cached (possibly failed) version of the modules so
+        # the next in-body import picks up the stubs instead.
+        monkeypatch.delitem(sys.modules, "v4.callbacks.response_handlers", raising=False)
+        monkeypatch.delitem(sys.modules, "v4.config.settings", raising=False)
+        monkeypatch.setitem(sys.modules, "v4.config.settings", mock_settings)
+
     def test_orchestrator_names_pass_gate(self):
         """Known orchestrator agent names pass the output gate."""
         from v4.callbacks.response_handlers import _is_orchestrator_agent

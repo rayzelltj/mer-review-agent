@@ -73,7 +73,11 @@ def test_reviews_run_route_returns_queued_with_run_id(client: TestClient, monkey
     )
 
     assert response.status_code == 200
-    assert response.json() == {"run_id": "run-fixed-123", "status": "queued"}
+    data = response.json()
+    # The response may include additional optional fields (e.g. summary, findings)
+    # that are None when the run is queued; only assert the required fields.
+    assert data["run_id"] == "run-fixed-123"
+    assert data["status"] == "queued"
 
 
 def test_reviews_run_route_propagates_qbo_precheck_conflict(client: TestClient, monkeypatch):

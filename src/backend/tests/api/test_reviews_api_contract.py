@@ -81,6 +81,10 @@ async def test_run_balance_sheet_review_queues_with_resolved_client_id(monkeypat
     response = await reviews.run_balance_sheet_review(
         reviews.BalanceSheetRunRequest(client_id="acme_alias", period_end=date(2025, 12, 31), notes="focus cash"),
         _request(),
+        # When the endpoint function is called directly (not via ASGI), FastAPI's
+        # Query(False, alias="await") resolves to a truthy FieldInfo object rather
+        # than the bool False.  Pass it explicitly to stay on the fire-and-forget path.
+        await_result=False,
     )
 
     assert response.run_id == "run-fixed-123"

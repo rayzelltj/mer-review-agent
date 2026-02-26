@@ -5,34 +5,48 @@ title MACAE (Multi-Agent Custom Automation Engine) - Container View
 Person(user, "End User", "Uses browser to submit tasks and approve plans")
 
 System_Boundary(macae, "MACAE Solution Accelerator") {
-  Container(frontend, "Frontend Web App", "React + FastAPI static server", "Serves UI and exposes /config for runtime API settings")
-  Container(backend, "Backend API + Orchestrator", "Python FastAPI + agent_framework", "Runs orchestration, websocket updates, and integration APIs (QBO/Drive)")
-  Container(mcp, "MCP Tool Server", "FastMCP (streamable-http)", "Exposes tool APIs at /mcp for agents (HR/finance/etc.)")
+
+  Boundary(compute_frontend, "Azure App Service (Linux Containers)") {
+    Container(frontend, "Frontend Web App", "React 18 + Vite + FastAPI static server", "Serves UI, exposes /config for runtime API URL. Port 3000.")
+  }
+
+  Boundary(compute_cae, "Container Apps Environment (cae-<suffix>)") {
+    Container(backend, "Backend API + Orchestrator", "Python 3.11 FastAPI + agent_framework", "Orchestration, WebSocket updates, QBO/Drive/review APIs. Port 8000.")
+    Container(mcp, "MCP Tool Server", "FastMCP (streamable-http)", "Exposes tool APIs at /mcp for agents (HR/finance/marketing/tech_support/product). Port 9000.")
+  }
+
+  Boundary(identity, "Identity") {
+    Container(uami, "User-Assigned Managed Identity", "id-<suffix>", "Shared identity for backend, MCP, and AI Services RBAC")
+  }
 }
 
 System_Ext(entra, "Microsoft Entra ID", "OIDC/OAuth2", "User authentication and JWT signing keys")
 System_Ext(intuit, "Intuit QuickBooks Online (QBO)", "OAuth2 + REST", "Accounting data source for finance workflows")
 System_Ext(gdrive, "Google Drive API (Optional)", "OAuth2 + REST", "Evidence/document source")
 
-ContainerDb(cosmos, "Azure Cosmos DB (SQL API)", "Database", "Memory store, plans, team configs, QBO refresh tokens")
-ContainerDb(storage, "Azure Storage (Blob)", "Blob Containers", "Sample datasets and documents for indexing")
-ContainerDb(search, "Azure AI Search", "Search Indexes", "RAG index/query for agents and backend")
-ContainerDb(keyvault, "Azure Key Vault", "Secrets", "Stores sensitive values (e.g., Search API key) as Key Vault references")
+ContainerDb(cosmos, "Azure Cosmos DB (SQL API)", "Database: macae / Container: memory", "Plans, team configs, QBO refresh tokens, agent memory")
+ContainerDb(storage, "Azure Storage (Blob)", "Blob Containers", "Sample datasets and documents for AI Search indexing")
+ContainerDb(search, "Azure AI Search", "Search Indexes", "RAG indexes for retail/RFP/contract teams. Public network access enabled.")
+ContainerDb(keyvault, "Azure Key Vault", "Secrets", "Stores AzureAISearchAPIKey. Backend reads via Container App Key Vault references (infra-level, not runtime SDK).")
 
-System_Ext(aifoundry, "Azure AI Foundry (AI Services + Project)", "Agents API + OpenAI models", "Model deployments and agent execution environment")
+System_Boundary(ai, "Azure AI Foundry") {
+  System_Ext(aisvc, "AI Services (aif-<suffix>)", "OpenAI models", "Deployments: gpt-4.1-mini, gpt-4.1, o4-mini (all GlobalStandard)")
+  System_Ext(aiproj, "AI Foundry Project (proj-<suffix>)", "Agents API", "Server-side agent execution. System-Assigned MI. Hosts AI Search connection (ApiKey auth).")
+}
 
-System_Ext(logs, "Azure Monitor (Log Analytics + App Insights)", "Observability", "Logs, traces, metrics")
-System_Ext(acr, "Azure Container Registry", "OCI registry", "Stores container images for backend/frontend/mcp")
+System_Ext(logs, "Azure Monitor (Log Analytics + App Insights)", "Observability (conditional: enableMonitoring flag)", "Logs, traces, metrics. Deployed only when enableMonitoring=true.")
+System_Ext(acr, "Azure Container Registry (external)", "OCI registry (biabcontainerreg.azurecr.io)", "Pre-existing external ACR. NOT deployed by this template.")
 
 Rel(user, frontend, "Uses UI", "HTTPS")
-Rel(frontend, backend, "Calls APIs + websocket", "HTTPS")
+Rel(frontend, backend, "Calls APIs + WebSocket", "HTTPS")
 
-Rel(backend, entra, "Validates user JWTs (optional)", "JWKS HTTPS")
-Rel(backend, aifoundry, "Runs agents / model calls", "Azure SDK (Managed Identity)")
-Rel(backend, cosmos, "Reads/writes state", "Azure SDK (Managed Identity)")
-Rel(backend, search, "Queries and indexes content", "API key and/or AAD (TBD)")
-Rel(backend, storage, "Reads datasets/documents", "Azure SDK (Managed Identity)")
-Rel(backend, keyvault, "Reads secrets via Key Vault references", "Managed Identity")
+Rel(backend, entra, "Validates user JWTs (optional, env-controlled)", "JWKS HTTPS")
+Rel(backend, aisvc, "Creates agents / model calls", "Azure SDK (User-Assigned MI)")
+Rel(backend, aiproj, "Runs agent workflows, resolves AI Search connection", "Azure SDK (User-Assigned MI)")
+Rel(aiproj, search, "Queries indexes via project-scoped connection", "ApiKey auth (aifp-srch-connection)")
+Rel(backend, cosmos, "Reads/writes state", "Azure SDK (User-Assigned MI for async; API key fallback for sync)")
+Rel(backend, storage, "Reads datasets/documents", "Azure SDK (User-Assigned MI)")
+Rel(backend, keyvault, "Secrets injected via Container App env var references", "Infra-level Key Vault reference (not runtime SDK)")
 Rel(backend, mcp, "Invokes tools", "MCP streamable-http")
 
 Rel(mcp, backend, "Fan-out tool calls back into backend (finance/QBO)", "HTTPS + forwarded user token")
@@ -40,12 +54,16 @@ Rel(mcp, backend, "Fan-out tool calls back into backend (finance/QBO)", "HTTPS +
 Rel(backend, intuit, "OAuth2 + QBO API calls", "HTTPS")
 Rel(backend, gdrive, "OAuth2 + Drive API calls (optional)", "HTTPS")
 
-Rel(backend, logs, "Traces/logs/metrics", "OTel + platform diagnostics")
-Rel(frontend, logs, "App Service diagnostics", "Platform diagnostics")
-Rel(mcp, logs, "Container Apps logs", "Platform diagnostics")
+Rel(backend, logs, "Traces/logs/metrics (when enabled)", "OTel + platform diagnostics")
+Rel(frontend, logs, "App Service diagnostics (when enabled)", "Platform diagnostics")
+Rel(mcp, logs, "Container Apps logs (when enabled)", "Platform diagnostics")
 
-Rel(acr, backend, "Image pull", "ACR")
-Rel(acr, frontend, "Image pull", "ACR")
-Rel(acr, mcp, "Image pull", "ACR")
+Rel(acr, backend, "Image pull (public, no auth)", "Docker pull")
+Rel(acr, frontend, "Image pull (public, no auth)", "Docker pull")
+Rel(acr, mcp, "Image pull (public, no auth)", "Docker pull")
+
+Rel(uami, backend, "Assigned to", "UA-MI")
+Rel(uami, mcp, "Assigned to", "UA-MI")
+Rel(uami, aisvc, "RBAC roles", "Cognitive Services OpenAI Contributor + User")
 ```
 

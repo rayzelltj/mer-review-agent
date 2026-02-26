@@ -1,0 +1,261 @@
+```mermaid
+flowchart TD
+    classDef user fill:#4A90D9,stroke:#2E6BA4,color:#fff,font-weight:bold
+    classDef frontend fill:#7BC67E,stroke:#4A9A4D,color:#fff,font-weight:bold
+    classDef backend fill:#F5A623,stroke:#D48A1A,color:#fff,font-weight:bold
+    classDef ai fill:#BD6BD9,stroke:#9B4FB5,color:#fff,font-weight:bold
+    classDef cosmos fill:#E85D5D,stroke:#C43E3E,color:#fff,font-weight:bold
+    classDef blob fill:#E8915D,stroke:#C46E3E,color:#fff,font-weight:bold
+    classDef external fill:#6BB5D9,stroke:#4A93B5,color:#fff,font-weight:bold
+    classDef decision fill:#FFD966,stroke:#D4B84A,color:#333,font-weight:bold
+    classDef legend fill:#f5f5f5,stroke:#999,color:#333
+
+    %% ═══════════════════════════════════════════════
+    %% LEGEND
+    %% ═══════════════════════════════════════════════
+    L1["🔴 Red = Cosmos DB (macae/memory)
+    🟠 Orange = Blob Storage (snapshots)
+    🔵 Blue = External Service
+    🟣 Purple = AI Processing
+    🟢 Green = User's Screen
+    🟡 Yellow = User Decision"]:::legend
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 1: User Opens the App
+    %% ═══════════════════════════════════════════════
+    S1["👤 STEP 1: Open the Web App
+    User goes to the website in their browser"]:::user
+    S1 --> S2
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 2: Sign In
+    %% ═══════════════════════════════════════════════
+    S2["🔐 STEP 2: Sign In
+    Microsoft login page appears.
+    User enters their work email & password."]:::frontend
+    S2 --> S2a["🔵 Microsoft Entra ID
+    Verifies the user's identity
+    and sends back a secure pass.
+    ⸻
+    📍 Token lives in browser session
+    (managed by Azure App Service,
+    not stored in our database)"]:::external
+    S2a --> S3
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 3: App Loads
+    %% ═══════════════════════════════════════════════
+    S3["🏠 STEP 3: App Home Screen Loads
+    The app sets up the user's workspace
+    and loads their agent team."]:::frontend
+    S3 --> S3a["🔴 Cosmos DB
+    Team config is loaded from:
+    Database: macae / Container: memory
+    ⸻
+    📍 Stores: team name, agent list,
+    starting tasks, AI model settings
+    (one record per user per team)"]:::cosmos
+    S3a --> S4
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 4: Connect QuickBooks (if needed)
+    %% ═══════════════════════════════════════════════
+    S4{"💼 STEP 4: Is QuickBooks Connected?
+    (Only for finance reviews)"}:::decision
+    S4 -->|"Not yet"| S4a["🔵 Intuit OAuth
+    User clicks 'Connect QBO'.
+    A popup opens to Intuit's login.
+    User authorizes access to
+    their accounting data."]:::external
+    S4a --> S4b["🔴 Cosmos DB
+    QBO credentials saved to:
+    Database: macae / Container: memory
+    ⸻
+    📍 Stores: refresh token, realm ID,
+    client ID, expiry timestamp
+    (access tokens are NOT stored —
+    fetched on-demand each time)"]:::cosmos
+    S4b --> S5
+    S4 -->|"Already connected"| S5
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 5: User Submits a Request
+    %% ═══════════════════════════════════════════════
+    S5["💬 STEP 5: Submit a Request
+    User types something like:
+    'Run a balance sheet review
+    for Client ABC, period ending Jan 2026'"]:::user
+    S5 --> S6
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 6: AI Creates a Plan
+    %% ═══════════════════════════════════════════════
+    S6["🟣 STEP 6: AI Creates a Plan
+    Azure AI Foundry (GPT-4.1) reads
+    the request and creates a step-by-step
+    plan: which agents, what data to pull,
+    what rules to check."]:::ai
+    S6 --> S6a["🔴 Cosmos DB
+    Plan is saved to:
+    Database: macae / Container: memory
+    ⸻
+    📍 Stores: plan ID, session ID,
+    plan steps, status, team ID
+    Then sent to user's screen
+    via live WebSocket connection"]:::cosmos
+    S6a --> S7
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 7: User Approves the Plan
+    %% ═══════════════════════════════════════════════
+    S7{"✅ STEP 7: Review & Approve the Plan
+    User sees the plan on screen.
+    'Does this look right?'"}:::decision
+    S7 -->|"Approve ✓"| S8
+    S7 -->|"Reject / Edit"| S5
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 8: Agents Execute
+    %% ═══════════════════════════════════════════════
+    S8["⚙️ STEP 8: Agents Get to Work
+    A team of AI agents runs in sequence.
+    Live progress streams to the screen."]:::backend
+
+    S8 --> A1["🟣 Agent 1 — Connector
+    Connects to QuickBooks via
+    saved credentials and pulls:
+    balance sheet, account list,
+    aging reports, transactions"]:::ai
+
+    A1 --> A1db["🔴 Cosmos DB
+    Review run record created:
+    Database: macae / Container: memory
+    ⸻
+    📍 Stores: run ID, client ID,
+    period end date, status,
+    snapshot keys, error info"]:::cosmos
+
+    A1 --> A1blob["🟠 Blob Storage
+    Raw QBO data saved as snapshots:
+    Container: snapshots
+    Path: snapshots/{run_id}/...
+    ⸻
+    📍 Stores: balance_sheet.json,
+    aging_ar.json, aging_ap.json,
+    trial_balance.json, accounts.json,
+    transactions — each as a separate file"]:::blob
+
+    A1db --> A2
+    A1blob --> A2
+
+    A2["🟣 Agent 2 — Normalizer
+    Cleans & organizes the raw data
+    into a standard format so
+    the rules engine can read it"]:::ai
+
+    A2 --> A2blob["🟠 Blob Storage
+    Normalized data saved:
+    Container: snapshots
+    Path: runs/{run_id}/review_inputs.json
+    ⸻
+    📍 Stores: standardized balance sheet,
+    prior periods, evidence bundle,
+    reconciliation data"]:::blob
+
+    A2blob --> A3
+
+    A3["🟣 Agent 3 — Rules Checker
+    Runs 26 review rules against
+    the normalized data. Each account
+    gets: Pass, Fail, Warning,
+    or Needs Review"]:::ai
+
+    A3 --> A3blob["🟠 Blob Storage
+    Rule results saved:
+    Container: snapshots
+    Path: runs/{run_id}/findings.json
+    + runs/{run_id}/bs_view.json
+    ⸻
+    📍 Stores: per-rule results,
+    per-account status, severity,
+    evidence references"]:::blob
+
+    A3 --> A3db["🔴 Cosmos DB
+    Run record updated with:
+    findings count, pass/fail totals,
+    critical rule IDs, HITL requests"]:::cosmos
+
+    A3blob --> A4
+    A3db --> A4
+
+    A4["🟣 Agent 4 — Report Builder
+    Creates an executive summary:
+    balance sheet view, key findings,
+    recommended next actions"]:::ai
+
+    A4 --> A4blob["🟠 Blob Storage
+    Report saved:
+    Container: snapshots
+    Path: runs/{run_id}/summary.md
+    ⸻
+    📍 Also saved inline on
+    the Cosmos run record"]:::blob
+
+    A4blob --> A5
+
+    A5["🟣 Agent 5 — Evidence Checker
+    Identifies missing documents
+    (bank statements, receipts)
+    and lists what's still needed"]:::ai
+
+    A5 --> S9
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 9: User Sees Results
+    %% ═══════════════════════════════════════════════
+    S9["📊 STEP 9: Results Appear on Screen
+    User sees:
+    • Balance sheet (current + 3 prior months)
+    • Per-account status (Pass/Fail/Warning)
+    • Key findings & flagged issues
+    • Missing evidence list
+    • Recommended next actions"]:::frontend
+
+    S9 --> S10
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 10: Follow-Up Questions
+    %% ═══════════════════════════════════════════════
+    S10{"💬 STEP 10: Follow-Up Questions
+    User can ask things like:
+    'Why did cash fail?'
+    'Show me the details for
+     accounts receivable.'"}:::decision
+    S10 -->|"Ask another question"| S10a["🟣 AI answers using
+    the saved results from
+    Cosmos DB + Blob Storage"]:::ai
+    S10a --> S10msg["🔴 Cosmos DB
+    Each message is saved:
+    Database: macae / Container: memory
+    ⸻
+    📍 Stores: message content,
+    sender (human/agent), plan ID,
+    timestamp"]:::cosmos
+    S10msg --> S10
+    S10 -->|"Done — close session"| S11
+
+    %% ═══════════════════════════════════════════════
+    %% STEP 11: Done
+    %% ═══════════════════════════════════════════════
+    S11["✔️ STEP 11: Review Complete
+    Everything is saved and persisted:
+    ⸻
+    🔴 Cosmos DB has: plans, run records,
+    findings summary, chat messages
+    🟠 Blob Storage has: raw QBO data,
+    normalized inputs, full findings,
+    balance sheet view, report
+    ⸻
+    User can come back anytime
+    to view past reviews."]:::frontend
+```

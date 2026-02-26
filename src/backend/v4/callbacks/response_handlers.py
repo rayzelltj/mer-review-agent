@@ -53,6 +53,36 @@ ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Internal names that must never appear in user-facing message text.
+_INTERNAL_NAME_MAP: dict[str, str] = {
+    "ConnectorAgent": "Data Connector",
+    "NormalizationAgent": "Data Processor",
+    "RulesAgent": "Rules Engine",
+    "ReportAgent": "Report Generator",
+    "HITLAgent": "Evidence Collector",
+    "ReviewAgent": "Review Pipeline",
+    "MagenticManager": "Assistant",
+    "HumanApprovalMagenticManager": "Assistant",
+    "ProxyAgent": "Assistant",
+}
+
+# Compiled once for efficiency.
+_INTERNAL_NAME_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _INTERNAL_NAME_MAP) + r")\b"
+)
+
+
+def sanitize_for_display(text: str) -> str:
+    """Replace internal agent/tool names with user-friendly equivalents.
+
+    This is a best-effort sanitizer. It catches the most common leakage patterns
+    (agent names used as nouns in prose) without risking false positives on
+    unrelated content.
+    """
+    if not text:
+        return text
+    return _INTERNAL_NAME_RE.sub(lambda m: _INTERNAL_NAME_MAP[m.group(0)], text)
+
 
 def _is_orchestrator_agent(agent_name: str) -> bool:
     """Return True if this agent is allowed to emit visible messages to the UI."""
@@ -123,7 +153,7 @@ def agent_response_callback(
         # Fallback for non-ChatMessage objects
         text = str(getattr(message, "text", ""))
 
-    text = clean_citations(text or "")
+    text = sanitize_for_display(clean_citations(text or ""))
 
     if not user_id:
         logger.debug("No user_id provided; skipping websocket send for final message.")
@@ -190,7 +220,7 @@ async def streaming_agent_response_callback(
                     collected.append(str(txt))
             chunk_text = "".join(collected) if collected else ""
 
-        cleaned = clean_citations(chunk_text or "")
+        cleaned = sanitize_for_display(clean_citations(chunk_text or ""))
 
         # Tool-call messages: always forward (show spinner / activity) for ALL agents
         contents = getattr(update, "contents", []) or []

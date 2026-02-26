@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { getApiUrl, getAuthToken, setApiUrl, setEnvData, toBoolean } from '@/api/config';
+import { setStoredReviewClientId } from '@/services/QboReviewContextService';
+import { redirectToAadLogin } from '@/utils/authSession';
 
 const QboCallbackPage: React.FC = () => {
   const [message, setMessage] = useState('Completing QBO connection...');
@@ -41,13 +43,11 @@ const QboCallbackPage: React.FC = () => {
 
       const token = getAuthToken();
       if (!token) {
-        const postLoginRedirect = `${window.location.pathname}${window.location.search || ''}`;
-        const loginUrl = `/.auth/login/aad?post_login_redirect_uri=${encodeURIComponent(postLoginRedirect || '/')}`;
-        window.location.assign(loginUrl);
+        redirectToAadLogin();
         return;
       }
 
-      const target = `${baseUrl}/qbo/callback${query}`;
+      const target = `${baseUrl}/api/qbo/callback${query}`;
       try {
         const response = await fetch(target, {
           method: 'GET',
@@ -55,6 +55,10 @@ const QboCallbackPage: React.FC = () => {
             Authorization: `Bearer ${token}`,
           },
         });
+        if (response.status === 401) {
+          redirectToAadLogin();
+          return;
+        }
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
           const detail = (payload as any)?.detail || 'Unable to complete QBO callback.';
@@ -63,6 +67,9 @@ const QboCallbackPage: React.FC = () => {
         }
 
         const resolvedClientId = String((payload as any)?.client_id || '').trim();
+        if (resolvedClientId) {
+          setStoredReviewClientId(resolvedClientId);
+        }
         const connectedEvent = {
           type: 'qbo_connected',
           client_id: resolvedClientId || null,

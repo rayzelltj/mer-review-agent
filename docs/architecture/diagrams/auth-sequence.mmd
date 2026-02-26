@@ -77,18 +77,19 @@ sequenceDiagram
   participant Intuit as Intuit OAuth/QBO
 
   U->>FE: Click "Connect QuickBooks"
-  FE->>BE: GET /api/qbo/connect/start?client_id=...
+  FE->>BE: GET /api/qbo/connect/prepare?client_id=...
   BE->>Cosmos: Save oauth_state (state + user_principal_id + redirect_uri)
-  BE-->>U: 302 Redirect to Intuit authorize URL (state)
+  BE-->>FE: authorization_url
+  FE-->>U: Navigate to Intuit authorize URL (state)
 
   U->>Intuit: Login + consent
   Intuit-->>U: Redirect to BE callback (code, realmId, state)
 
-  U->>BE: GET /api/qbo/connect/callback?code=...&realmId=...&state=...
+  U->>BE: GET /api/qbo/callback?code=...&realmId=...&state=...
   BE->>Cosmos: Read + delete oauth_state, verify user binding
   BE->>Intuit: Exchange code for tokens
   Intuit-->>BE: access_token + refresh_token + expires_in
   BE->>Cosmos: Upsert qbo_client refresh_token (keyed by user + client_id)
-  BE-->>U: Redirect back to UI / success
+  BE-->>U: JSON callback result
+  U->>FE: Frontend callback stores event and returns to home
 ```
-

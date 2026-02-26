@@ -584,6 +584,61 @@ async def get_run_status(request: Request):
     }
 
 
+@app_v4.get("/session/{session_id}/active_plan")
+async def get_session_active_plan(session_id: str, request: Request):
+    """Return the current active plan_id and status for a session.
+
+    Used by the frontend after a follow-up message creates a new plan within the
+    same session so the chat page can update its WebSocket channel without full
+    page navigation.
+    """
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="no user found")
+
+    # Check the in-memory run lock first — fastest path.
+    active = await run_control_config.get_active_run(user_id=user_id)
+    if active and active.session_id == session_id:
+        return {
+            "session_id": session_id,
+            "plan_id": active.plan_id,
+            "run_id": active.run_id,
+            "status": "running",
+            "process_id": active.process_id,
+        }
+
+    # Fall back to database: find the most recent plan for this session.
+    try:
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        plans = await memory_store.get_plans_by_session_id(session_id=session_id)
+        if plans:
+            # Sort by created time descending and take the most recent.
+            latest = sorted(
+                plans,
+                key=lambda p: str(getattr(p, "created_at", "") or ""),
+                reverse=True,
+            )[0]
+            if str(getattr(latest, "user_id", "")).strip() in ("", str(user_id)):
+                return {
+                    "session_id": session_id,
+                    "plan_id": latest.plan_id,
+                    "run_id": latest.plan_id,
+                    "status": str(getattr(latest, "overall_status", "unknown")),
+                }
+    except Exception as lookup_err:
+        logger.warning(
+            "get_session_active_plan db lookup failed session=%s: %s",
+            session_id,
+            lookup_err,
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No active plan found for session {session_id}",
+    )
+
+
 @app_v4.post("/cancel_run")
 async def cancel_run(request: Request, run_id: Optional[str] = Query(None)):
     authenticated_user = get_authenticated_user_details(request_headers=request.headers)

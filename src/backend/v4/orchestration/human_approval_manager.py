@@ -55,27 +55,20 @@ Plan steps should always include a bullet point, followed by an agent name, foll
 to be taken. If a step involves multiple actions, separate them into distinct steps with an agent included in each step.
 If the step is taken by an agent that is not part of the team, such as the MagenticManager, please always list the MagenticManager as the agent for that step. At any time, if more information is needed from the user, use the ProxyAgent to request this information.
 The first plan step must always be a MagenticManager orchestration step that states it will coordinate the team.
-Every plan step — including steps 2, 3, and all subsequent steps — MUST start with the assigned agent name in bold (e.g. **ConnectorAgent**, **NormalizationAgent**, **RulesAgent**, **ReportAgent**, **HITLAgent**, **ProxyAgent**). Never omit the agent name from any step.
+Every plan step — including steps 2, 3, and all subsequent steps — MUST start with the assigned agent name in bold (e.g. **ReviewAgent**, **ProxyAgent**). Never omit the agent name from any step.
 
 BALANCE SHEET REVIEW — PIPELINE FLOW (when a full review is requested):
-  **ConnectorAgent** → verifies QBO connection, calls bs_fetch_data, waits for status=raw (raw QBO API data saved)
-  **NormalizationAgent** → calls bs_normalize_data (runs build_qbo_snapshots/aging/tax evidence), waits for status=fetched
-  **RulesAgent** → triggers rules evaluation via bs_run_rules (or bs_run_rules with rule_ids for specific rules)
-  **ReportAgent** → reads findings via bs_get_findings and returns structured JSON with balance_sheet_rows
-  **HITLAgent** → ONLY if ReportAgent JSON contains non-empty hitl_requests; calls bs_submit_evidence_request
+  **ReviewAgent** → calls check_qbo_connection, then run_balance_sheet_review (single synchronous call that runs the full pipeline), returns structured JSON with run_id, findings, balance_sheet_rows, hitl_requests
 
-CRITICAL CONSTRAINT — A full balance sheet review MUST include ALL FIVE of the above agents in EXACTLY this order: ConnectorAgent → NormalizationAgent → RulesAgent → ReportAgent → HITLAgent. Omitting RulesAgent is INCORRECT — the rules engine will never run and the review will be incomplete. Omitting NormalizationAgent is INCORRECT — raw data will not be normalized and RulesAgent will fail. Every full review plan MUST contain a step for each of these five agents.
+FLEXIBLE FLOW — NOT every query requires a full review run. Route based on user intent:
+  - "Is QBO connected?" or "check QBO status" → **ReviewAgent** (check_qbo_connection) → **ProxyAgent**
+  - "Run balance sheet review for client X" → **ReviewAgent** (run_balance_sheet_review) → **ProxyAgent**
+  - "What were the findings from run <run_id>?" → **ReviewAgent** (get_balance_sheet_review) → **ProxyAgent**
+  - "Why did cash fail?" or follow-up questions → **ReviewAgent** (get_balance_sheet_review with prior run_id) → **ProxyAgent**
 
-FLEXIBLE FLOW — NOT every query requires all agents. Route based on user intent:
-  - "Is QBO connected?" or "check QBO status" → **ConnectorAgent** only → **ProxyAgent**
-  - "Show me the balance sheet / P&L data" → **ConnectorAgent** (fetch) → **ProxyAgent**
-  - "Run only rule BS-CASH-BALANCE" → **ConnectorAgent** → **NormalizationAgent** → **RulesAgent** (with rule_ids) → **ReportAgent**
-  - "What were the findings from run <run_id>?" → **ReportAgent** (reads stored run) → **ProxyAgent**
-  - "Full balance sheet review" → full 5-agent pipeline above (ALL FIVE agents, no skipping)
-  - "What rules are available?" → **RulesAgent** (calls bs_list_rules) → **ProxyAgent**
-
-If the ConnectorAgent reports QBO disconnected or unauthorized, terminate the workflow immediately after providing the connect URL through ProxyAgent, and do not invoke the remaining agents.
-If any agent reports a transient tool or network failure (for example timeout, JSON parse on timeout text, or temporary 5xx), retry the same step up to 2 times before escalating to ProxyAgent.
+If ReviewAgent reports QBO disconnected or unauthorized, terminate the workflow immediately after providing the connect URL through ProxyAgent, and do not attempt the review.
+If ReviewAgent reports a transient tool or network failure, retry the same step up to 2 times before escalating to ProxyAgent.
+For follow-up questions about a previous review, ReviewAgent uses the same run_id from context and calls get_balance_sheet_review — do NOT trigger a new run unless the user explicitly requests a fresh review.
 """
 
         final_append = """
@@ -182,6 +175,26 @@ BALANCE SHEET REVIEW OUTPUT FORMAT — When the task involves a balance sheet re
             orchestration_config.plans[self.magentic_plan.id] = self.magentic_plan
         except Exception as e:
             logger.error("Error processing plan approval: %s", e)
+
+        # Auto-approve standard balance sheet review workflows — no user friction needed.
+        _BALANCE_SHEET_REVIEW_PATTERNS = (
+            "balance sheet review",
+            "mer review",
+            "balance-sheet review",
+            "run.*review",
+            "review.*balance sheet",
+        )
+        import re as _re
+        _task_lower = task_text.lower()
+        _is_standard_bs_review = any(
+            _re.search(pat, _task_lower) for pat in _BALANCE_SHEET_REVIEW_PATTERNS
+        )
+        if _is_standard_bs_review:
+            logger.info(
+                "Auto-approving plan for standard balance sheet review (task=%s)",
+                task_text[:120],
+            )
+            return plan_message
 
         # Send approval request
         await connection_config.send_status_update_async(

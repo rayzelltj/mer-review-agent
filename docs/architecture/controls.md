@@ -2,6 +2,28 @@
 
 This file inventories the major security-relevant boundaries and control points inferred from the repo, plus items to confirm against the live Azure environment.
 
+## Live Validation Snapshot (2026-02-21)
+
+Verified against deployed backend container app `ca-prodmvpwrf6y` in `RG-Automation_Engine-001`:
+- Backend FQDN resolves and readiness probe responds:
+  - `GET /readyz` -> `200 {"status":"ready"}`
+- Auth-sensitive endpoints reject unauthenticated requests:
+  - `GET /api/qbo/status` -> `401 Unauthorized`
+- Backend auth env posture (non-secret values):
+  - `EASYAUTH_ENABLED=true`
+  - `AAD_TOKEN_VALIDATION_ENABLED=true`
+  - `ALLOW_UNVERIFIED_IDENTITY_HEADERS=false`
+  - `AAD_ALLOWED_AUDIENCES` includes:
+    - `55483d14-3ac8-42dd-9a68-232417237515`
+    - `api://55483d14-3ac8-42dd-9a68-232417237515`
+    - `d013cea5-1c02-403c-95c3-60fbe22be086`
+    - `api://d013cea5-1c02-403c-95c3-60fbe22be086`
+
+Current blocker for fully automated API smoke from Azure CLI:
+- `az account get-access-token --resource api://<allowed-audience>` returns `AADSTS65001` (missing tenant consent for Azure CLI app).
+- Required one-time action:
+  - `az login --tenant "<tenant-id>" --scope "api://<allowed-audience>/.default"`
+
 ## Trust Boundaries
 
 1) **User Browser (Internet) -> Frontend Web App (App Service)**

@@ -1,10 +1,41 @@
 import React from "react";
 import { Button, Input, Popover, PopoverSurface, PopoverTrigger } from "@fluentui/react-components";
 import { PlugConnected20Regular } from "@fluentui/react-icons";
+import { getStoredReviewClientId, setStoredReviewClientId } from "@/services/QboReviewContextService";
 
-const QboConnectButton: React.FC = () => {
-    const [clientId, setClientId] = React.useState("");
-    const normalizedClientId = (clientId || "").trim();
+interface QboConnectButtonProps {
+    clientId?: string;
+    onClientIdChange?: (clientId: string) => void;
+}
+
+const QboConnectButton: React.FC<QboConnectButtonProps> = ({
+    clientId,
+    onClientIdChange,
+}) => {
+    const [draftClientId, setDraftClientId] = React.useState<string>(
+        () => String((clientId ?? getStoredReviewClientId()) || "").trim()
+    );
+    const effectiveClientId = clientId !== undefined ? clientId : draftClientId;
+
+    React.useEffect(() => {
+        if (clientId === undefined) {
+            return;
+        }
+        setDraftClientId(clientId);
+    }, [clientId]);
+
+    const handleClientIdChange = React.useCallback(
+        (nextValue: string) => {
+            setDraftClientId(nextValue);
+            const normalized = String(nextValue || "").trim();
+            setStoredReviewClientId(normalized);
+            onClientIdChange?.(normalized);
+        },
+        [onClientIdChange]
+    );
+
+    const clientIdValue = String(effectiveClientId || "");
+    const normalizedClientId = clientIdValue.trim();
     const connectHref = normalizedClientId
         ? `/qbo/connect?client_id=${encodeURIComponent(normalizedClientId)}`
         : "#";
@@ -25,8 +56,8 @@ const QboConnectButton: React.FC = () => {
                     Connect QuickBooks for the client you want to review.
                 </div>
                 <Input
-                    value={clientId}
-                    onChange={(_, data) => setClientId(data.value)}
+                    value={clientIdValue}
+                    onChange={(_, data) => handleClientIdChange(data.value)}
                     placeholder="Client ID (for example: example_client)"
                 />
                 <Button

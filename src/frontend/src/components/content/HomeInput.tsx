@@ -2,6 +2,7 @@ import {
   Body1Strong,
   Button,
   Caption1,
+  Input,
   Title2
 } from "@fluentui/react-components";
 
@@ -15,8 +16,16 @@ import "./../../styles/HomeInput.css";
 import { HomeInputProps, iconMap, QuickTask } from "../../models/homeInput";
 import { TaskService } from "../../services/TaskService";
 import { NewTaskService } from "../../services/NewTaskService";
-import { apiService } from "@/api";
+import { apiClient, apiService } from "@/api";
 import { APIClientError } from "@/api/apiClient";
+import {
+  getStoredReviewClientId,
+  getStoredReviewPeriodEnd,
+  setStoredReviewClientId,
+  setStoredReviewPeriodEnd,
+} from "@/services/QboReviewContextService";
+import { buildMerReviewPrompt } from "@/utils/merReviewPrompt";
+import { useQboStatus } from "@/hooks/useQboStatus";
 
 import ChatInput from "@/coral/modules/ChatInput";
 import InlineToaster, { useInlineToaster } from "../toast/InlineToaster";
@@ -59,11 +68,21 @@ interface ExtendedQuickTask extends QuickTask {
   fullDescription: string; // Store the full, untruncated description
 }
 
-const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
+const HomeInput: React.FC<HomeInputProps> = ({
+  selectedTeam,
+  qboClientId,
+  onQboClientIdChange,
+}) => {
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [input, setInput] = useState<string>("");
   const [activeRunPlanId, setActiveRunPlanId] = useState<string | null>(null);
   const [activeRunMessage, setActiveRunMessage] = useState<string>("");
+  const [reviewClientId, setReviewClientId] = useState<string>(
+    () => String(qboClientId || getStoredReviewClientId() || "").trim()
+  );
+  const [reviewPeriodEnd, setReviewPeriodEnd] = useState<string>(
+    () => getStoredReviewPeriodEnd()
+  );
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
@@ -74,6 +93,43 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
   const isLegalTeam = selectedTeam?.name
     ?.toLowerCase()
     .includes("contract compliance");
+  const isBalanceSheetTeam = selectedTeam?.name
+    ?.toLowerCase()
+    .includes("balance sheet review");
+
+  // QBO connection status — only polled when the balance sheet team is active.
+  // Used to hard-disable the submit button so users can't accidentally queue a
+  // review without QBO credentials (soft gate in handleSubmit remains as backup).
+  const { status: qboStatus } = useQboStatus({
+    clientId: isBalanceSheetTeam ? (reviewClientId || "") : "",
+  });
+  // Disable the submit button when we know QBO is disconnected (not just loading).
+  // loading / error states leave the button enabled; verifyQboConnection() handles those.
+  const isQboDisconnected =
+    isBalanceSheetTeam &&
+    !!reviewClientId?.trim() &&
+    qboStatus.state === "disconnected";
+
+  useEffect(() => {
+    const normalized = String(qboClientId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setReviewClientId(normalized);
+  }, [qboClientId]);
+
+  const updateReviewClientId = (value: string) => {
+    setReviewClientId(value);
+    const normalized = String(value || "").trim();
+    setStoredReviewClientId(normalized);
+    onQboClientIdChange?.(normalized);
+  };
+
+  const updateReviewPeriodEnd = (value: string) => {
+    const normalized = String(value || "").trim();
+    setReviewPeriodEnd(normalized);
+    setStoredReviewPeriodEnd(normalized);
+  };
 
   useEffect(() => {
     if (location.state?.focusInput) {
@@ -145,75 +201,134 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
     }
   };
 
+  const submitPlan = async (prompt: string) => {
+    const trimmedPrompt = String(prompt || "").trim();
+    if (!trimmedPrompt) {
+      return;
+    }
+
+    setSubmitting(true);
+    let id = showToast("Creating a plan", "progress");
+
+    try {
+      const status = await apiService.getRunStatus();
+      if (status?.active && status.plan_id) {
+        dismissToast(id);
+        setActiveRunPlanId(status.plan_id);
+        setActiveRunMessage(
+          `Run in progress (run_id: ${status.run_id || "unknown"}). Open the active stream.`
+        );
+        showToast("Run already in progress. Opening active stream.", "progress");
+        navigate(`/plan/${status.plan_id}`);
+        return;
+      }
+
+      const response = await TaskService.createPlan(
+        trimmedPrompt,
+        selectedTeam?.team_id
+      );
+      console.log("Plan created:", response);
+      setInput("");
+
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "auto";
+      }
+
+      if (response.plan_id && response.plan_id !== null) {
+        showToast("Plan created!", "success");
+        dismissToast(id);
+        navigate(`/plan/${response.plan_id}`);
+      } else {
+        showToast("Failed to create plan", "error");
+        dismissToast(id);
+      }
+    } catch (error: any) {
+      console.log("Error creating plan:", error);
+      let errorMessage = "Unable to create plan. Please try again.";
+      if (error instanceof APIClientError && error.status === 409) {
+        const detail = error.data?.detail || error.data || {};
+        const planId = detail?.plan_id || null;
+        const runId = detail?.run_id || "unknown";
+        if (planId) {
+          setActiveRunPlanId(planId);
+          setActiveRunMessage(
+            `Run in progress (run_id: ${runId}). Open the active stream.`
+          );
+          dismissToast(id);
+          showToast("Run already in progress. Opening active stream.", "progress");
+          navigate(`/plan/${planId}`);
+          return;
+        }
+        errorMessage = detail?.message || "Run already in progress.";
+      } else if (error?.message) {
+        errorMessage = String(error.message);
+      }
+      dismissToast(id);
+      showToast(errorMessage, "error");
+    } finally {
+      setInput("");
+      setSubmitting(false);
+    }
+  };
+
+  const verifyQboConnection = async (clientId: string): Promise<boolean> => {
+    try {
+      const payload = await apiClient.get("/qbo/status", {
+        params: { client_id: clientId },
+      });
+      if (payload?.connected) {
+        return true;
+      }
+      showToast(
+        `QuickBooks is not connected for "${clientId}". Connect QBO before starting the review.`,
+        "warning"
+      );
+      return false;
+    } catch (error: any) {
+      const message = error instanceof Error ? error.message : "Unable to verify QBO connection.";
+      showToast(message, "error");
+      return false;
+    }
+  };
+
   const handleSubmit = async () => {
     if (activeRunPlanId) {
       await handleOpenActiveStream();
       return;
     }
-    if (input.trim()) {
-      setSubmitting(true);
-      let id = showToast("Creating a plan", "progress");
 
-      try {
-        const status = await apiService.getRunStatus();
-        if (status?.active && status.plan_id) {
-          dismissToast(id);
-          setActiveRunPlanId(status.plan_id);
-          setActiveRunMessage(
-            `Run in progress (run_id: ${status.run_id || "unknown"}). Open the active stream.`
-          );
-          showToast("Run already in progress. Opening active stream.", "progress");
-          navigate(`/plan/${status.plan_id}`);
-          return;
-        }
-
-        const response = await TaskService.createPlan(
-          input.trim(),
-          selectedTeam?.team_id
-        );
-        console.log("Plan created:", response);
-        setInput("");
-
-        if (textareaRef.current) {
-          textareaRef.current.style.height = "auto";
-        }
-
-        if (response.plan_id && response.plan_id !== null) {
-          showToast("Plan created!", "success");
-          dismissToast(id);
-
-          navigate(`/plan/${response.plan_id}`);
-        } else {
-          showToast("Failed to create plan", "error");
-          dismissToast(id);
-        }
-      } catch (error: any) {
-        console.log("Error creating plan:", error);
-        let errorMessage = "Unable to create plan. Please try again.";
-        if (error instanceof APIClientError && error.status === 409) {
-          const detail = error.data?.detail || error.data || {};
-          const planId = detail?.plan_id || null;
-          const runId = detail?.run_id || "unknown";
-          if (planId) {
-            setActiveRunPlanId(planId);
-            setActiveRunMessage(
-              `Run in progress (run_id: ${runId}). Open the active stream.`
-            );
-            dismissToast(id);
-            showToast("Run already in progress. Opening active stream.", "progress");
-            navigate(`/plan/${planId}`);
-            return;
-          }
-          errorMessage = detail?.message || "Run already in progress.";
-        } else if (error?.message) {
-          errorMessage = String(error.message);
-        }
-        dismissToast(id);
-        showToast(errorMessage, "error");
-      } finally {
-        setInput("");
-        setSubmitting(false);
+    if (isBalanceSheetTeam) {
+      const normalizedClientId = String(reviewClientId || "").trim();
+      const normalizedPeriodEnd = String(reviewPeriodEnd || "").trim();
+      if (!normalizedClientId) {
+        showToast("Enter a client ID before starting a MER review.", "error");
+        return;
       }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedPeriodEnd)) {
+        showToast("Choose a valid period end date (YYYY-MM-DD).", "error");
+        return;
+      }
+
+      setStoredReviewClientId(normalizedClientId);
+      setStoredReviewPeriodEnd(normalizedPeriodEnd);
+      onQboClientIdChange?.(normalizedClientId);
+
+      const connected = await verifyQboConnection(normalizedClientId);
+      if (!connected) {
+        return;
+      }
+
+      const prompt = buildMerReviewPrompt(
+        normalizedClientId,
+        normalizedPeriodEnd,
+        input
+      );
+      await submitPlan(prompt);
+      return;
+    }
+
+    if (input.trim()) {
+      await submitPlan(input.trim());
     }
   };
 
@@ -237,18 +352,30 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
       ? selectedTeam.starting_tasks.map((task, index) => {
           // Handle both string tasks and StartingTask objects
           if (typeof task === "string") {
+            const fullDescription = isBalanceSheetTeam
+              ? "Run the standard balance sheet review."
+              : task;
             return {
               id: `team-task-${index}`,
               title: task,
-              description: truncateDescription(task),
-              fullDescription: task, // Store the full description
+              description: truncateDescription(fullDescription),
+              fullDescription,
               icon: getIconFromString("📋"),
             };
           } else {
             // Handle StartingTask objects
             const startingTask = task as any; // Type assertion for now
-            const taskDescription =
+            const rawTaskDescription =
               startingTask.prompt || startingTask.name || "Task description";
+            const normalizedTaskText = String(
+              `${startingTask.name || ""} ${startingTask.prompt || ""}`
+            ).toLowerCase();
+            const isStandardBalanceSheetTask =
+              isBalanceSheetTeam &&
+              normalizedTaskText.includes("balance sheet review");
+            const taskDescription = isStandardBalanceSheetTask
+              ? "Run the standard balance sheet review."
+              : rawTaskDescription;
             return {
               id: startingTask.id || `team-task-${index}`,
               title: startingTask.name || startingTask.prompt || "Task",
@@ -300,19 +427,70 @@ const HomeInput: React.FC<HomeInputProps> = ({ selectedTeam }) => {
                         />
                     )} */}
 
+          {isBalanceSheetTeam && (
+            <div
+              style={{
+                marginBottom: "12px",
+                width: "100%",
+                maxWidth: "820px",
+                border: "1px solid var(--colorNeutralStroke2)",
+                borderRadius: "8px",
+                padding: "10px",
+                background: "var(--colorNeutralBackground1)",
+              }}
+            >
+              <div
+                style={{
+                  display: "grid",
+                  gap: "8px",
+                  gridTemplateColumns: "1.5fr 1fr auto",
+                  alignItems: "center",
+                }}
+              >
+                <Input
+                  value={reviewClientId}
+                  placeholder="Client ID (required)"
+                  onChange={(_, data) => updateReviewClientId(data.value)}
+                  disabled={submitting || !!activeRunPlanId}
+                />
+                <Input
+                  type="date"
+                  value={reviewPeriodEnd}
+                  onChange={(_, data) => updateReviewPeriodEnd(data.value)}
+                  disabled={submitting || !!activeRunPlanId}
+                />
+                <Button
+                  appearance="secondary"
+                  onClick={handleSubmit}
+                  disabled={submitting || !!activeRunPlanId || isQboDisconnected}
+                  title={isQboDisconnected ? "Connect QuickBooks before starting a review" : undefined}
+                >
+                  Run MER Review
+                </Button>
+              </div>
+              <Caption1>
+                Client + period are persisted and reused for each balance sheet review run.
+              </Caption1>
+            </div>
+          )}
+
           <ChatInput
             ref={textareaRef} // forwarding
             value={input}
-            placeholder="Tell us what needs planning, building, or connecting—we'll handle the rest."
+            placeholder={
+              isBalanceSheetTeam
+                ? "Optional reviewer notes (for example: focus on cash and AP anomalies)."
+                : "Tell us what needs planning, building, or connecting—we'll handle the rest."
+            }
             onChange={setInput}
             onEnter={handleSubmit}
-            disabledChat={submitting || !!activeRunPlanId}
+            disabledChat={submitting || !!activeRunPlanId || isQboDisconnected}
           >
             <Button
               appearance="subtle"
               className="home-input-send-button"
               onClick={handleSubmit}
-              disabled={submitting || !!activeRunPlanId}
+              disabled={submitting || !!activeRunPlanId || isQboDisconnected}
               icon={<Send />}
             />
           </ChatInput>

@@ -8,6 +8,11 @@ Diagrams:
 - `docs/architecture/diagrams/data-flow-dfd.mmd`
 - `docs/architecture/diagrams/auth-sequence.mmd`
 
+Companion spec for contributors and AI assistants:
+- `docs/architecture/project-spec.md`
+- `docs/architecture/mer-review-agent-spec.md`
+- `docs/architecture/mer-mvp1-smoke-checklist.md`
+
 ## Evidence Used (Primary Repo Sources)
 
 Runtime/service entrypoints:
@@ -122,12 +127,23 @@ This preserves “act as user” semantics for operations like QBO access, while
 ### 3) QBO OAuth (Intuit QuickBooks Online)
 
 Key endpoints:
-- Start connect: `/api/qbo/connect/start` (redirect to Intuit authorize)
-- Callback: `/api/qbo/connect/callback` (exchange code for tokens)
+- API prepare/start:
+  - `GET /api/qbo/connect/prepare?client_id=...` (returns authorization URL)
+  - `GET /api/qbo/connect/start?client_id=...` (redirects to Intuit authorize)
+- API callback:
+  - `GET /api/qbo/callback?code=...&realmId=...&state=...` (exchanges code for tokens)
+- Frontend pages:
+  - `/qbo/connect` (initiates backend prepare call)
+  - `/qbo/callback` (forwards OAuth query to `/api/qbo/callback`)
 
 Storage behavior (repo default):
-- OAuth `state` is stored either in Cosmos (preferred in non-dev) or in-memory fallback.
+- OAuth `state` is stored in Cosmos when `QBO_CLIENT_STORE=cosmos` and in-memory only in file/dev mode.
+- In Cosmos mode, OAuth state store failures return `503` (no silent fallback).
 - Refresh tokens are stored in Cosmos in records like `qbo_client::<user_principal_id>::<client_id>` (`src/backend/connectors/qbo/client_store.py`).
+
+Operational smoke guide:
+- `docs/architecture/mer-mvp1-smoke-checklist.md`
+- `scripts/smoke/mer_mvp1_api_smoke.sh`
 
 Config keys (redacted):
 - `QBO_CLIENT_ID=<...>`
@@ -160,6 +176,11 @@ Production release controls:
   - staging deploy, promote, rollback, and health checks (production-touching operations are guarded by `confirm=yes` or `--confirm`).
 
 ## Unknowns / TBD (Need Live Azure Confirmation)
+
+Partial live confirmation captured on 2026-02-21 (see `docs/architecture/controls.md`):
+- backend `ca-prodmvpwrf6y` readiness endpoint responds
+- backend auth is enforced (`401` on protected route without valid token)
+- token acquisition for allowed API audiences is currently blocked for Azure CLI by tenant consent (`AADSTS65001`)
 
 Marking these as **TBD** until live discovery outputs are provided:
 - Exact resource names for your deployed environment (RG name, suffixes, app names).
@@ -242,4 +263,3 @@ az network private-dns zone list -g "$RG" --query "[].name" -o json
 ```
 
 When you paste or save outputs, avoid any commands that print secret values (e.g., listing Key Vault secrets, ACR creds, search admin keys, containerapp secret values).
-

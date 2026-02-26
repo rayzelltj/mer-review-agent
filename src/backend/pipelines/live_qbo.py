@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import calendar
+import concurrent.futures
 import json
 import logging
 import os
@@ -85,6 +87,7 @@ INTERCOMPANY_NAME_PATTERNS = (
     "shareholder loan",
 )
 LOGGER = logging.getLogger(__name__)
+_QBO_FETCH_CONCURRENCY = int(os.getenv("QBO_FETCH_CONCURRENCY", "5"))
 
 
 class LiveQBODataSource:
@@ -106,14 +109,14 @@ class LiveQBODataSource:
             self._clients = {}
         self._snapshot_store = snapshot_store or _default_snapshot_store()
 
-    def fetch_raw_data(self, *, client_id: str, period_end: date) -> dict[str, Any]:
+    def fetch_raw_data(self, *, client_id: str, period_end: date | str) -> dict[str, Any]:
         """Phase 1: Fetch all raw QBO API payloads and save them as snapshots.
 
-        Does NOT run normalization (no build_qbo_snapshots / build_qbo_aging_evidence etc.).
-        Returns a serializable dict of raw payloads so the caller can persist it as an artifact
-        for the normalization phase.  All payloads are also saved individually via the snapshot
-        store so the NormalizationAgent can inspect them with list_snapshots / get_snapshot.
+        [PARALLELIZED] Uses a ThreadPoolExecutor to run independent QBO API calls
+        concurrently (up to _QBO_FETCH_CONCURRENCY at a time).  The interface and
+        returned dict are identical to the sequential version.
         """
+        period_end = _coerce_period_end(period_end, context="fetch_raw_data")
         client = self._get_client_config(client_id)
         if client is None:
             if self._client_store_mode == "cosmos":
@@ -133,15 +136,76 @@ class LiveQBODataSource:
             "period_end": period_end.isoformat(),
         }
 
+        # Compute derived dates before entering the traced phase.
+        pnl_start = _first_day_months_ago(period_end, 4)
+        pnl_monthly_start = _first_day_months_ago(period_end, 1)
+        trial_balance_start = date(period_end.year, period_end.month, 1)
+        tx_list_start = date(period_end.year, period_end.month, 1).isoformat()
+        prior_period_ends = [_month_end_months_ago(period_end, m) for m in range(1, 4)]
+
+        # Drive manifest is fast and needed for tx list date ranges — fetch before Round 1.
+        manifest_payload, drive_items = _load_drive_manifest_evidence(
+            client_id=client_id,
+            period_end=period_end,
+            user_principal_id=self._user_principal_id,
+        )
+        statement_end_by_ref, statement_end_by_id = _statement_end_dates_by_account(drive_items)
+
         with traced_phase(
             "balance_sheet.connector",
             logger=LOGGER,
             attributes={"client.id": client_id, "qbo.realm_id": primary_config.realm_id},
         ):
-            balance_sheet_report = fetch_balance_sheet(
-                primary_config,
-                end_date=period_end.isoformat(),
-            )
+            # ── Round 1: submit all independent QBO fetches concurrently ─────────
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_QBO_FETCH_CONCURRENCY) as _pool:
+                _f_bs = _pool.submit(
+                    fetch_balance_sheet, primary_config, end_date=period_end.isoformat()
+                )
+                _f_prior = [
+                    _pool.submit(
+                        fetch_balance_sheet, primary_config, end_date=ppe.isoformat()
+                    )
+                    for ppe in prior_period_ends
+                ]
+                _f_pnl = _pool.submit(
+                    fetch_profit_and_loss,
+                    primary_config,
+                    start_date=pnl_start.isoformat(),
+                    end_date=period_end.isoformat(),
+                )
+                _f_pnl_monthly = _pool.submit(
+                    fetch_profit_and_loss,
+                    primary_config,
+                    start_date=pnl_monthly_start.isoformat(),
+                    end_date=period_end.isoformat(),
+                    summarize_column_by="Month",
+                )
+                _f_tb = _pool.submit(
+                    fetch_trial_balance,
+                    primary_config,
+                    start_date=trial_balance_start.isoformat(),
+                    end_date=period_end.isoformat(),
+                )
+                _f_accounts = _pool.submit(fetch_accounts_all, primary_config)
+                _f_ap_s = _pool.submit(
+                    fetch_aged_payables_summary, primary_config, as_of_date=period_end.isoformat()
+                )
+                _f_ap_d = _pool.submit(
+                    fetch_aged_payables_detail, primary_config, as_of_date=period_end.isoformat()
+                )
+                _f_ar_s = _pool.submit(
+                    fetch_aged_receivables_summary, primary_config, as_of_date=period_end.isoformat()
+                )
+                _f_ar_d = _pool.submit(
+                    fetch_aged_receivables_detail, primary_config, as_of_date=period_end.isoformat()
+                )
+                _f_tax_agencies = _pool.submit(fetch_tax_agencies_payload, primary_config)
+                _f_tax_returns = _pool.submit(fetch_tax_returns_payload, primary_config)
+                _f_tax_payments = _pool.submit(fetch_tax_payments_payload, primary_config)
+            # All Round-1 futures are resolved when the `with` block exits.
+
+            # ── Collect + validate + save: current balance sheet ─────────────────
+            balance_sheet_report = _f_bs.result()
             self._snapshot_store.save_json(
                 client_id=client_id,
                 period_end=period_end,
@@ -165,12 +229,44 @@ class LiveQBODataSource:
             )
             raw["qbo_balance_sheet"] = balance_sheet_report
 
-            pnl_start = _first_day_months_ago(period_end, 4)
-            profit_and_loss_report = fetch_profit_and_loss(
-                primary_config,
-                start_date=pnl_start.isoformat(),
-                end_date=period_end.isoformat(),
-            )
+            # ── Collect + validate + save: prior balance sheets ──────────────────
+            prior_balance_sheets_raw: list[dict[str, Any]] = []
+            for months_back, (prior_period_end, _f) in enumerate(
+                zip(prior_period_ends, _f_prior), start=1
+            ):
+                prior_report = _f.result()
+                snapshot_name = f"qbo_balance_sheet_prior_{months_back}"
+                self._snapshot_store.save_json(
+                    client_id=client_id,
+                    period_end=period_end,
+                    name=snapshot_name,
+                    payload=prior_report,
+                )
+                _validate_report_payload(
+                    prior_report,
+                    endpoint=_format_endpoint(
+                        primary_config.base_url,
+                        f"/v3/company/{primary_config.realm_id}/reports/BalanceSheet",
+                        {
+                            "end_date": prior_period_end.isoformat(),
+                            "accounting_method": "Accrual",
+                        },
+                    ),
+                    snapshot_name=snapshot_name,
+                    client_id=client_id,
+                    period_end=period_end,
+                    header_keys=("EndPeriod",),
+                )
+                prior_balance_sheets_raw.append(
+                    {
+                        "period_end": prior_period_end.isoformat(),
+                        "payload": prior_report,
+                    }
+                )
+            raw["qbo_balance_sheets_prior"] = prior_balance_sheets_raw
+
+            # ── Collect + validate + save: P&L ───────────────────────────────────
+            profit_and_loss_report = _f_pnl.result()
             self._snapshot_store.save_json(
                 client_id=client_id,
                 period_end=period_end,
@@ -195,15 +291,10 @@ class LiveQBODataSource:
             )
             raw["qbo_profit_and_loss"] = profit_and_loss_report
 
+            # ── Collect + validate + save: P&L monthly (optional) ────────────────
             profit_and_loss_monthly_report: dict[str, Any] | None = None
-            pnl_monthly_start = _first_day_months_ago(period_end, 1)
             try:
-                profit_and_loss_monthly_report = fetch_profit_and_loss(
-                    primary_config,
-                    start_date=pnl_monthly_start.isoformat(),
-                    end_date=period_end.isoformat(),
-                    summarize_column_by="Month",
-                )
+                profit_and_loss_monthly_report = _f_pnl_monthly.result()
                 self._snapshot_store.save_json(
                     client_id=client_id,
                     period_end=period_end,
@@ -236,12 +327,8 @@ class LiveQBODataSource:
                 )
             raw["qbo_profit_and_loss_monthly"] = profit_and_loss_monthly_report
 
-            trial_balance_start = date(period_end.year, period_end.month, 1)
-            trial_balance_report = fetch_trial_balance(
-                primary_config,
-                start_date=trial_balance_start.isoformat(),
-                end_date=period_end.isoformat(),
-            )
+            # ── Collect + validate + save: trial balance ──────────────────────────
+            trial_balance_report = _f_tb.result()
             self._snapshot_store.save_json(
                 client_id=client_id,
                 period_end=period_end,
@@ -266,7 +353,8 @@ class LiveQBODataSource:
             )
             raw["qbo_trial_balance"] = trial_balance_report
 
-            accounts_payload = fetch_accounts_all(primary_config)
+            # ── Collect + validate + save: accounts ───────────────────────────────
+            accounts_payload = _f_accounts.result()
             self._snapshot_store.save_json(
                 client_id=client_id,
                 period_end=period_end,
@@ -288,24 +376,22 @@ class LiveQBODataSource:
             )
             raw["qbo_accounts"] = accounts_payload
 
-            manifest_payload, drive_items = _load_drive_manifest_evidence(
-                client_id=client_id,
-                period_end=period_end,
-                user_principal_id=self._user_principal_id,
-            )
-            statement_end_by_ref, statement_end_by_id = _statement_end_dates_by_account(drive_items)
-
+            # ── Round 2: transaction lists (depend on accounts) ───────────────────
             bank_cc_scope = active_bank_cc_accounts_from_accounts_payload(
                 accounts_payload,
                 realm_id=primary_config.realm_id,
                 active_only=True,
             )
-            tx_list_payloads: list[dict[str, Any]] = []
-            tx_list_start = date(period_end.year, period_end.month, 1).isoformat()
-            for scoped_account in bank_cc_scope:
+            fixed_asset_scope = active_fixed_asset_accounts_from_accounts_payload(
+                accounts_payload,
+                realm_id=primary_config.realm_id,
+                active_only=True,
+            )
+
+            def _fetch_bank_cc_tx(scoped_account: dict) -> dict[str, Any] | None:
                 account_id = str(scoped_account.get("account_id") or "").strip()
                 if not account_id:
-                    continue
+                    return None
                 account_ref = str(scoped_account.get("account_ref") or "").strip()
                 statement_end_date = (
                     statement_end_by_ref.get(account_ref)
@@ -319,33 +405,28 @@ class LiveQBODataSource:
                     end_date=statement_end_date.isoformat(),
                     include_split_detail=True,
                 )
-                tx_list_payloads.append(
-                    {
-                        "account_id": account_id,
-                        "account_ref": account_ref,
-                        "account_name": scoped_account.get("account_name"),
-                        "statement_end_date": statement_end_date.isoformat()
-                        if isinstance(statement_end_date, date) else str(statement_end_date),
-                        "payload": tx_payload,
-                    }
-                )
                 self._snapshot_store.save_json(
                     client_id=client_id,
                     period_end=period_end,
                     name=f"qbo_transaction_list_by_account_{account_id}",
                     payload=tx_payload,
                 )
+                return {
+                    "account_id": account_id,
+                    "account_ref": account_ref,
+                    "account_name": scoped_account.get("account_name"),
+                    "statement_end_date": (
+                        statement_end_date.isoformat()
+                        if isinstance(statement_end_date, date)
+                        else str(statement_end_date)
+                    ),
+                    "payload": tx_payload,
+                }
 
-            fixed_asset_scope = active_fixed_asset_accounts_from_accounts_payload(
-                accounts_payload,
-                realm_id=primary_config.realm_id,
-                active_only=True,
-            )
-            fixed_asset_tx_payloads: list[dict[str, Any]] = []
-            for scoped_account in fixed_asset_scope:
+            def _fetch_fixed_asset_tx(scoped_account: dict) -> dict[str, Any] | None:
                 account_id = str(scoped_account.get("account_id") or "").strip()
                 if not account_id:
-                    continue
+                    return None
                 try:
                     tx_payload = fetch_transaction_list_by_account(
                         primary_config,
@@ -362,27 +443,39 @@ class LiveQBODataSource:
                         period_end,
                         exc,
                     )
-                    continue
-
-                fixed_asset_tx_payloads.append(
-                    {
-                        "account_id": account_id,
-                        "account_ref": str(scoped_account.get("account_ref") or "").strip(),
-                        "account_name": scoped_account.get("account_name"),
-                        "payload": tx_payload,
-                    }
-                )
+                    return None
                 self._snapshot_store.save_json(
                     client_id=client_id,
                     period_end=period_end,
                     name=f"qbo_transaction_list_fixed_asset_{account_id}",
                     payload=tx_payload,
                 )
+                return {
+                    "account_id": account_id,
+                    "account_ref": str(scoped_account.get("account_ref") or "").strip(),
+                    "account_name": scoped_account.get("account_name"),
+                    "payload": tx_payload,
+                }
 
-            ap_summary = fetch_aged_payables_summary(primary_config, as_of_date=period_end.isoformat())
-            ap_detail = fetch_aged_payables_detail(primary_config, as_of_date=period_end.isoformat())
-            ar_summary = fetch_aged_receivables_summary(primary_config, as_of_date=period_end.isoformat())
-            ar_detail = fetch_aged_receivables_detail(primary_config, as_of_date=period_end.isoformat())
+            tx_list_payloads: list[dict[str, Any]] = []
+            fixed_asset_tx_payloads: list[dict[str, Any]] = []
+            bank_cc_list = list(bank_cc_scope)
+            fixed_asset_list = list(fixed_asset_scope)
+
+            if bank_cc_list or fixed_asset_list:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_QBO_FETCH_CONCURRENCY
+                ) as _pool:
+                    _f_tx = [_pool.submit(_fetch_bank_cc_tx, a) for a in bank_cc_list]
+                    _f_fa = [_pool.submit(_fetch_fixed_asset_tx, a) for a in fixed_asset_list]
+                tx_list_payloads = [r for f in _f_tx if (r := f.result()) is not None]
+                fixed_asset_tx_payloads = [r for f in _f_fa if (r := f.result()) is not None]
+
+            # ── Collect + validate + save: AP/AR aging ────────────────────────────
+            ap_summary = _f_ap_s.result()
+            ap_detail = _f_ap_d.result()
+            ar_summary = _f_ar_s.result()
+            ar_detail = _f_ar_d.result()
 
             self._snapshot_store.save_json(
                 client_id=client_id,
@@ -461,9 +554,10 @@ class LiveQBODataSource:
             raw["qbo_aged_receivables_summary"] = ar_summary
             raw["qbo_aged_receivables_detail"] = ar_detail
 
-            tax_agencies_payload = fetch_tax_agencies_payload(primary_config)
-            tax_returns_payload = fetch_tax_returns_payload(primary_config)
-            tax_payments_payload = fetch_tax_payments_payload(primary_config)
+            # ── Collect + validate + save: tax ────────────────────────────────────
+            tax_agencies_payload = _f_tax_agencies.result()
+            tax_returns_payload = _f_tax_returns.result()
+            tax_payments_payload = _f_tax_payments.result()
 
             self._snapshot_store.save_json(
                 client_id=client_id,
@@ -520,6 +614,7 @@ class LiveQBODataSource:
             raw["qbo_tax_returns"] = tax_returns_payload
             raw["qbo_tax_payments"] = tax_payments_payload
 
+            # ── Counterparty balance sheets ────────────────────────────────────────
             counterparty_payloads: list[dict[str, Any]] = []
             if client.counterparties:
                 counterparty_configs = [
@@ -596,6 +691,29 @@ class LiveQBODataSource:
         tax_agencies_payload = raw["qbo_tax_agencies"]
         tax_returns_payload = raw["qbo_tax_returns"]
         tax_payments_payload = raw["qbo_tax_payments"]
+        prior_balance_sheet_reports_raw: list[dict[str, Any]] = (
+            raw.get("qbo_balance_sheets_prior") or []
+        )
+        prior_balance_sheet_reports: list[tuple[date, dict[str, Any]]] = []
+        for entry in prior_balance_sheet_reports_raw:
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            period_end_raw = str(entry.get("period_end") or "").strip()
+            if not period_end_raw:
+                continue
+            try:
+                prior_period_end = date.fromisoformat(period_end_raw)
+            except ValueError:
+                LOGGER.warning(
+                    "Ignoring invalid prior balance sheet period_end '%s' for realm_id=%s",
+                    period_end_raw,
+                    realm_id,
+                )
+                continue
+            prior_balance_sheet_reports.append((prior_period_end, payload))
 
         # Re-hydrate tx_list_payloads — statement_end_date was serialized as ISO string
         tx_list_payloads_raw: list[dict[str, Any]] = raw.get("tx_list_payloads") or []
@@ -638,6 +756,29 @@ class LiveQBODataSource:
                 realm_id=realm_id,
                 pnl_summarize_by_month=False,
             )
+            prior_balance_sheets_list = []
+            for prior_period_end, prior_report in sorted(
+                prior_balance_sheet_reports,
+                key=lambda item: item[0],
+                reverse=True,
+            ):
+                try:
+                    prior_snapshot = balance_sheet_snapshot_from_report(
+                        prior_report,
+                        realm_id=realm_id,
+                        account_types=snapshots.account_type_map,
+                        include_rows_without_id=True,
+                        include_summary_totals=True,
+                    )
+                    prior_balance_sheets_list.append(prior_snapshot)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Failed to normalize prior balance sheet report period_end=%s realm_id=%s: %s",
+                        prior_period_end,
+                        realm_id,
+                        exc,
+                    )
+            prior_balance_sheets = tuple(prior_balance_sheets_list)
 
             tax_agencies = tax_agencies_from_payload(tax_agencies_payload)
             tax_returns = tax_returns_from_payload(tax_returns_payload)
@@ -808,14 +949,15 @@ class LiveQBODataSource:
         return ReviewInputs(
             period_end=period_end,
             balance_sheet=snapshots.balance_sheet,
-            prior_balance_sheets=(),
+            prior_balance_sheets=prior_balance_sheets,
             profit_and_loss=snapshots.profit_and_loss,
             evidence=EvidenceBundle(items=items),
             reconciliations=tuple(),
         )
 
-    def build_review_inputs(self, *, client_id: str, period_end: date) -> ReviewInputs:
+    def build_review_inputs(self, *, client_id: str, period_end: date | str) -> ReviewInputs:
         """Backward-compatible monolith: fetch raw data then normalize in one call."""
+        period_end = _coerce_period_end(period_end, context="build_review_inputs")
         raw = self.fetch_raw_data(client_id=client_id, period_end=period_end)
         return self.normalize_raw_data(raw=raw)
 
@@ -937,6 +1079,20 @@ def _config_for_realm(
     )
 
 
+def _coerce_period_end(period_end: date | str, *, context: str) -> date:
+    if isinstance(period_end, date):
+        return period_end
+    raw_value = str(period_end or "").strip()
+    if not raw_value:
+        raise ValueError(f"{context}: period_end is required (YYYY-MM-DD).")
+    try:
+        return date.fromisoformat(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{context}: invalid period_end '{raw_value}' (expected YYYY-MM-DD)."
+        ) from exc
+
+
 def _first_day_months_ago(period_end: date, months_back: int) -> date:
     if months_back < 0:
         raise ValueError("months_back must be >= 0")
@@ -946,6 +1102,18 @@ def _first_day_months_ago(period_end: date, months_back: int) -> date:
         month += 12
         year -= 1
     return date(year, month, 1)
+
+
+def _month_end_months_ago(period_end: date, months_back: int) -> date:
+    if months_back < 0:
+        raise ValueError("months_back must be >= 0")
+    year = period_end.year
+    month = period_end.month - months_back
+    while month <= 0:
+        month += 12
+        year -= 1
+    day = calendar.monthrange(year, month)[1]
+    return date(year, month, day)
 
 
 def _build_intercompany_payload(

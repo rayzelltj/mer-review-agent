@@ -53,9 +53,15 @@ type BalanceSheetView = {
   generated_at: string;
   currency?: string;
   status_palette?: Record<string, string>;
+  period_columns?: Array<{
+    period_end: string;
+    label?: string;
+    kind?: string;
+  }>;
   accounts: Array<{
     account: BalanceSheetAccount;
     status: string;
+    balances_by_period?: Record<string, string | number | null>;
     rule_hits: RuleHit[];
   }>;
   unmapped_findings?: RuleHit[];
@@ -85,6 +91,8 @@ const DEFAULT_STATUS_PALETTE: Record<string, string> = {
   PASS: "#107C10",
   NOT_APPLICABLE: "#605E5C",
 };
+
+const POLLABLE_RUN_STATUSES = new Set(["queued", "running", "raw", "fetched"]);
 
 const runCache = new Map<string, ReviewRun>();
 const runInflight = new Map<string, Promise<ReviewRun>>();
@@ -308,11 +316,11 @@ const sortFindings = (items: RuleHit[]): RuleHit[] => {
 };
 
 async function fetchRun(runId: string, force: boolean): Promise<ReviewRun> {
+  if (runInflight.has(runId)) {
+    return runInflight.get(runId) as Promise<ReviewRun>;
+  }
   if (!force && runCache.has(runId)) {
     return runCache.get(runId) as ReviewRun;
-  }
-  if (!force && runInflight.has(runId)) {
-    return runInflight.get(runId) as Promise<ReviewRun>;
   }
 
   const apiUrl = getApiUrl();
@@ -368,9 +376,42 @@ const BalanceSheetReviewPanel: React.FC<{ runId: string }> = ({ runId }) => {
     void loadRun(false);
   }, [loadRun]);
 
+  useEffect(() => {
+    const status = String(run?.status || "").toLowerCase();
+    if (!runId || !POLLABLE_RUN_STATUSES.has(status)) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadRun(true);
+    }, 5000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [loadRun, run?.status, runId]);
+
   const view = run?.balance_sheet_view || null;
   const findings = sortFindings(run?.findings || []);
   const totals = run?.totals || {};
+  const periodColumns =
+    view?.period_columns && view.period_columns.length > 0
+      ? view.period_columns
+      : view?.period_end
+        ? [{ period_end: view.period_end, label: view.period_end, kind: "current" }]
+        : [];
+
+  const resolveBalanceForPeriod = (
+    row: { account: BalanceSheetAccount; balances_by_period?: Record<string, string | number | null> },
+    periodEnd: string
+  ) => {
+    const explicit = row.balances_by_period?.[periodEnd];
+    if (explicit !== undefined) {
+      return explicit;
+    }
+    if (view?.period_end && periodEnd === view.period_end) {
+      return row.account.balance;
+    }
+    return null;
+  };
 
   return (
     <div className={styles.panel}>
@@ -436,7 +477,11 @@ const BalanceSheetReviewPanel: React.FC<{ runId: string }> = ({ runId }) => {
                   <thead>
                     <tr>
                       <th className={styles.th}>Account</th>
-                      <th className={styles.th}>Balance</th>
+                      {periodColumns.map((column) => (
+                        <th key={`period-${column.period_end}`} className={styles.th}>
+                          {column.label || column.period_end}
+                        </th>
+                      ))}
                       <th className={styles.th}>Status</th>
                       <th className={styles.th}>Rule Hits</th>
                     </tr>
@@ -458,9 +503,17 @@ const BalanceSheetReviewPanel: React.FC<{ runId: string }> = ({ runId }) => {
                               </div>
                             )}
                           </td>
-                          <td className={styles.td}>
-                            {formatCurrency(row.account.balance, view.currency)}
-                          </td>
+                          {periodColumns.map((column) => (
+                            <td
+                              key={`${row.account.account_ref}-${column.period_end}`}
+                              className={styles.td}
+                            >
+                              {formatCurrency(
+                                resolveBalanceForPeriod(row, column.period_end),
+                                view.currency
+                              )}
+                            </td>
+                          ))}
                           <td className={styles.td}>
                             <span
                               className={styles.statusPill}

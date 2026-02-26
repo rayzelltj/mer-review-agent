@@ -152,6 +152,25 @@ def _summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _status_next_step_guidance(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "raw":
+        return (
+            "Raw fetch is complete. Next: NormalizationAgent should call "
+            "bs_normalize_data, then wait_for_balance_sheet_review until status is fetched or done."
+        )
+    if normalized == "fetched":
+        return "Data is already normalized. Next: RulesAgent should call bs_run_rules."
+    if normalized == "done":
+        return (
+            "Rules already ran on this run_id. Next: ReportAgent should call bs_get_findings "
+            "(or RulesAgent may call bs_run_rules idempotently)."
+        )
+    if normalized == "failed":
+        return "Run failed. Start a new run via bs_fetch_data."
+    return "Status is unknown. Call get_balance_sheet_review for details."
+
+
 def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key, value in payload.items():
@@ -385,6 +404,96 @@ class FinanceService(MCPToolBase):
                 )
 
         @mcp.tool(tags={self.domain.value})
+        def run_balance_sheet_review(
+            client_id: str,
+            period_end: str,
+            notes: str | None = None,
+        ) -> str:
+            """
+            Run a complete balance sheet review synchronously and return results.
+
+            This is the preferred tool for ReviewAgent. It calls the backend pipeline
+            (fetch QBO data → normalize → run 22 rules → generate summary) and blocks
+            until the pipeline completes (typically 25-45 seconds), then returns the
+            complete run record including findings, balance_sheet_rows, and hitl_requests.
+
+            Unlike start_balance_sheet_review + wait_for_balance_sheet_review, this tool
+            makes a single HTTP call with no polling loop.
+            """
+            try:
+                # First, check for an existing active run (idempotency).
+                try:
+                    existing = _request_json(
+                        "GET",
+                        f"/api/reviews/balance-sheet/find?client_id={quote(client_id)}&period_end={period_end}",
+                    )
+                    existing_run_id = existing.get("run_id") or existing.get("id")
+                    existing_status = str(existing.get("status") or "").lower()
+                    if existing_run_id and existing_status not in ("failed", ""):
+                        LOGGER.info(
+                            "run_balance_sheet_review: reusing existing run_id=%s status=%s",
+                            existing_run_id,
+                            existing_status,
+                        )
+                        # If the run is already done, return it.
+                        if existing_status == "done":
+                            payload = _request_json(
+                                "GET",
+                                f"/api/reviews/balance-sheet/runs/{existing_run_id}",
+                            )
+                            details = _summarize_run(payload)
+                            return format_success_response(
+                                "Balance Sheet Review Complete (Reused)",
+                                details,
+                                summary=f"Reusing completed run {existing_run_id}.",
+                            )
+                except Exception as lookup_err:
+                    status_code = getattr(
+                        getattr(lookup_err, "response", None), "status_code", None
+                    )
+                    if status_code != 404:
+                        LOGGER.warning("run_balance_sheet_review lookup failed: %s", lookup_err)
+
+                # Call the synchronous endpoint — blocks until pipeline completes.
+                # Use a 90-second timeout: well above 25-45s target, below ALB default.
+                url = f"{_backend_url()}/api/reviews/balance-sheet/run"
+                outbound_headers = _resolve_user_auth_header()
+                body = {
+                    "client_id": client_id,
+                    "period_end": period_end,
+                    "notes": notes,
+                }
+                with httpx.Client(timeout=90.0) as client_http:
+                    resp = client_http.post(
+                        url,
+                        json=body,
+                        params={"await": "true"},
+                        headers=outbound_headers or None,
+                    )
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {"raw": resp.text}
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Backend error {resp.status_code}: {payload}")
+                if not isinstance(payload, dict):
+                    payload = {"data": payload}
+
+                details = _summarize_run(payload)
+                run_id = payload.get("run_id") or payload.get("id") or "unknown"
+                status = str(details.get("status") or "").lower()
+                summary = (
+                    f"Balance sheet review complete for {client_id} period {period_end}. "
+                    f"Run ID: {run_id}. Status: {status}."
+                )
+                LOGGER.info(
+                    "run_balance_sheet_review complete run_id=%s status=%s", run_id, status
+                )
+                return format_success_response("Balance Sheet Review Complete", details, summary=summary)
+            except Exception as e:
+                return format_error_response(str(e), context="running balance sheet review")
+
+        @mcp.tool(tags={self.domain.value})
         def get_balance_sheet_review(run_id: str) -> str:
             """Fetch the status/results for a balance sheet review run."""
             try:
@@ -473,7 +582,10 @@ class FinanceService(MCPToolBase):
                     action = "Balance Sheet Review In Progress"
                 else:
                     details["timed_out"] = False
-                    summary = f"Run {run_id} reached terminal status: {status}."
+                    summary = (
+                        f"Run {run_id} reached terminal status: {status}. "
+                        f"{_status_next_step_guidance(status)}"
+                    )
                     action = "Balance Sheet Review Completed"
 
                 LOGGER.info(
@@ -1014,9 +1126,10 @@ class FinanceService(MCPToolBase):
         ) -> str:
             """Start a balance sheet raw-fetch-only run (QBO API calls only; does NOT normalize or run rules).
             Idempotent: reuses an existing non-failed run for the same client and period.
-            Returns run_id. Use wait_for_balance_sheet_review(poll_seconds=2) to wait for
-            status='raw'. Once raw, NormalizationAgent calls bs_normalize_data to normalize
-            (which sets status='fetched'), then RulesAgent calls bs_run_rules.
+            Returns run_id. Use wait_for_balance_sheet_review(poll_seconds=2) and interpret:
+            - status='raw': fetch complete, NormalizationAgent should call bs_normalize_data
+            - status='fetched': already normalized, RulesAgent can call bs_run_rules
+            - status='done': rules already ran; ReportAgent can call bs_get_findings directly
             ConnectorAgent MUST use this tool instead of start_balance_sheet_review for new flows.
             """
             try:
@@ -1029,20 +1142,21 @@ class FinanceService(MCPToolBase):
                     existing_run_id = existing.get("run_id") or existing.get("id")
                     existing_status = str(existing.get("status") or "").lower()
                     if existing_run_id and existing_status != "failed":
+                        next_step = _status_next_step_guidance(existing_status)
                         details = {
                             "client_id": client_id,
                             "period_end": period_end,
                             "run_id": existing_run_id,
                             "status": existing_status,
                             "reused": True,
+                            "next_step": next_step,
                         }
                         return format_success_response(
                             "Balance Sheet Fetch (Existing Run)",
                             details,
                             summary=(
                                 f"Reusing existing run {existing_run_id} (status={existing_status}). "
-                                "Use wait_for_balance_sheet_review(poll_seconds=2) to wait for status=raw, "
-                                "then NormalizationAgent calls bs_normalize_data."
+                                f"{next_step}"
                             ),
                         )
                 except Exception as lookup_err:
@@ -1078,13 +1192,15 @@ class FinanceService(MCPToolBase):
         @mcp.tool(tags={self.domain.value})
         def bs_normalize_data(run_id: str) -> str:
             """Run the normalization phase on a raw-fetched balance sheet run (synchronous).
-            Must be called AFTER wait_for_balance_sheet_review returns status='raw'.
+            Prefer calling after wait_for_balance_sheet_review returns status='raw'.
+            If the run is already 'fetched' or 'done', this call is idempotent and should
+            return the existing run details without failure.
             Runs build_qbo_snapshots, build_qbo_aging_evidence, build_qbo_tax_evidence on the
             raw QBO payloads and stores a normalized review_inputs artifact.
-            Sets run status to 'fetched' on success.
+            Sets run status to 'fetched' on success (or keeps 'done' for already completed runs).
             NormalizationAgent is the ONLY agent that should call this tool.
             After calling this tool, call wait_for_balance_sheet_review(run_id, poll_seconds=2)
-            and wait for status='fetched' before the RulesAgent calls bs_run_rules.
+            and accept status in {'fetched','done'} before the RulesAgent calls bs_run_rules.
             """
             try:
                 payload = _request_json(

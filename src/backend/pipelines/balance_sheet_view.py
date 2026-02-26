@@ -28,6 +28,7 @@ def build_balance_sheet_view(
     client_id: str,
     period_end,
     balance_sheet: BalanceSheetSnapshot,
+    prior_balance_sheets: Iterable[BalanceSheetSnapshot] = (),
     results: Iterable[RuleResult],
 ) -> dict[str, Any]:
     accounts = list(balance_sheet.accounts)
@@ -63,14 +64,47 @@ def build_balance_sheet_view(
         else:
             unmapped_findings.append(_build_rule_hit(result, list(result.details)))
 
+    prior_snapshots = sorted(
+        (snapshot for snapshot in prior_balance_sheets if snapshot.as_of_date < period_end),
+        key=lambda snapshot: snapshot.as_of_date,
+        reverse=True,
+    )[:3]
+    period_columns = [
+        {
+            "period_end": period_end.isoformat(),
+            "label": period_end.isoformat(),
+            "kind": "current",
+        }
+    ]
+    prior_lookup_by_period: dict[str, dict[str, dict[str, Any]]] = {}
+    for index, snapshot in enumerate(prior_snapshots, start=1):
+        period_key = snapshot.as_of_date.isoformat()
+        period_columns.append(
+            {
+                "period_end": period_key,
+                "label": period_key,
+                "kind": f"prior_{index}",
+            }
+        )
+        prior_lookup_by_period[period_key] = _build_snapshot_balance_lookup(snapshot)
+
     account_rows: list[dict[str, Any]] = []
     for acct in accounts:
         hits = account_hits.get(acct.account_ref, [])
         hits_sorted = sorted(hits, key=_rule_hit_sort_key)
+        balances_by_period: dict[str, str | None] = {
+            period_end.isoformat(): _stringify_balance(acct.balance),
+        }
+        for column in period_columns[1:]:
+            period_key = str(column["period_end"])
+            lookup = prior_lookup_by_period.get(period_key)
+            balance_value = _lookup_period_balance(acct, lookup) if lookup else None
+            balances_by_period[period_key] = _stringify_balance(balance_value)
         account_rows.append(
             {
                 "account": acct.model_dump(mode="json"),
                 "status": _worst_status([hit["status"] for hit in hits_sorted]),
+                "balances_by_period": balances_by_period,
                 "rule_hits": hits_sorted,
             }
         )
@@ -81,6 +115,7 @@ def build_balance_sheet_view(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "currency": balance_sheet.currency,
         "status_palette": _STATUS_PALETTE,
+        "period_columns": period_columns,
         "accounts": account_rows,
         "unmapped_findings": sorted(unmapped_findings, key=_rule_hit_sort_key),
     }
@@ -161,3 +196,40 @@ def _worst_status(statuses: Iterable[str]) -> str:
 def _rule_hit_sort_key(hit: dict[str, Any]) -> tuple[int, str]:
     status = hit.get("status") or ""
     return (-_STATUS_ORDER.get(status, 0), str(hit.get("rule_id") or ""))
+
+
+def _build_snapshot_balance_lookup(snapshot: BalanceSheetSnapshot) -> dict[str, dict[str, Any]]:
+    by_ref: dict[str, Any] = {}
+    by_name: dict[str, Any] = {}
+    duplicate_names: set[str] = set()
+    for account in snapshot.accounts:
+        by_ref[account.account_ref] = account.balance
+        normalized_name = _normalize_name(account.name)
+        if not normalized_name:
+            continue
+        if normalized_name in by_name:
+            duplicate_names.add(normalized_name)
+            continue
+        by_name[normalized_name] = account.balance
+    for key in duplicate_names:
+        by_name.pop(key, None)
+    return {"by_ref": by_ref, "by_name": by_name}
+
+
+def _lookup_period_balance(account, lookup: dict[str, dict[str, Any]] | None) -> Any:
+    if not lookup:
+        return None
+    by_ref = lookup.get("by_ref", {})
+    by_name = lookup.get("by_name", {})
+    if account.account_ref in by_ref:
+        return by_ref[account.account_ref]
+    normalized_name = _normalize_name(account.name)
+    if normalized_name and normalized_name in by_name:
+        return by_name[normalized_name]
+    return None
+
+
+def _stringify_balance(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)

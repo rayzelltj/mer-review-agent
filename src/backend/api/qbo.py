@@ -18,6 +18,7 @@ from connectors.qbo.client_store import (
     list_qbo_client_ids,
     upsert_qbo_client_tokens,
 )
+from connectors.qbo.auth import QBOAuthError
 from connectors.qbo.config import get_client_store_mode
 from connectors.qbo.oauth import exchange_code_for_tokens
 from connectors.qbo.token_store import load_tokens, persist_env, save_tokens, token_store_path
@@ -29,13 +30,14 @@ router = APIRouter(prefix="/qbo", tags=["qbo"])
 api_router = APIRouter(prefix="/api/qbo", tags=["qbo"])
 
 _STATE_TTL_SECONDS = 600
-# In-memory fallback used only in dev (file-store mode) or if Cosmos is unavailable.
+# In-memory state is only used in file-store/dev mode.
 _STATE_STORE: dict[str, dict[str, Any]] = {}
 _QBO_DEBUG_ENABLED = os.getenv("QBO_DEBUG_ENDPOINTS_ENABLED", "").strip().lower() in {
     "1",
     "true",
     "yes",
 }
+_BLACKBIRD_CANONICAL = os.getenv("QBO_FILE_STORE_CLIENT_ID", "blackbird_fabrics").strip() or "blackbird_fabrics"
 
 # ---------------------------------------------------------------------------
 # Cosmos-backed OAuth state store
@@ -61,8 +63,23 @@ def _save_oauth_state(state: str, record: dict[str, Any]) -> None:
             container.upsert_item(doc)
             return
         except Exception as exc:
-            _LOGGER.warning("Cosmos OAuth state save failed, falling back to memory: %s", exc)
+            _LOGGER.exception("Cosmos OAuth state save failed for state=%s", state)
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to initialize QBO OAuth state store. Please retry.",
+            ) from exc
     _STATE_STORE[state] = record
+
+
+def _is_cosmos_not_found(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 404:
+        return True
+    kind = exc.__class__.__name__.lower()
+    if "notfound" in kind:
+        return True
+    msg = str(exc).lower()
+    return "not found" in msg and "404" in msg
 
 
 def _pop_oauth_state(state: str) -> dict[str, Any] | None:
@@ -70,22 +87,36 @@ def _pop_oauth_state(state: str) -> dict[str, Any] | None:
         try:
             container = get_cosmos_container_client()
             doc_id = f"oauth_state::{state}"
+            doc = container.read_item(item=doc_id, partition_key=doc_id)
+            # Delete after read (one-shot use)
             try:
-                doc = container.read_item(item=doc_id, partition_key=doc_id)
-                # Delete after read (one-shot use)
-                try:
-                    container.delete_item(item=doc_id, partition_key=doc_id)
-                except Exception:
-                    pass
-                return {
-                    k: v for k, v in doc.items()
-                    if k not in {"id", "session_id", "data_type", "state", "_rid", "_self", "_etag", "_attachments", "_ts"}
-                }
+                container.delete_item(item=doc_id, partition_key=doc_id)
             except Exception:
-                # Not found in Cosmos; fall through to memory fallback
                 pass
+            return {
+                k: v
+                for k, v in doc.items()
+                if k
+                not in {
+                    "id",
+                    "session_id",
+                    "data_type",
+                    "state",
+                    "_rid",
+                    "_self",
+                    "_etag",
+                    "_attachments",
+                    "_ts",
+                }
+            }
         except Exception as exc:
-            _LOGGER.warning("Cosmos OAuth state read failed, falling back to memory: %s", exc)
+            if _is_cosmos_not_found(exc):
+                return None
+            _LOGGER.exception("Cosmos OAuth state read failed for state=%s", state)
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to read QBO OAuth state. Please retry.",
+            ) from exc
     return _STATE_STORE.pop(state, None)
 
 
@@ -191,6 +222,51 @@ def _prepare_oauth_flow(
     }
 
 
+def _parse_expires_in_seconds(expires_in: Any) -> int:
+    value = expires_in
+    if isinstance(value, bool):
+        value = None
+    if isinstance(value, str):
+        value = value.strip()
+        if "." in value:
+            try:
+                value = float(value)
+            except ValueError:
+                value = None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="OAuth token exchange returned invalid expires_in.") from exc
+    if seconds <= 0:
+        raise HTTPException(status_code=502, detail="OAuth token exchange returned invalid expires_in.")
+    return seconds
+
+
+def _exchange_tokens_for_callback(
+    *,
+    app_client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    code: str,
+) -> dict[str, Any]:
+    try:
+        payload = exchange_code_for_tokens(
+            client_id=app_client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            code=code,
+        )
+    except QBOAuthError as exc:
+        _LOGGER.warning("QBO OAuth token exchange rejected by Intuit: %s", exc)
+        raise HTTPException(status_code=502, detail="QBO OAuth token exchange failed.") from exc
+    except Exception as exc:
+        _LOGGER.exception("Unexpected QBO OAuth token exchange failure")
+        raise HTTPException(status_code=502, detail="QBO OAuth token exchange failed.") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="OAuth token exchange failed.")
+    return payload
+
+
 def _handle_oauth_callback(
     *,
     code: str,
@@ -202,7 +278,10 @@ def _handle_oauth_callback(
     record = _pop_oauth_state(state)
     if record is None:
         raise HTTPException(status_code=400, detail="Invalid or expired state.")
-    if time.time() - record["created_at"] > _STATE_TTL_SECONDS:
+    created_at = record.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state payload.")
+    if time.time() - created_at > _STATE_TTL_SECONDS:
         raise HTTPException(status_code=400, detail="State expired.")
     if str(record.get("user_principal_id") or "").strip() != user_principal_id:
         raise HTTPException(status_code=403, detail="OAuth state does not match signed-in user.")
@@ -214,47 +293,58 @@ def _handle_oauth_callback(
     app_client_id = _require_env("QBO_CLIENT_ID")
     client_secret = _require_env("QBO_CLIENT_SECRET")
 
-    payload = exchange_code_for_tokens(
-        client_id=app_client_id,
+    payload = _exchange_tokens_for_callback(
+        app_client_id=app_client_id,
         client_secret=client_secret,
         redirect_uri=redirect_uri,
         code=code,
     )
     access_token = payload.get("access_token")
     refresh_token = payload.get("refresh_token")
-    expires_in = payload.get("expires_in")
-    if not access_token or not refresh_token or not expires_in:
+    expires_in = _parse_expires_in_seconds(payload.get("expires_in"))
+    if not access_token or not refresh_token:
         raise HTTPException(status_code=502, detail="OAuth token exchange failed.")
 
-    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))).isoformat()
-    if get_client_store_mode() == "cosmos":
+    mode = get_client_store_mode()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+    if mode == "cosmos":
         if not client_id:
             raise HTTPException(status_code=400, detail="client_id is required for Cosmos token storage.")
         env = os.getenv("QBO_ENV", os.getenv("QBO_ENVIRONMENT", "sandbox")).strip().lower()
-        upsert_qbo_client_tokens(
-            client_id=client_id,
-            user_principal_id=user_principal_id,
-            realm_id=realm_id,
-            refresh_token=refresh_token,
-            environment=env,
-        )
+        try:
+            upsert_qbo_client_tokens(
+                client_id=client_id,
+                user_principal_id=user_principal_id,
+                realm_id=realm_id,
+                refresh_token=refresh_token,
+                environment=env,
+            )
+        except Exception as exc:
+            _LOGGER.exception("Unable to persist QBO tokens in Cosmos for client=%s", client_id)
+            raise HTTPException(status_code=503, detail="Unable to persist QBO connection. Please retry.") from exc
     else:
-        save_tokens(
-            token_store_path(),
-            access_token=access_token,
-            refresh_token=refresh_token,
-            token_expires_at=expires_at,
-            realm_id=realm_id,
-        )
-        persist_env(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            token_expires_at=expires_at,
-            realm_id=realm_id,
-        )
+        try:
+            save_tokens(
+                token_store_path(),
+                access_token=access_token,
+                refresh_token=refresh_token,
+                token_expires_at=expires_at,
+                realm_id=realm_id,
+            )
+            persist_env(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                token_expires_at=expires_at,
+                realm_id=realm_id,
+            )
+        except Exception as exc:
+            _LOGGER.exception("Unable to persist QBO tokens in file store")
+            raise HTTPException(status_code=503, detail="Unable to persist QBO connection. Please retry.") from exc
 
     return {
         "status": "ok",
+        "connected": True,
+        "store_mode": mode,
         "client_id": client_id,
         "realm_id": realm_id,
         "token_expires_at": expires_at,
@@ -462,14 +552,27 @@ def qbo_validate_connection(request: Request, client_id: str | None = Query(None
     # Attempt a cheap live probe: fetch CompanyInfo for the realm.
     realm_id = str(status.get("realm_id") or "").strip()
     resolved_client_id = str(status.get("client_id") or status.get("resolved_client_id") or "").strip()
+    mode = str(status.get("store_mode") or get_client_store_mode()).strip().lower()
     try:
-        from connectors.qbo.client_store import get_qbo_client_record
         from connectors.qbo.config import build_qbo_config
-        from connectors.qbo.client import qbo_get, QBOHttpError
+        from connectors.qbo.client import qbo_get
 
-        record = get_qbo_client_record(resolved_client_id or client_id, user_principal_id=user_principal_id) if (resolved_client_id or client_id) else None
-        refresh_token = str((record or {}).get("refresh_token") or "").strip()
-        env = str((record or {}).get("environment") or "").strip() or None
+        refresh_token = ""
+        env: str | None = None
+        if mode == "cosmos":
+            record = (
+                get_qbo_client_record(resolved_client_id or client_id, user_principal_id=user_principal_id)
+                if (resolved_client_id or client_id)
+                else None
+            )
+            refresh_token = str((record or {}).get("refresh_token") or "").strip()
+            env = str((record or {}).get("environment") or "").strip() or None
+        else:
+            tokens = load_tokens(token_store_path()) or {}
+            refresh_token = str(
+                tokens.get("QBO_REFRESH_TOKEN") or os.getenv("QBO_REFRESH_TOKEN", "")
+            ).strip()
+            env = os.getenv("QBO_ENV", os.getenv("QBO_ENVIRONMENT", "")).strip().lower() or None
 
         if not refresh_token:
             return {**status, "live": False, "reason": "no_refresh_token"}
@@ -483,7 +586,6 @@ def qbo_validate_connection(request: Request, client_id: str | None = Query(None
             user_principal_id=user_principal_id,
         )
         if env:
-            import os as _os
             config = config.__class__(
                 env=env,
                 base_url=config.base_url if env == config.env else (

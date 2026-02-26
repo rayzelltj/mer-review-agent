@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { getApiUrl, getAuthToken, setApiUrl, setEnvData, toBoolean } from '@/api/config';
+import { setStoredReviewClientId } from '@/services/QboReviewContextService';
+import { redirectToAadLogin } from '@/utils/authSession';
 
 const QboConnectPage: React.FC = () => {
   const [message, setMessage] = useState('Preparing QBO authorization...');
@@ -34,6 +36,7 @@ const QboConnectPage: React.FC = () => {
         setMessage('Missing client_id. Please retry QBO connect from the app.');
         return;
       }
+      setStoredReviewClientId(clientId);
 
       const baseUrl = await resolveApiBaseUrl();
       if (!baseUrl) {
@@ -43,9 +46,7 @@ const QboConnectPage: React.FC = () => {
 
       const token = getAuthToken();
       if (!token) {
-        const postLoginRedirect = `${window.location.pathname}${window.location.search || ''}`;
-        const loginUrl = `/.auth/login/aad?post_login_redirect_uri=${encodeURIComponent(postLoginRedirect || '/')}`;
-        window.location.assign(loginUrl);
+        redirectToAadLogin();
         return;
       }
 
@@ -57,6 +58,10 @@ const QboConnectPage: React.FC = () => {
             Authorization: `Bearer ${token}`,
           },
         });
+        if (response.status === 401) {
+          redirectToAadLogin();
+          return;
+        }
 
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {

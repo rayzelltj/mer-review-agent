@@ -16,6 +16,7 @@ import { TeamService } from '../services/TeamService';
 import InlineToaster, { useInlineToaster } from "../components/toast/InlineToaster";
 import QboConnectButton from "@/components/content/QboConnectButton";
 import QboStatusBanner from "@/components/content/QboStatusBanner";
+import { getStoredReviewClientId, setStoredReviewClientId } from "@/services/QboReviewContextService";
 
 /**
  * HomePage component - displays task lists and provides navigation
@@ -26,6 +27,25 @@ const HomePage: React.FC = () => {
     const [selectedTeam, setSelectedTeam] = useState<TeamConfig | null>(null);
     const [isLoadingTeam, setIsLoadingTeam] = useState<boolean>(true);
     const [reloadLeftList, setReloadLeftList] = useState<boolean>(true);
+    const [selectedQboClientId, setSelectedQboClientId] = useState<string>(() => getStoredReviewClientId());
+
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search || "");
+        if (params.get("qbo_connected") !== "1") {
+            return;
+        }
+
+        const resolvedClientId = String(params.get("client_id") || "").trim();
+        if (resolvedClientId) {
+            setStoredReviewClientId(resolvedClientId);
+            setSelectedQboClientId(resolvedClientId);
+            showToast(`QBO connected for ${resolvedClientId}.`, "success");
+        } else {
+            showToast("QBO connected successfully.", "success");
+        }
+
+        window.history.replaceState({}, document.title, window.location.pathname);
+    }, [showToast]);
 
     useEffect(() => {
         const initTeam = async () => {
@@ -239,12 +259,17 @@ const HomePage: React.FC = () => {
                         <ContentToolbar
                             panelTitle={"Multi-Agent Planner"}
                         >
-                            <QboConnectButton />
+                            <QboConnectButton
+                                clientId={selectedQboClientId}
+                                onClientIdChange={setSelectedQboClientId}
+                            />
                         </ContentToolbar>
-                        <QboStatusBanner />
+                        <QboStatusBanner clientId={selectedQboClientId} />
                         {!isLoadingTeam ? (
                             <HomeInput
                                 selectedTeam={selectedTeam}
+                                qboClientId={selectedQboClientId}
+                                onQboClientIdChange={setSelectedQboClientId}
                             />
                         ) : (
                             <div style={{

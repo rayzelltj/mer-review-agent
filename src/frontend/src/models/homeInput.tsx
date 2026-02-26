@@ -23,6 +23,8 @@ export interface QuickTask {
 
 export interface HomeInputProps {
     selectedTeam?: TeamConfig | null;
+    qboClientId?: string;
+    onQboClientIdChange?: (clientId: string) => void;
 }
 export const iconMap: Record<string, React.ReactNode> = {
     // Task/Logo icons

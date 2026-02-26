@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Spinner, Text } from "@fluentui/react-components";
+import { Spinner, Text, Button } from "@fluentui/react-components";
+import { DismissRegular } from "@fluentui/react-icons";
 import { PlanDataService } from "../services/PlanDataService";
 import { TaskService } from "../services/TaskService";
 import { ProcessedPlanData, WebsocketMessageType, MPlanData, AgentMessageData, AgentMessageType, ParsedUserClarification, AgentType, PlanStatus, TeamConfig } from "../models";
@@ -22,6 +23,8 @@ import { StreamMessage, StreamingPlanUpdate } from "../models";
 import { usePlanCancellationAlert } from "../hooks/usePlanCancellationAlert";
 import PlanCancellationDialog from "../components/common/PlanCancellationDialog";
 import QboConnectButton from "../components/content/QboConnectButton";
+import { getStoredReviewClientId, setStoredReviewClientId } from "@/services/QboReviewContextService";
+import { isAuthSessionError, redirectToAadLogin } from "@/utils/authSession";
 import "../styles/PlanPage.css"
 
 // Create API service instance
@@ -59,6 +62,11 @@ const PlanPage: React.FC = () => {
     const [streamingMessageBuffer, setStreamingMessageBuffer] = useState<string>("");
     const [showBufferingText, setShowBufferingText] = useState<boolean>(false);
     const [agentMessages, setAgentMessages] = useState<AgentMessageData[]>([]);
+    const [selectedQboClientId, setSelectedQboClientId] = useState<string>(() => getStoredReviewClientId());
+    // activePlanId: the plan whose WebSocket channel is currently open.
+    // Decoupled from the URL planId so follow-up submissions can reconnect the
+    // WebSocket to a new plan without navigating away (no page remount).
+    const [activePlanId, setActivePlanId] = useState<string | undefined>(planId);
     const formatErrorMessage = useCallback((content: string): string => {
         // Split content by newlines and add proper indentation
         const lines = content.split('\n');
@@ -480,6 +488,44 @@ const PlanPage: React.FC = () => {
         return () => unsubscribe();
     }, [scrollToBottom, showToast, formatErrorMessage]);
 
+    // WebsocketMessageType.TIMEOUT_NOTIFICATION
+    useEffect(() => {
+        const unsubscribe = webSocketService.on(WebsocketMessageType.TIMEOUT_NOTIFICATION, (msg: any) => {
+            const text =
+                msg?.data?.message ||
+                msg?.message ||
+                "Timed out waiting for a response. The run was cancelled.";
+
+            const systemMsg: AgentMessageData = {
+                agent: 'system',
+                agent_type: AgentMessageType.SYSTEM_AGENT,
+                timestamp: Date.now(),
+                steps: [],
+                next_steps: [],
+                content: `⏱ ${text}`,
+                raw_data: msg || '',
+            };
+            setAgentMessages(prev => [...prev, systemMsg]);
+            scrollToBottom();
+            showToast(text, "warning");
+        });
+        return () => unsubscribe();
+    }, [scrollToBottom, showToast]);
+
+    // WebSocket permanent connection loss
+    useEffect(() => {
+        const unsubscribe = webSocketService.on('error', (errorEvent: any) => {
+            const msg = errorEvent?.error || errorEvent?.message || '';
+            if (msg === 'Max reconnection attempts reached') {
+                showToast(
+                    'Connection lost — still checking for results in the background.',
+                    'warning'
+                );
+            }
+        });
+        return () => unsubscribe();
+    }, [showToast]);
+
     //WebsocketMessageType.AGENT_MESSAGE
     useEffect(() => {
         const unsubscribe = webSocketService.on(WebsocketMessageType.AGENT_MESSAGE, (agentMessage: any) => {
@@ -524,14 +570,16 @@ const PlanPage: React.FC = () => {
         return () => clearInterval(interval);
     }, [loading]);
 
-    // WebSocket connection with proper error handling and v4 backend compatibility
+    // WebSocket connection with proper error handling and v4 backend compatibility.
+    // Uses activePlanId (not planId from URL) so follow-up submissions can reconnect
+    // to a new plan channel without triggering a page remount / navigate().
     useEffect(() => {
-        if (planId && continueWithWebsocketFlow) {
-            console.log('🔌 Connecting WebSocket:', { planId, continueWithWebsocketFlow });
+        if (activePlanId && continueWithWebsocketFlow) {
+            console.log('🔌 Connecting WebSocket:', { activePlanId, continueWithWebsocketFlow });
 
             const connectWebSocket = async () => {
                 try {
-                    await webSocketService.connect(planId);
+                    await webSocketService.connect(activePlanId);
                     console.log('✅ WebSocket connected successfully');
                 } catch (error) {
                     console.error('❌ WebSocket connection failed:', error);
@@ -588,7 +636,7 @@ const PlanPage: React.FC = () => {
                 webSocketService.disconnect();
             };
         }
-    }, [planId, continueWithWebsocketFlow]);
+    }, [activePlanId, continueWithWebsocketFlow]);
 
     useEffect(() => {
         if (!planId || !continueWithWebsocketFlow || wsConnected || loading) {
@@ -598,6 +646,7 @@ const PlanPage: React.FC = () => {
         setPollingFallbackActive(true);
         let cancelled = false;
         let pollCount = 0;
+        let intervalId: number | null = null;
 
         const pollPlanState = async () => {
             if (cancelled) {
@@ -661,16 +710,27 @@ const PlanPage: React.FC = () => {
                     setPollingFallbackActive(false);
                 }
             } catch (error) {
+                if (isAuthSessionError(error)) {
+                    cancelled = true;
+                    if (intervalId !== null) {
+                        clearInterval(intervalId);
+                    }
+                    setPollingFallbackActive(false);
+                    redirectToAadLogin();
+                    return;
+                }
                 console.warn("Polling fallback failed:", error);
             }
         };
 
-        const interval = setInterval(pollPlanState, 5000);
+        intervalId = window.setInterval(pollPlanState, 5000);
         pollPlanState();
 
         return () => {
             cancelled = true;
-            clearInterval(interval);
+            if (intervalId !== null) {
+                clearInterval(intervalId);
+            }
         };
     }, [planId, continueWithWebsocketFlow, wsConnected, loading]);
 
@@ -744,6 +804,10 @@ const PlanPage: React.FC = () => {
     useEffect(() => {
         const refreshAfterQboConnect = async (rawClientId: unknown) => {
             const clientId = String(rawClientId || "").trim();
+            if (clientId) {
+                setStoredReviewClientId(clientId);
+                setSelectedQboClientId(clientId);
+            }
             const suffix = clientId ? ` for ${clientId}` : "";
             showToast(`QBO connected${suffix}. Refreshing this plan.`, "success");
             try {
@@ -843,6 +907,12 @@ const PlanPage: React.FC = () => {
             setProcessingApproval(false);
         }
     }, [planApprovalRequest, planData, navigate, setProcessingApproval]);
+    // Handle "Stop run" button — reuses the cancellation dialog
+    const handleStopRun = useCallback(() => {
+        setPendingNavigation(() => () => navigate('/'));
+        setShowCancellationDialog(true);
+    }, [navigate]);
+
     // Chat submission handler - updated for v4 backend compatibility
 
     const handleOnchatSubmit = useCallback(
@@ -877,8 +947,53 @@ const PlanPage: React.FC = () => {
                     );
 
                     dismissToast(id);
-                    showToast("Follow-up prompt started in this thread", "success");
-                    navigate(`/plan/${response.plan_id}`);
+
+                    // Add the user's message optimistically so the conversation thread
+                    // shows it immediately (before the WS reconnects and streams back).
+                    const userFollowUpMsg: AgentMessageData = {
+                        agent: 'human',
+                        agent_type: AgentMessageType.HUMAN_AGENT,
+                        timestamp: Date.now(),
+                        steps: [],
+                        next_steps: [],
+                        content: chatInput,
+                        raw_data: chatInput,
+                    } as AgentMessageData;
+                    setAgentMessages(prev => [...prev, userFollowUpMsg]);
+
+                    // Update planData so subsequent handlers use the new plan id.
+                    if (planData?.plan) {
+                        setPlanData({
+                            ...planData,
+                            plan: {
+                                ...planData.plan,
+                                id: response.plan_id,
+                                overall_status: PlanStatus.IN_PROGRESS,
+                            },
+                        });
+                    }
+
+                    // Reset per-plan state for the new run without clearing message history.
+                    setPlanApprovalRequest(null);
+                    setClarificationMessage(null);
+                    setStreamingMessageBuffer("");
+                    setShowBufferingText(false);
+                    setWaitingForPlan(false);
+                    setShowProcessingPlanSpinner(true);
+                    setSubmittingChatDisableInput(true);
+
+                    // Switch the WebSocket channel to the new plan.
+                    // activePlanId change triggers the WS useEffect to disconnect the old
+                    // channel and connect to the new one — no page remount needed.
+                    setActivePlanId(response.plan_id);
+                    setContinueWithWebsocketFlow(true);
+
+                    // Update the browser URL silently so a page refresh lands on the new
+                    // plan, but without triggering React Router's re-render / remount.
+                    window.history.replaceState(null, '', `/plan/${response.plan_id}`);
+
+                    showToast("Follow-up started — continuing in this conversation", "success");
+                    scrollToBottom();
                     return;
                 }
 
@@ -929,6 +1044,7 @@ const PlanPage: React.FC = () => {
             planApprovalRequest?.id,
             planData,
             scrollToBottom,
+            setActivePlanId,
             showToast,
         ]
     );
@@ -963,6 +1079,14 @@ const PlanPage: React.FC = () => {
 
         initializePlanLoading();
     }, [planId, loadPlanData, resetPlanVariables, setErrorLoading]);
+
+    // When the user navigates to a different plan via a sidebar link, keep activePlanId
+    // in sync with the URL-derived planId so the WebSocket reconnects to the new plan.
+    // This does NOT fire on follow-up submissions (those use window.history.replaceState
+    // which bypasses React Router and leaves planId unchanged).
+    useEffect(() => {
+        setActivePlanId(planId);
+    }, [planId]);
 
     useEffect(() => {
         if (planData?.team) {
@@ -1029,7 +1153,21 @@ const PlanPage: React.FC = () => {
                             <ContentToolbar
                                 panelTitle="Multi-Agent Planner"
                             >
-                                <QboConnectButton />
+                                {continueWithWebsocketFlow && (
+                                    <Button
+                                        appearance="subtle"
+                                        size="small"
+                                        icon={<DismissRegular />}
+                                        onClick={handleStopRun}
+                                        disabled={cancellingPlan}
+                                    >
+                                        Stop run
+                                    </Button>
+                                )}
+                                <QboConnectButton
+                                    clientId={selectedQboClientId}
+                                    onClientIdChange={setSelectedQboClientId}
+                                />
                             </ContentToolbar>
 
                             {pollingFallbackActive && (

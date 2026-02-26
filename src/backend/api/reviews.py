@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -73,6 +73,15 @@ class BalanceSheetRunRequest(BaseModel):
 class BalanceSheetRunResponse(BaseModel):
     run_id: str
     status: str
+    # Populated only when ?await=true: full run record fields
+    summary: str | None = None
+    findings: list | None = None
+    balance_sheet_view: dict | None = None
+    totals: dict | None = None
+    hitl_requests: list | None = None
+    artifact_keys: dict | None = None
+    snapshot_keys: dict | None = None
+    error: str | None = None
 
 
 class BalanceSheetFetchRequest(BaseModel):
@@ -101,7 +110,11 @@ def _authenticated_user_id(http_request: Request) -> str | None:
 
 
 @router.post("/balance-sheet/run", response_model=BalanceSheetRunResponse)
-async def run_balance_sheet_review(request: BalanceSheetRunRequest, http_request: Request):
+async def run_balance_sheet_review(
+    request: BalanceSheetRunRequest,
+    http_request: Request,
+    await_result: bool = Query(False, alias="await"),
+):
     user_principal_id = _authenticated_user_id(http_request)
 
     resolved_client_id = _resolve_client_id(
@@ -124,6 +137,37 @@ async def run_balance_sheet_review(request: BalanceSheetRunRequest, http_request
         notes=request.notes,
     )
 
+    if await_result:
+        # Synchronous path: run the full pipeline inline and return complete results.
+        # HTTP timeout on Azure Container Apps is 240s; target pipeline is 25-45s.
+        await run_in_threadpool(
+            _run_balance_sheet_review_sync,
+            run_id=run_id,
+            client_id=resolved_client_id,
+            period_end=request.period_end,
+            notes=request.notes,
+            user_principal_id=user_principal_id,
+        )
+        record = await run_in_threadpool(
+            get_balance_sheet_run, run_id, user_principal_id=user_principal_id
+        )
+        if record is None:
+            raise HTTPException(status_code=500, detail="Run record missing after pipeline completion")
+        resp = _run_record_response(record)
+        return BalanceSheetRunResponse(
+            run_id=record.run_id,
+            status=record.status,
+            summary=resp.get("summary"),
+            findings=resp.get("findings"),
+            balance_sheet_view=resp.get("balance_sheet_view"),
+            totals=resp.get("totals"),
+            hitl_requests=resp.get("hitl_requests"),
+            artifact_keys=resp.get("artifact_keys"),
+            snapshot_keys=resp.get("snapshot_keys"),
+            error=resp.get("error"),
+        )
+
+    # Async path (default): fire-and-forget, return run_id immediately.
     asyncio.create_task(
         _run_balance_sheet_review_async(
             run_id=run_id,
@@ -361,6 +405,8 @@ async def run_rules_for_review(run_id: str, request: RunRulesRequest, http_reque
         raise HTTPException(status_code=409, detail="Run is still in progress. Wait and retry.")
     if record.status == "failed":
         raise HTTPException(status_code=409, detail="Run has failed. Start a new fetch first.")
+    if record.status == "queued":
+        raise HTTPException(status_code=409, detail="Run has not started yet. Wait and retry.")
     if record.status == "raw":
         raise HTTPException(status_code=409, detail="Run has not been normalized yet. Call /normalize first.")
     if record.status == "done":
@@ -676,30 +722,39 @@ def _run_rules_phase_sync(
             logger=LOGGER,
             attributes={"run.id": run_id, "client.id": client_id},
         ):
-            artifact_store.save_json(
-                client_id=client_id, period_end=period_end, run_id=run_id,
-                name="findings", payload=findings_payload,
-            )
-            artifact_store.save_json(
-                client_id=client_id, period_end=period_end, run_id=run_id,
-                name="run_report", payload=report_payload,
-            )
             balance_sheet_view = build_balance_sheet_view(
                 client_id=client_id, period_end=period_end,
-                balance_sheet=inputs.balance_sheet, results=report.results,
-            )
-            artifact_store.save_json(
-                client_id=client_id, period_end=period_end, run_id=run_id,
-                name="balance_sheet_view", payload=balance_sheet_view,
+                balance_sheet=inputs.balance_sheet,
+                prior_balance_sheets=inputs.prior_balance_sheets,
+                results=report.results,
             )
             summary = generate_balance_sheet_summary(
                 client_id=client_id, period_end=period_end,
                 report=report, notes=notes, balance_sheet_view=balance_sheet_view,
             )
-            artifact_store.save_text(
-                client_id=client_id, period_end=period_end, run_id=run_id,
-                name="summary", content=summary,
-            )
+            # Save all 4 artifacts in parallel — each writes to a distinct blob key.
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=4) as _pool:
+                _pool.submit(
+                    artifact_store.save_json,
+                    client_id=client_id, period_end=period_end, run_id=run_id,
+                    name="findings", payload=findings_payload,
+                )
+                _pool.submit(
+                    artifact_store.save_json,
+                    client_id=client_id, period_end=period_end, run_id=run_id,
+                    name="run_report", payload=report_payload,
+                )
+                _pool.submit(
+                    artifact_store.save_json,
+                    client_id=client_id, period_end=period_end, run_id=run_id,
+                    name="balance_sheet_view", payload=balance_sheet_view,
+                )
+                _pool.submit(
+                    artifact_store.save_text,
+                    client_id=client_id, period_end=period_end, run_id=run_id,
+                    name="summary", content=summary,
+                )
 
         existing_artifact_keys = dict(record.artifact_keys or {})
         existing_artifact_keys.update({

@@ -63,10 +63,10 @@
       "value": true
     },
     "enablePrivateNetworking": {
-      "value": true
+      "value": false
     },
     "enableScalability": {
-      "value": true
+      "value": false
     },
     "virtualMachineAdminUsername": {
       "value": "${AZURE_ENV_VM_ADMIN_USERNAME}"

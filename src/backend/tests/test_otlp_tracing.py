@@ -1,4 +1,7 @@
 import os
+import sys
+from unittest.mock import MagicMock, patch
+
 from src.backend.common.utils.otlp_tracing import (
     configure_oltp_tracing,
 )  # Import directly since it's in backend

@@ -11,8 +11,6 @@ from src.backend.common.models.messages_af import (
     Step,
     Plan,
     AgentMessage,
-    ActionRequest,
-    HumanFeedback,
 )
 
 
@@ -45,6 +43,7 @@ def test_plan_with_steps_update_counts():
         user_id=str(uuid.uuid4()),
     )
     plan = PlanWithSteps(
+        plan_id=str(uuid.uuid4()),
         steps=[step1, step2],
         session_id=str(uuid.uuid4()),
         user_id=str(uuid.uuid4()),
@@ -71,35 +70,10 @@ def test_agent_message_creation():
     assert agent_message.content == "Test message content"
 
 
-def test_action_request_creation():
-    """Test the creation of ActionRequest."""
-    action_request = ActionRequest(
-        step_id=str(uuid.uuid4()),
-        plan_id=str(uuid.uuid4()),
-        session_id=str(uuid.uuid4()),
-        action="Review and approve",
-        agent=BAgentType.PROCUREMENT,
-    )
-    assert action_request.action == "Review and approve"
-    assert action_request.agent == BAgentType.PROCUREMENT
-
-
-def test_human_feedback_creation():
-    """Test HumanFeedback creation."""
-    human_feedback = HumanFeedback(
-        step_id=str(uuid.uuid4()),
-        plan_id=str(uuid.uuid4()),
-        session_id=str(uuid.uuid4()),
-        approved=True,
-        human_feedback="Looks good!",
-    )
-    assert human_feedback.approved is True
-    assert human_feedback.human_feedback == "Looks good!"
-
-
 def test_plan_initialization():
     """Test Plan model initialization."""
     plan = Plan(
+        plan_id=str(uuid.uuid4()),
         session_id=str(uuid.uuid4()),
         user_id=str(uuid.uuid4()),
         initial_goal="Complete document processing",

@@ -1466,6 +1466,18 @@ module containerAppMcp 'br/public:avm/res/app/container-app:0.18.1' = {
             name: 'DATASET_PATH'
             value: './datasets'
           }
+          {
+            name: 'BACKEND_URL'
+            value: 'https://${containerApp.outputs.fqdn}'
+          }
+          {
+            name: 'BACKEND_API_URL'
+            value: 'https://${containerApp.outputs.fqdn}'
+          }
+          {
+            name: 'MCP_REQUIRE_USER_AUTH'
+            value: 'false'
+          }
         ]
       }
     ]

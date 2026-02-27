@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push:*)",
+      "Bash(az containerapp:*)",
+      "Bash(az monitor:*)",
+      "Bash(uv run:*)",
+      "Bash(git:*)",
+      "Bash(bash:*)"
+    ]
+  }
+}

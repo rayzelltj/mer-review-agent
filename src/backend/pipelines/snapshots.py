@@ -61,12 +61,17 @@ class BlobSnapshotStore:
                 "azure-storage-blob is not installed; cannot enable blob snapshots."
             ) from exc
 
-        account_url = account_url or os.getenv("AZURE_STORAGE_ACCOUNT_URL", "").strip()
+        account_url = (
+            account_url
+            or os.getenv("AZURE_STORAGE_ACCOUNT_URL", "").strip()
+            or os.getenv("AZURE_STORAGE_BLOB_URL", "").strip()
+        )
         if not account_url:
             account_name = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "").strip()
             if not account_name:
                 raise RuntimeError(
-                    "AZURE_STORAGE_ACCOUNT_URL or AZURE_STORAGE_ACCOUNT_NAME is required for blob snapshots."
+                    "AZURE_STORAGE_ACCOUNT_URL, AZURE_STORAGE_BLOB_URL, or "
+                    "AZURE_STORAGE_ACCOUNT_NAME is required for blob snapshots."
                 )
             account_url = f"https://{account_name}.blob.core.windows.net"
 
@@ -230,12 +235,17 @@ class BlobRunArtifactStore:
                 "azure-storage-blob is not installed; cannot enable blob artifacts."
             ) from exc
 
-        account_url = account_url or os.getenv("AZURE_STORAGE_ACCOUNT_URL", "").strip()
+        account_url = (
+            account_url
+            or os.getenv("AZURE_STORAGE_ACCOUNT_URL", "").strip()
+            or os.getenv("AZURE_STORAGE_BLOB_URL", "").strip()
+        )
         if not account_url:
             account_name = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "").strip()
             if not account_name:
                 raise RuntimeError(
-                    "AZURE_STORAGE_ACCOUNT_URL or AZURE_STORAGE_ACCOUNT_NAME is required for blob artifacts."
+                    "AZURE_STORAGE_ACCOUNT_URL, AZURE_STORAGE_BLOB_URL, or "
+                    "AZURE_STORAGE_ACCOUNT_NAME is required for blob artifacts."
                 )
             account_url = f"https://{account_name}.blob.core.windows.net"
 

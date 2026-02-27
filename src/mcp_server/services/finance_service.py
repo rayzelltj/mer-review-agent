@@ -419,41 +419,10 @@ class FinanceService(MCPToolBase):
 
             Unlike start_balance_sheet_review + wait_for_balance_sheet_review, this tool
             makes a single HTTP call with no polling loop.
+
+            Always starts a fresh pipeline run — never returns cached results.
             """
             try:
-                # First, check for an existing active run (idempotency).
-                try:
-                    existing = _request_json(
-                        "GET",
-                        f"/api/reviews/balance-sheet/find?client_id={quote(client_id)}&period_end={period_end}",
-                    )
-                    existing_run_id = existing.get("run_id") or existing.get("id")
-                    existing_status = str(existing.get("status") or "").lower()
-                    if existing_run_id and existing_status not in ("failed", ""):
-                        LOGGER.info(
-                            "run_balance_sheet_review: reusing existing run_id=%s status=%s",
-                            existing_run_id,
-                            existing_status,
-                        )
-                        # If the run is already done, return it.
-                        if existing_status == "done":
-                            payload = _request_json(
-                                "GET",
-                                f"/api/reviews/balance-sheet/runs/{existing_run_id}",
-                            )
-                            details = _summarize_run(payload)
-                            return format_success_response(
-                                "Balance Sheet Review Complete (Reused)",
-                                details,
-                                summary=f"Reusing completed run {existing_run_id}.",
-                            )
-                except Exception as lookup_err:
-                    status_code = getattr(
-                        getattr(lookup_err, "response", None), "status_code", None
-                    )
-                    if status_code != 404:
-                        LOGGER.warning("run_balance_sheet_review lookup failed: %s", lookup_err)
-
                 # Call the synchronous endpoint — blocks until pipeline completes.
                 # Use a 90-second timeout: well above 25-45s target, below ALB default.
                 url = f"{_backend_url()}/api/reviews/balance-sheet/run"

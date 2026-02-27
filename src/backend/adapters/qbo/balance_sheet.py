@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -7,6 +8,8 @@ from typing import Any, Iterable
 
 from common.rules_engine.models import BalanceSheetSnapshot
 from .accounts import QBOAccountTypeInfo, account_type_map_from_accounts_payload
+
+logger = logging.getLogger(__name__)
 
 
 class QBOBalanceSheetAdapterError(ValueError):
@@ -121,6 +124,27 @@ def balance_sheet_snapshot_from_report(
 
     account_col = _find_column_index(report, "account")
     total_col = _find_column_index(report, "total")
+
+    # Log column discovery for diagnostics — helps catch API response format changes.
+    cols = report.get("Columns", {}).get("Column")
+    col_count = len(cols) if isinstance(cols, list) else 0
+    if account_col is None or total_col is None:
+        col_titles = [
+            c.get("ColTitle", "") for c in (cols or []) if isinstance(c, dict)
+        ]
+        logger.warning(
+            "balance_sheet_adapter: column MetaData missing or unexpected — "
+            "account_col=%s total_col=%s col_count=%d col_titles=%s as_of=%s; "
+            "falling back to positional indices 0/1",
+            account_col, total_col, col_count, col_titles,
+            header.get("EndPeriod"),
+        )
+    else:
+        logger.debug(
+            "balance_sheet_adapter: columns resolved — account_col=%d total_col=%d col_count=%d as_of=%s",
+            account_col, total_col, col_count, header.get("EndPeriod"),
+        )
+
     # Fall back to the canonical sample structure if metadata is absent.
     account_col = 0 if account_col is None else account_col
     total_col = 1 if total_col is None else total_col

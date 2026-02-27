@@ -1,6 +1,6 @@
 """
-Human-in-the-loop Magentic Manager for employee onboarding orchestration.
-Extends StandardMagenticManager (agent_framework version) to add approval gates before plan execution.
+Magentic Manager with custom prompts for balance sheet review orchestration.
+Extends StandardMagenticManager (agent_framework version).
 """
 
 import asyncio
@@ -9,7 +9,6 @@ from typing import Any, Optional
 
 import v4.models.messages as messages
 from agent_framework import ChatMessage
-from common.database.database_factory import DatabaseFactory
 from agent_framework._workflows._magentic import (
     MagenticContext,
     StandardMagenticManager,
@@ -27,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 class HumanApprovalMagenticManager(StandardMagenticManager):
     """
-    Extended Magentic manager (agent_framework) that requires human approval before executing plan steps.
-    Provides interactive approval for each step in the orchestration plan.
+    Magentic manager with custom orchestration prompts for balance sheet review workflows.
+    Approval gate is disabled — the orchestrator routes directly to agents without user friction.
     """
 
     approval_enabled: bool = True
@@ -58,10 +57,10 @@ The first plan step must always be a MagenticManager orchestration step that sta
 Every plan step — including steps 2, 3, and all subsequent steps — MUST start with the assigned agent name in bold (e.g. **ReviewAgent**, **ProxyAgent**). Never omit the agent name from any step.
 
 BALANCE SHEET REVIEW — PIPELINE FLOW (when a full review is requested):
-  **ReviewAgent** → calls check_qbo_connection, then run_balance_sheet_review (single synchronous call that runs the full pipeline), returns structured JSON with run_id, findings, balance_sheet_rows, hitl_requests
+  **ReviewAgent** → calls qbo_connection_status, then run_balance_sheet_review (single synchronous call that runs the full pipeline), returns structured JSON with run_id, findings, balance_sheet_rows, hitl_requests
 
 FLEXIBLE FLOW — NOT every query requires a full review run. Route based on user intent:
-  - "Is QBO connected?" or "check QBO status" → **ReviewAgent** (check_qbo_connection) → **ProxyAgent**
+  - "Is QBO connected?" or "check QBO status" → **ReviewAgent** (qbo_connection_status) → **ProxyAgent**
   - "Run balance sheet review for client X" → **ReviewAgent** (run_balance_sheet_review) → **ProxyAgent**
   - "What were the findings from run <run_id>?" → **ReviewAgent** (get_balance_sheet_review) → **ProxyAgent**
   - "Why did cash fail?" or follow-up questions → **ReviewAgent** (get_balance_sheet_review with prior run_id) → **ProxyAgent**
@@ -98,128 +97,17 @@ BALANCE SHEET REVIEW OUTPUT FORMAT — When the task involves a balance sheet re
 
     async def plan(self, magentic_context: MagenticContext) -> Any:
         """
-        Override the plan method to create the plan first, then ask for approval before execution.
-        Returns the original plan ChatMessage if approved, otherwise raises.
+        Generate the orchestration plan and proceed immediately — no user approval gate.
+
+        Plan approval adds friction for deterministic, predictable workflows such as
+        balance sheet reviews. The orchestrator routes directly to agents without waiting
+        for the user to click "Approve", which eliminates the stuck-waiting failure mode
+        and the "failed to submit approval" error that occurs when the backend has already
+        moved past the approval state by the time the user clicks.
         """
-        # Normalize task text
         task_text = getattr(magentic_context.task, "text", str(magentic_context.task))
-
-        logger.info("\n Human-in-the-Loop Magentic Manager Creating Plan:")
-        logger.info("   Task: %s", task_text)
-        logger.info("-" * 60)
-
-        logger.info(" Creating execution plan...")
-        plan_message = await super().plan(magentic_context)
-        logger.info(
-            " Plan created (assistant message length=%d)",
-            len(plan_message.text) if plan_message and plan_message.text else 0,
-        )
-
-        # Build structured MPlan from task ledger
-        if self.task_ledger is None:
-            raise RuntimeError("task_ledger not set after plan()")
-
-        self.magentic_plan = self.plan_to_obj(magentic_context, self.task_ledger)
-        self.magentic_plan.user_id = self.current_user_id  # annotate with user
-        if not self.magentic_plan.plan_id:
-            try:
-                # Recover current plan_id so polling clients can render approval UI
-                # even if the websocket drops before the approval request arrives.
-                from v4.config.settings import run_control_config
-
-                active_run = await run_control_config.get_active_run(
-                    user_id=self.current_user_id
-                )
-                if active_run and active_run.plan_id:
-                    self.magentic_plan.plan_id = active_run.plan_id
-            except Exception as attach_err:
-                logger.warning(
-                    "Unable to attach plan_id to m_plan for user=%s: %s",
-                    self.current_user_id,
-                    attach_err,
-                )
-
-        if self.magentic_plan.plan_id:
-            try:
-                memory_store = await DatabaseFactory.get_database(
-                    user_id=self.current_user_id
-                )
-                db_plan = await memory_store.get_plan_by_plan_id(
-                    plan_id=self.magentic_plan.plan_id
-                )
-                if db_plan:
-                    db_plan.m_plan = self.magentic_plan.model_dump()
-                    await memory_store.update_plan(db_plan)
-            except Exception as persist_err:
-                logger.warning(
-                    "Failed to persist pending m_plan for user=%s plan_id=%s: %s",
-                    self.current_user_id,
-                    self.magentic_plan.plan_id,
-                    persist_err,
-                )
-
-        approval_message = messages.PlanApprovalRequest(
-            plan=self.magentic_plan,
-            status="PENDING_APPROVAL",
-            context=(
-                {
-                    "task": task_text,
-                    "participant_descriptions": magentic_context.participant_descriptions,
-                }
-                if hasattr(magentic_context, "participant_descriptions")
-                else {}
-            ),
-        )
-
-        try:
-            orchestration_config.plans[self.magentic_plan.id] = self.magentic_plan
-        except Exception as e:
-            logger.error("Error processing plan approval: %s", e)
-
-        # Auto-approve standard balance sheet review workflows — no user friction needed.
-        _BALANCE_SHEET_REVIEW_PATTERNS = (
-            "balance sheet review",
-            "mer review",
-            "balance-sheet review",
-            "run.*review",
-            "review.*balance sheet",
-        )
-        import re as _re
-        _task_lower = task_text.lower()
-        _is_standard_bs_review = any(
-            _re.search(pat, _task_lower) for pat in _BALANCE_SHEET_REVIEW_PATTERNS
-        )
-        if _is_standard_bs_review:
-            logger.info(
-                "Auto-approving plan for standard balance sheet review (task=%s)",
-                task_text[:120],
-            )
-            return plan_message
-
-        # Send approval request
-        await connection_config.send_status_update_async(
-            message=approval_message,
-            user_id=self.current_user_id,
-            message_type=messages.WebsocketMessageType.PLAN_APPROVAL_REQUEST,
-        )
-
-        # Await user response
-        approval_response = await self._wait_for_user_approval(approval_message.plan.id)
-
-        if approval_response and approval_response.approved:
-            logger.info("Plan approved - proceeding with execution...")
-            return plan_message
-        else:
-            logger.debug("Plan execution cancelled by user")
-            await connection_config.send_status_update_async(
-                {
-                    "type": messages.WebsocketMessageType.PLAN_APPROVAL_RESPONSE,
-                    "data": approval_response,
-                },
-                user_id=self.current_user_id,
-                message_type=messages.WebsocketMessageType.PLAN_APPROVAL_RESPONSE,
-            )
-            raise Exception("Plan execution cancelled by user")
+        logger.info("Creating plan (approval gate disabled): task=%.120s", task_text)
+        return await super().plan(magentic_context)
 
     async def replan(self, magentic_context: MagenticContext) -> Any:
         """

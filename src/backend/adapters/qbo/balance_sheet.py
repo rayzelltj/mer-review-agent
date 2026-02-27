@@ -154,24 +154,36 @@ def balance_sheet_snapshot_from_report(
     if not isinstance(rows, dict):
         raise QBOBalanceSheetAdapterError("Report.Rows missing or invalid.")
 
+    rows_processed = 0
+    rows_skipped_no_balance = 0
+    rows_skipped_no_id = 0
+    rows_skipped_bad_structure = 0
+
     def _append_from_coldata(coldata: Any) -> None:
+        nonlocal rows_processed, rows_skipped_no_balance, rows_skipped_no_id, rows_skipped_bad_structure
         if not isinstance(coldata, list):
+            rows_skipped_bad_structure += 1
             return
         if account_col >= len(coldata) or total_col >= len(coldata):
+            rows_skipped_bad_structure += 1
             return
         acct_cell = coldata[account_col]
         total_cell = coldata[total_col]
         if not isinstance(acct_cell, dict) or not isinstance(total_cell, dict):
+            rows_skipped_bad_structure += 1
             return
         acct_id = acct_cell.get("id")
         acct_name = acct_cell.get("value") if isinstance(acct_cell.get("value"), str) else ""
         if not isinstance(acct_id, str) or not acct_id.strip():
             if not include_rows_without_id:
+                rows_skipped_no_id += 1
                 return
             acct_id = f"report::{acct_name}".strip() or "report::unknown"
         bal = _parse_decimal(total_cell.get("value"))
         if bal is None:
+            rows_skipped_no_balance += 1
             return
+        rows_processed += 1
         account_ref = acct_id.strip()
         if realm_id:
             account_ref = f"qbo::{realm_id}::{account_ref}"
@@ -221,6 +233,17 @@ def balance_sheet_snapshot_from_report(
                         _append_from_coldata(summary)
 
     _append_rows(rows)
+
+    logger.info(
+        "balance_sheet_adapter: as_of=%s accounts=%d processed=%d "
+        "skipped_no_balance=%d skipped_no_id=%d skipped_bad_structure=%d",
+        as_of,
+        len(accounts),
+        rows_processed,
+        rows_skipped_no_balance,
+        rows_skipped_no_id,
+        rows_skipped_bad_structure,
+    )
 
     return BalanceSheetSnapshot(
         as_of_date=as_of,

@@ -357,11 +357,10 @@ class OrchestrationManager:
                 session_id,
                 run_id,
             )
-            with traced_phase(
-                "orchestration.workflow_stream",
-                logger=self.logger,
-                attributes={"run.id": run_id, "plan.id": plan_id, "user.id": user_id},
-            ):
+            _ORCHESTRATION_TIMEOUT_S = 180  # 3 minutes — well above 25-45s pipeline target
+
+            async def _consume_stream() -> None:
+                nonlocal final_text, final_output
                 async for event in workflow.run_stream(task_text):
                     await run_control_config.refresh_ttl(user_id=user_id, run_id=run_id)
                     try:
@@ -387,7 +386,7 @@ class OrchestrationManager:
                         elif isinstance(event, MagenticAgentMessageEvent):
                             if event.message:
                                 try:
-                                    agent_response_callback(
+                                    await agent_response_callback(
                                         event.agent_id, event.message, user_id
                                     )
                                 except Exception as e:
@@ -417,6 +416,25 @@ class OrchestrationManager:
                             e,
                             exc_info=True,
                         )
+
+            with traced_phase(
+                "orchestration.workflow_stream",
+                logger=self.logger,
+                attributes={"run.id": run_id, "plan.id": plan_id, "user.id": user_id},
+            ):
+                try:
+                    await asyncio.wait_for(_consume_stream(), timeout=_ORCHESTRATION_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    self.logger.error(
+                        "Orchestration timed out after %ds user=%s run_id=%s",
+                        _ORCHESTRATION_TIMEOUT_S,
+                        user_id,
+                        run_id,
+                    )
+                    final_text = (
+                        "The review timed out. This usually means the backend pipeline "
+                        "is taking longer than expected. Please try again."
+                    )
 
             final_text = final_output if final_output else final_text
             self.logger.info(

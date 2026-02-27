@@ -230,7 +230,8 @@ class TestOutputGate:
         ]:
             assert not _is_orchestrator_agent(name), f"{name} should not pass gate"
 
-    def test_agent_response_callback_routes_sub_agent_as_internal(self):
+    @pytest.mark.asyncio
+    async def test_agent_response_callback_routes_sub_agent_as_internal(self):
         """Sub-agent final messages are sent with INTERNAL_AGENT_MESSAGE type."""
         from v4.callbacks.response_handlers import agent_response_callback
         from v4.models.messages import WebsocketMessageType
@@ -250,22 +251,12 @@ class TestOutputGate:
         fake_msg.text = '{"run_id":"abc","status":"done"}'
 
         with patch("v4.callbacks.response_handlers.connection_config", mock_connection):
-            with patch("v4.callbacks.response_handlers.asyncio.create_task") as mock_task:
-                # Capture the coroutine passed to create_task and run it
-                captured = []
-                def capture(coro):
-                    captured.append(coro)
-                mock_task.side_effect = capture
-
-                agent_response_callback("ConnectorAgent", fake_msg, user_id="user-1")
-
-                # Run the captured coroutine
-                assert captured, "create_task was not called"
-                asyncio.get_event_loop().run_until_complete(captured[0])
+            await agent_response_callback("ConnectorAgent", fake_msg, user_id="user-1")
 
         assert sent_types == [WebsocketMessageType.INTERNAL_AGENT_MESSAGE]
 
-    def test_agent_response_callback_routes_orchestrator_as_agent_message(self):
+    @pytest.mark.asyncio
+    async def test_agent_response_callback_routes_orchestrator_as_agent_message(self):
         """Orchestrator messages are sent with AGENT_MESSAGE type."""
         from v4.callbacks.response_handlers import agent_response_callback
         from v4.models.messages import WebsocketMessageType
@@ -284,11 +275,7 @@ class TestOutputGate:
         fake_msg.text = "Here is your final report..."
 
         with patch("v4.callbacks.response_handlers.connection_config", mock_connection):
-            with patch("v4.callbacks.response_handlers.asyncio.create_task") as mock_task:
-                captured = []
-                mock_task.side_effect = lambda coro: captured.append(coro)
-                agent_response_callback("MagenticManager", fake_msg, user_id="user-1")
-                asyncio.get_event_loop().run_until_complete(captured[0])
+            await agent_response_callback("MagenticManager", fake_msg, user_id="user-1")
 
         assert sent_types == [WebsocketMessageType.AGENT_MESSAGE]
 

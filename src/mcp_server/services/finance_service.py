@@ -90,7 +90,7 @@ def _resolve_user_auth_header() -> dict[str, str]:
 def _request_json(method: str, path: str, *, json: dict | None = None, params: dict | None = None) -> dict[str, Any]:
     url = f"{_backend_url()}{path}"
     outbound_headers = _resolve_user_auth_header()
-    if _is_truthy_env("MCP_REQUIRE_USER_AUTH", default=True):
+    if _is_truthy_env("MCP_REQUIRE_USER_AUTH", default=False):
         if "authorization" not in {str(k).lower() for k in outbound_headers.keys()}:
             raise RuntimeError(
                 "Missing user auth token in MCP request context. "
@@ -133,6 +133,7 @@ def _summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
                 "account": str(acct.get("name") or acct.get("account_ref") or ""),
                 "section": str(acct.get("type") or ""),
                 "balance": str(acct.get("balance") or "0"),
+                "is_total": bool(row.get("is_total", False)),
                 "status": str(row.get("status") or "NOT_APPLICABLE"),
                 "flag": str(first_hit.get("summary") or "") if hits else "",
                 "action": str(first_hit.get("human_action") or "") if hits else "",

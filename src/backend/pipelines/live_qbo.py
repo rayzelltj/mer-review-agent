@@ -227,6 +227,16 @@ class LiveQBODataSource:
                 period_end=period_end,
                 header_keys=("EndPeriod",),
             )
+            # Validate QBO returned data for the requested date
+            returned_end = (balance_sheet_report.get("Header") or {}).get("EndPeriod", "")
+            if returned_end != period_end.isoformat():
+                LOGGER.warning(
+                    "QBO date mismatch: requested=%s returned=%s client_id=%s realm_id=%s",
+                    period_end.isoformat(),
+                    returned_end,
+                    client_id,
+                    primary_config.realm_id,
+                )
             raw["qbo_balance_sheet"] = balance_sheet_report
 
             # ── Collect + validate + save: prior balance sheets ──────────────────

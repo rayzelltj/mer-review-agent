@@ -103,6 +103,7 @@ def build_balance_sheet_view(
         account_rows.append(
             {
                 "account": acct.model_dump(mode="json"),
+                "is_total": acct.account_ref.startswith("report::"),
                 "status": _worst_status([hit["status"] for hit in hits_sorted]),
                 "balances_by_period": balances_by_period,
                 "rule_hits": hits_sorted,

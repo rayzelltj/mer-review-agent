@@ -129,7 +129,7 @@ def _extract_tool_calls_from_contents(contents: list[Any]) -> list[AgentToolCall
     return tool_calls
 
 
-def agent_response_callback(
+async def agent_response_callback(
     agent_id: str,
     message: ChatMessage,
     user_id: str | None = None,
@@ -144,13 +144,11 @@ def agent_response_callback(
     agent_name = getattr(message, "author_name", None) or agent_id or "Unknown Agent"
     role = getattr(message, "role", "assistant")
 
-    # FIX: Properly extract text from ChatMessage
     # ChatMessage has a .text property that concatenates all TextContent items
     text = ""
     if isinstance(message, ChatMessage):
-        text = message.text  # Use the property directly
+        text = message.text
     else:
-        # Fallback for non-ChatMessage objects
         text = str(getattr(message, "text", ""))
 
     text = sanitize_for_display(clean_citations(text or ""))
@@ -179,12 +177,10 @@ def agent_response_callback(
             timestamp=time.time(),
             content=text,
         )
-        asyncio.create_task(
-            connection_config.send_status_update_async(
-                final_message,
-                user_id,
-                message_type=ws_type,
-            )
+        await connection_config.send_status_update_async(
+            final_message,
+            user_id,
+            message_type=ws_type,
         )
         logger.info("%s message (agent=%s type=%s): %s", str(role).capitalize(), agent_name, ws_type, text[:200])
     except Exception as e:

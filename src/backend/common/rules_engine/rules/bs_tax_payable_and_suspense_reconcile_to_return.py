@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from ..config import TaxPayableAndSuspenseReconcileRuleConfig
@@ -34,6 +34,24 @@ class _TaxPayment:
     payment_amount: Decimal | None
     refund: bool
     agency_id: str | None
+
+
+def _parse_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        s = value.strip().replace(",", "")
+        if not s:
+            return None
+        try:
+            return Decimal(s)
+        except InvalidOperation:
+            return None
+    return None
 
 
 def _iter_items(meta: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -270,7 +288,7 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
                 start_date=_to_date(item.get("start_date")),
                 end_date=_to_date(item.get("end_date")),
                 file_date=_to_date(item.get("file_date")),
-                net_tax_amount_due=item.get("net_tax_amount_due"),
+                net_tax_amount_due=_parse_decimal(item.get("net_tax_amount_due")),
                 upcoming_filing=bool(item.get("upcoming_filing")),
             )
             for item in _iter_items(returns_item.meta or {})
@@ -278,7 +296,7 @@ class BS_TAX_PAYABLE_AND_SUSPENSE_RECONCILE_TO_RETURN(Rule):
         payments = [
             _TaxPayment(
                 payment_date=_to_date(item.get("payment_date")),
-                payment_amount=item.get("payment_amount"),
+                payment_amount=_parse_decimal(item.get("payment_amount")),
                 refund=bool(item.get("refund")),
                 agency_id=item.get("agency_id"),
             )

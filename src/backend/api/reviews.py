@@ -140,14 +140,30 @@ async def run_balance_sheet_review(
     if await_result:
         # Synchronous path: run the full pipeline inline and return complete results.
         # HTTP timeout on Azure Container Apps is 240s; target pipeline is 25-45s.
-        await run_in_threadpool(
-            _run_balance_sheet_review_sync,
-            run_id=run_id,
-            client_id=resolved_client_id,
-            period_end=request.period_end,
-            notes=request.notes,
-            user_principal_id=user_principal_id,
-        )
+        try:
+            await run_in_threadpool(
+                _run_balance_sheet_review_sync,
+                run_id=run_id,
+                client_id=resolved_client_id,
+                period_end=request.period_end,
+                notes=request.notes,
+                user_principal_id=user_principal_id,
+            )
+        except Exception as exc:
+            LOGGER.exception("Synchronous balance sheet review failed run_id=%s", run_id)
+            # Return the failed run record so the caller sees the error details
+            record = await run_in_threadpool(
+                get_balance_sheet_run, run_id, user_principal_id=user_principal_id
+            )
+            if record is not None:
+                resp = _run_record_response(record)
+                return BalanceSheetRunResponse(
+                    run_id=record.run_id,
+                    status=record.status,
+                    error=resp.get("error") or str(exc),
+                )
+            raise HTTPException(status_code=500, detail=str(exc))
+
         record = await run_in_threadpool(
             get_balance_sheet_run, run_id, user_principal_id=user_principal_id
         )
@@ -597,6 +613,7 @@ def _run_balance_sheet_fetch_sync(
         record.completed_at = datetime.now(timezone.utc)
         record.error = str(exc)
         update_balance_sheet_run(record)
+        raise
 
 
 def _run_normalize_phase_sync(

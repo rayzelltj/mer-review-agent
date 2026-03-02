@@ -57,13 +57,16 @@ The first plan step must always be a MagenticManager orchestration step that sta
 Every plan step — including steps 2, 3, and all subsequent steps — MUST start with the assigned agent name in bold (e.g. **ReviewAgent**, **ProxyAgent**). Never omit the agent name from any step.
 
 BALANCE SHEET REVIEW — PIPELINE FLOW (when a full review is requested):
-  **ReviewAgent** → calls qbo_connection_status, then run_balance_sheet_review (single synchronous call that runs the full pipeline), returns structured JSON with run_id, findings, balance_sheet_rows, hitl_requests
+  **ReviewAgent** → calls check_qbo_connection, then get_or_create_balance_sheet_review (idempotent — reuses existing run if one exists, otherwise creates one). Returns structured JSON with run_id, findings, balance_sheet_rows, hitl_requests.
+
+CRITICAL — SINGLE INVOCATION RULE:
+  ReviewAgent must be called EXACTLY ONCE per balance sheet review request. After ReviewAgent returns its JSON response, the task is COMPLETE. Do NOT call ReviewAgent a second time. Proceed directly to generating the final answer from the data ReviewAgent already returned. The JSON contains all balance_sheet_rows, findings, and hitl_requests needed for the final answer.
 
 FLEXIBLE FLOW — NOT every query requires a full review run. Route based on user intent:
-  - "Is QBO connected?" or "check QBO status" → **ReviewAgent** (qbo_connection_status) → **ProxyAgent**
-  - "Run balance sheet review for client X" → **ReviewAgent** (run_balance_sheet_review) → **ProxyAgent**
-  - "What were the findings from run <run_id>?" → **ReviewAgent** (get_balance_sheet_review) → **ProxyAgent**
-  - "Why did cash fail?" or follow-up questions → **ReviewAgent** (get_balance_sheet_review with prior run_id) → **ProxyAgent**
+  - "Is QBO connected?" or "check QBO status" → **ReviewAgent** (check_qbo_connection) → final answer
+  - "Run balance sheet review for client X" → **ReviewAgent** (get_or_create_balance_sheet_review) → final answer
+  - "What were the findings from run <run_id>?" → **ReviewAgent** (get_balance_sheet_review) → final answer
+  - "Why did cash fail?" or follow-up questions → **ReviewAgent** (get_balance_sheet_review with prior run_id) → final answer
 
 If ReviewAgent reports QBO disconnected or unauthorized, terminate the workflow immediately after providing the connect URL through ProxyAgent, and do not attempt the review.
 If ReviewAgent reports a transient tool or network failure, retry the same step up to 2 times before escalating to ProxyAgent.
@@ -77,11 +80,21 @@ BALANCE SHEET REVIEW OUTPUT FORMAT — When the task involves a balance sheet re
 
 1. **Executive Summary** — 3-5 sentences on the client's overall financial position and most critical concerns.
 
-2. **## Balance Sheet** — Render ALL rows from balance_sheet_rows as a markdown table. Add a `### [Section]` heading before each distinct account section group (e.g. ### Assets, ### Current Liabilities, ### Non-current Liabilities, ### Equity). Columns: | Account | Balance | Status | Notes |. Status emoji: ✅ PASS · ❌ FAIL · ⚠️ NEEDS REVIEW · — (NOT_APPLICABLE). Show the row's `flag` in Notes if non-empty, otherwise leave blank. Format balance values with two decimal places.
+2. **## Balance Sheet as of [period_end]** — Render EVERY row from balance_sheet_rows as a markdown table, preserving the QBO account hierarchy. Group rows by their `section` field and add a section heading (e.g. `### Bank`, `### Accounts Receivable`, `### Other Current Asset`, `### Fixed Asset`, `### Other Asset`, `### Accounts Payable`, `### Credit Card`, `### Other Current Liability`, `### Long Term Liability`, `### Equity`). Use the exact section names from the data. Within each section, list accounts in the order they appear. Include total/summary rows (where is_total=true) at the bottom of their section.
 
-3. **## Issues Requiring Attention** — Bullet list of every ❌ FAIL and ⚠️ NEEDS REVIEW account, showing the account name, flag description, and required action from balance_sheet_rows.
+   Table columns: | Account | Balance | Status | Details |
+   - **Account**: The account name. Indent sub-accounts if the hierarchy is apparent.
+   - **Balance**: Formatted with commas and two decimal places (e.g. 254,403.55). Negative values in parentheses.
+   - **Status**: ✅ PASS · ❌ FAIL · ⚠️ NEEDS REVIEW · — (for NOT_APPLICABLE, meaning no rule applies to this account)
+   - **Details**: The row's `flag` text if non-empty. For NOT_APPLICABLE rows, leave blank.
 
-4. **## Recommended Next Steps** — Numbered list of 3-6 concrete actions ordered by urgency.
+   IMPORTANT: Include ALL accounts — not just those with findings. Accounts with status NOT_APPLICABLE and no flag should still appear with "—" status and blank Details. This gives a complete picture of the balance sheet.
+
+3. **## Rules Not Tied to Specific Accounts** — If there are any unmapped findings or rules that apply globally (not to a specific account), list them here with their status and explanation.
+
+4. **## Issues Requiring Attention** — Bullet list of every ❌ FAIL and ⚠️ NEEDS REVIEW item. For each, state: the account name, what the issue is (from the flag), and the specific action required (from the action field). Be specific — reference actual account names, dollar amounts, and dates.
+
+5. **## Recommended Next Steps** — Numbered list of 3-6 concrete actions ordered by urgency. Reference specific accounts and amounts where applicable.
 """
 
         kwargs["task_ledger_plan_prompt"] = (

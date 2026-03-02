@@ -43,42 +43,28 @@ sequenceDiagram
 
     Note over BE,MCP: Agent execution begins
 
-    BE->>AI: ConnectorAgent reasoning
+    BE->>AI: ReviewAgent reasoning
     AI-->>BE: Tool call: check_qbo_connection
     BE->>MCP: check_qbo_connection (bearer token)
     MCP->>BE: GET /api/qbo/status (fan-out)
     BE-->>MCP: Connection status
     MCP-->>BE: Result
 
-    BE->>AI: ConnectorAgent continues
-    AI-->>BE: Tool call: get_or_create_balance_sheet_review
-    BE->>MCP: get_or_create_balance_sheet_review
-    MCP->>BE: POST /api/reviews/balance-sheet/run
-    BE->>QBO: Fetch Balance Sheet, Accounts, Aging Reports
-    BE->>Cosmos: Store review run + raw data
-    BE->>Blob: Store snapshots + artifacts
-    BE-->>MCP: Run created (run_id)
-
-    BE->>AI: NormalizationAgent reasoning
-    AI-->>BE: Tool calls: get_review_run, list_snapshots
-    BE->>MCP: Snapshot retrieval tools
-    MCP->>BE: GET /api/reviews/balance-sheet/runs/{id}/snapshots
-    MCP-->>BE: Snapshot keys + artifact metadata
-
-    BE->>AI: RulesAgent reasoning
-    AI-->>BE: Tool call: run_balance_sheet_rules
-    BE->>MCP: run_balance_sheet_rules
-    MCP->>BE: POST /api/reviews/rules
-    Note over BE: Rules Engine evaluates in-process
-    BE-->>MCP: RuleRunReport (pass/fail/needs_review counts)
-    MCP-->>BE: Findings summary
-
-    BE->>AI: ReportAgent reasoning
-    AI-->>BE: Tool call: get_balance_sheet_view
-    BE->>MCP: get_balance_sheet_view
-    MCP->>BE: GET /api/reviews/balance-sheet/runs/{id}
-    BE-->>MCP: Full balance_sheet_view with 4 periods
-    MCP-->>BE: Executive summary payload
+    BE->>AI: ReviewAgent continues
+    AI-->>BE: Tool call: run_balance_sheet_review
+    BE->>MCP: run_balance_sheet_review (synchronous, ~25-45s)
+    MCP->>BE: POST /api/reviews/balance-sheet/run?await=true
+    Note over BE: Phase 1: Fetch raw QBO data (BS, P&L, TB, accounts, aging, tax)
+    BE->>QBO: 11+ API calls
+    QBO-->>BE: Raw JSON payloads
+    BE->>Blob: Store raw snapshots + artifacts
+    Note over BE: Phase 2: Normalize via adapters (pure functions)
+    Note over BE: Phase 3: Rules Engine evaluates 24 rules in ThreadPool(8)
+    Note over BE: Build balance_sheet_view + generate summary
+    BE->>Cosmos: Update run record (status: done)
+    BE-->>MCP: Full result JSON (run_id, findings, balance_sheet_rows, totals, hitl_requests)
+    MCP-->>BE: Formatted response
+    AI-->>BE: Structured JSON response
 
     BE-->>FE: WS: AGENT_MESSAGE (streaming)
     BE-->>FE: WS: FINAL_RESULT_MESSAGE
@@ -128,12 +114,19 @@ sequenceDiagram
 
 ## Processing Pipeline
 
-### Stage 1: Data Acquisition (ConnectorAgent)
+### Stage 1: Data Acquisition (ReviewAgent → `run_balance_sheet_review`)
 
 ```
-QBO API → Raw JSON payloads → Cosmos DB (review run record) + Blob Storage (snapshots)
+ReviewAgent calls run_balance_sheet_review(client_id, period_end)
+→ MCP forwards to POST /api/reviews/balance-sheet/run?await=true
+→ Backend starts synchronous pipeline:
+  Phase 1: QBO API → Raw JSON payloads → Blob Storage (snapshots) + Cosmos DB (run record)
+  Phase 2: Raw JSON → Adapters (pure functions) → Canonical Pydantic Models → Blob Storage (artifacts)
+  Phase 3: RuleContext → RulesRunner (24 rules, ThreadPool 8) → RuleRunReport + balance_sheet_view
+→ Returns full result JSON to ReviewAgent
 ```
 
+- All three phases execute in a single synchronous call (~25-45s)
 - QBO reports are fetched via `src/backend/connectors/qbo/reports.py`
 - Raw JSON responses are stored as snapshots in Blob Storage for auditability
 - Review run metadata is stored in Cosmos DB with status tracking
@@ -174,7 +167,7 @@ The `RulesRunner` iterates through the `RuleRegistry` (26 rules), calling `evalu
 
 See [Rules Engine](rules-engine.md) for the full rule catalog.
 
-### Stage 4: Report Generation (ReportAgent)
+### Stage 4: Report Generation (Orchestrator Final Answer)
 
 ```
 RuleRunReport + BalanceSheetView → Executive Summary with balance_sheet_rows + findings + next_actions

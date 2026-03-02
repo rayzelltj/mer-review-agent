@@ -44,7 +44,8 @@ const AppWrapper = () => {
         }
         window.userInfo = defaultUserInfo;
         setUserInfoGlobal(defaultUserInfo);
-        await apiService.sendUserBrowserLanguage();
+        // Fire-and-forget: don't block app rendering on this informational call
+        apiService.sendUserBrowserLanguage().catch(() => {});
       } catch (error) {
         console.info("frontend config did not load from python", error);
       } finally {

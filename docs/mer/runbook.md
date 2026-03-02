@@ -53,15 +53,15 @@ Review run status?
 │       Start a new run; the stuck run will eventually time out.
 │
 ├── "raw" (expecting "fetched")
-│   ├── NormalizationAgent hasn't called /normalize yet
-│   │   → Check agent orchestration logs
+│   ├── Normalize phase hasn't executed yet
+│   │   → Check if pipeline was interrupted between phases
 │   │   → Manual: POST /api/reviews/balance-sheet/{run_id}/normalize
 │   └── Normalization failed silently?
 │       → Check run record error field
 │
 ├── "fetched" (expecting "done")
-│   ├── RulesAgent hasn't called /run-rules yet
-│   │   → Check agent orchestration logs
+│   ├── Rules phase hasn't executed yet
+│   │   → Check if pipeline was interrupted between phases
 │   │   → Manual: POST /api/reviews/balance-sheet/{run_id}/run-rules
 │   └── Rules evaluation failed?
 │       → Check run record error field

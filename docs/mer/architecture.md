@@ -225,18 +225,14 @@ src/frontend/src/
 
 ## Agent Roles (Balance Sheet Review Team)
 
-✅ *Verified in code:* `data/agent_teams/balance_sheet_review_team.json`
+✅ *Verified in code:* `data/agent_teams/balance_sheet_review_team.json` (2026-03-02)
 
-| Agent | MCP Tools Used | Key MCP Functions |
-|---|---|---|
-| **ConnectorAgent** | ✅ | `check_qbo_connection`, `get_or_create_balance_sheet_review` |
-| **NormalizationAgent** | ✅ | `get_balance_sheet_review_run`, `list_snapshots` |
-| **RulesAgent** | ✅ | `get_review_findings`, `run_balance_sheet_rules` |
-| **ReportAgent** | ✅ | `get_balance_sheet_view`, `build_executive_summary` |
-| **HITLAgent** | ✅ | `get_missing_evidence_requests`, `get_qbo_connect_url` |
-| **ProxyAgent** | ❌ | (coordinates handoffs, no tool calls) |
+| Agent | Model | MCP Tools | Role |
+|---|---|---|---|
+| **ReviewAgent** | `gpt-4.1` | ✅ (33 tools) | Full review pipeline. Calls `run_balance_sheet_review` for the synchronous pipeline, plus has access to all QBO data query tools, layered pipeline tools, Drive evidence tools, and snapshot/artifact tools. Returns compact JSON. |
+| **ProxyAgent** | — | ✗ | Human-in-the-loop clarification. Relays questions via WebSocket. No model, no tools. |
 
-All agents use model `gpt-4.1` and return compact JSON responses.
+> **Architectural note:** The layered MCP tools (`bs_fetch_data`, `bs_normalize_data`, `bs_run_rules`) and direct QBO query tools (`qbo_get_trial_balance`, `qbo_get_gl_detail`, etc.) are registered and available but currently unused by the ReviewAgent’s system prompt, which directs it to call only `run_balance_sheet_review` (monolithic) or `get_balance_sheet_review` (follow-up). See [Agent Team Evolution Proposal](agent-team-evolution-proposal.md) for the planned multi-agent architecture.
 
 ---
 

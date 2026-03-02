@@ -100,6 +100,7 @@ class OrchestrationConfig:
         self.clarifications: Dict[str, str] = {}  # m_plan_id -> clarification response
         self.max_rounds: int = 20  # Maximum replanning rounds
         self.user_auth_tokens: Dict[str, str] = {}  # user_id -> latest bearer/id token
+        self.workflow_last_run_context: Dict[str, Dict[str, str]] = {}  # user_id -> {"run_id", "session_id", "initial_goal"}
 
         # Event-driven notification system for approvals and clarifications
         self._approval_events: Dict[str, asyncio.Event] = {}

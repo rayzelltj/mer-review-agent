@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import time
 from typing import List, Optional
 
@@ -34,6 +35,22 @@ from v4.config.settings import connection_config, orchestration_config, run_cont
 from v4.models.messages import WebsocketMessageType
 from v4.orchestration.human_approval_manager import HumanApprovalMagenticManager
 from v4.magentic_agents.magentic_agent_factory import MagenticAgentFactory
+
+
+_RUN_ID_PATTERN = re.compile(r"Run ID:\s*([a-f0-9-]+)", re.IGNORECASE)
+
+
+def _try_capture_run_context(
+    text: str, user_id: str, session_id: str, initial_goal: str
+) -> None:
+    """Extract a balance-sheet run_id from agent/tool output and cache it for follow-ups."""
+    match = _RUN_ID_PATTERN.search(text)
+    if match:
+        orchestration_config.workflow_last_run_context[user_id] = {
+            "run_id": match.group(1),
+            "session_id": session_id,
+            "initial_goal": initial_goal,
+        }
 
 
 class OrchestrationManager:
@@ -344,6 +361,27 @@ class OrchestrationManager:
 
         # Build task from input (same as old version)
         task_text = getattr(input_task, "description", str(input_task))
+
+        # Inject prior run context for follow-up questions in the same session
+        if not reset_executor_state:
+            prior_ctx = orchestration_config.workflow_last_run_context.get(user_id)
+            if prior_ctx and prior_ctx.get("session_id") == session_id:
+                prior_run_id = prior_ctx["run_id"]
+                original_request = prior_ctx.get("initial_goal", "")
+                task_text = (
+                    f"CONTEXT FROM PREVIOUS RUN IN THIS SESSION:\n"
+                    f"- Previous balance sheet review run_id: {prior_run_id}\n"
+                    f"- Original request: {original_request}\n"
+                    f"To answer follow-up questions, use get_balance_sheet_review with run_id={prior_run_id}.\n"
+                    f"Do NOT start a new review unless the user explicitly asks for one.\n\n"
+                    f"USER FOLLOW-UP QUESTION: {task_text}"
+                )
+                self.logger.info(
+                    "Enriched follow-up task with prior run context run_id=%s user=%s",
+                    prior_run_id,
+                    user_id,
+                )
+
         self.logger.debug("Task: %s", task_text)
         final_text = ""
         memory_store = await DatabaseFactory.get_database(user_id=user_id)
@@ -395,6 +433,12 @@ class OrchestrationManager:
                                         event.agent_id,
                                         e,
                                     )
+                                # Capture balance-sheet run_id from agent messages
+                                msg_text = getattr(event.message, "text", "")
+                                if msg_text:
+                                    _try_capture_run_context(
+                                        msg_text, user_id, session_id, task_text
+                                    )
 
                         elif isinstance(event, MagenticFinalResultEvent):
                             final_text = getattr(event.message, "text", "")
@@ -444,6 +488,10 @@ class OrchestrationManager:
                 time.perf_counter() - start_ts,
                 len(final_text),
             )
+
+            # Capture run_id from final output for follow-up context
+            if final_text:
+                _try_capture_run_context(final_text, user_id, session_id, task_text)
 
             await connection_config.send_status_update_async(
                 {

@@ -100,6 +100,7 @@ def build_balance_sheet_view(
             lookup = prior_lookup_by_period.get(period_key)
             balance_value = _lookup_period_balance(acct, lookup) if lookup else None
             balances_by_period[period_key] = _stringify_balance(balance_value)
+        notes = _build_account_notes(hits_sorted)
         account_rows.append(
             {
                 "account": acct.model_dump(mode="json"),
@@ -107,6 +108,7 @@ def build_balance_sheet_view(
                 "status": _worst_status([hit["status"] for hit in hits_sorted]),
                 "balances_by_period": balances_by_period,
                 "rule_hits": hits_sorted,
+                "notes": notes,
             }
         )
 
@@ -120,6 +122,32 @@ def build_balance_sheet_view(
         "accounts": account_rows,
         "unmapped_findings": sorted(unmapped_findings, key=_rule_hit_sort_key),
     }
+
+
+def _build_account_notes(hits: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Build a list of per-rule notes for an account row.
+
+    Each entry contains the rule_id, status, and summary so that the
+    report renderer can display ALL rule results — not just the worst.
+    """
+    notes: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        rule_id = hit.get("rule_id") or ""
+        if not rule_id or rule_id in seen:
+            continue
+        seen.add(rule_id)
+        summary = hit.get("summary") or ""
+        status = hit.get("status") or ""
+        if not summary:
+            continue
+        notes.append({
+            "rule_id": rule_id,
+            "status": status,
+            "summary": summary,
+            "human_action": hit.get("human_action") or "",
+        })
+    return notes
 
 
 def _normalize_name(value: str) -> str:

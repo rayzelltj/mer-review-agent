@@ -43,7 +43,7 @@ The MER (Month-End Report) Review Agent is a **Reviewer Copilot** — not a revi
 │  3. Select client + month-end period                            │
 │  4. Submit "Run balance sheet review" task                      │
 │  5. Approve generated plan (human-in-the-loop)                  │
-│  6. Agents execute: connect → normalize → rules → report        │
+│  6. ReviewAgent executes: fetch → normalize → rules → report    │
 │  7. View results: multi-period BS + status per account/rule     │
 │  8. Ask follow-up questions in same chat thread                 │
 │  9. (Future) Export MER Review Package to Google Sheets          │
@@ -52,18 +52,18 @@ The MER (Month-End Report) Review Agent is a **Reviewer Copilot** — not a revi
 
 ### Agent Execution Sequence (Balance Sheet Review Team)
 
-The Balance Sheet Review Team (`data/agent_teams/balance_sheet_review_team.json`) defines 6 agents that execute in sequence:
+The Balance Sheet Review Team (`data/agent_teams/balance_sheet_review_team.json`) defines 2 agents:
 
-| Order | Agent | Role |
-|---|---|---|
-| 1 | **ConnectorAgent** | Parses review context, checks QBO connection, creates/retrieves balance sheet review run |
-| 2 | **NormalizationAgent** | Retrieves review run, lists snapshots, returns snapshot/artifact keys |
-| 3 | **RulesAgent** | Extracts findings from run, returns pass/fail/needs_review counts + critical rule IDs |
-| 4 | **ReportAgent** | Builds executive summary with balance_sheet_rows, key findings, next actions |
-| 5 | **HITLAgent** | Collects missing evidence requests, deduplicates, provides connect URLs |
-| 6 | **ProxyAgent** | Coordinates agent handoffs (no MCP tools) |
+| Order | Agent | Model | Role |
+|---|---|---|---|
+| 1 | **ReviewAgent** | `gpt-4.1` | Full MER review pipeline via MCP tools. Checks QBO connection, triggers the synchronous balance sheet review pipeline (`run_balance_sheet_review`), and returns structured JSON with run results, findings, balance sheet rows, and HITL requests. Has access to 33 MCP tools including direct QBO data queries, layered pipeline tools, and Drive evidence tools. |
+| 2 | **ProxyAgent** | — | Human-in-the-loop clarification agent. Relays questions to the user via WebSocket and returns their response to the orchestrator. No model, no tools. |
 
-✅ *Verified in code:* `data/agent_teams/balance_sheet_review_team.json`
+The orchestrator (`HumanApprovalMagenticManager`) generates a plan, routes to ReviewAgent, and formats the final answer as a markdown executive summary with balance sheet table.
+
+> **Note:** Earlier documentation referenced a 6-agent decomposed architecture (ConnectorAgent, NormalizationAgent, RulesAgent, ReportAgent, HITLAgent). These agents were never deployed. The current architecture uses a single ReviewAgent that calls the monolithic `run_balance_sheet_review` MCP tool, which internally executes all pipeline phases (fetch → normalize → rules → report) in a single synchronous API call.
+
+✅ *Verified in code:* `data/agent_teams/balance_sheet_review_team.json` (2026-03-02)
 
 ---
 

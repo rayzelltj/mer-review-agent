@@ -158,7 +158,7 @@ async def run_balance_sheet_review(
             if record is not None:
                 resp = _run_record_response(record)
                 return BalanceSheetRunResponse(
-                    run_id=record.run_id,
+                    run_id=record.id,
                     status=record.status,
                     error=resp.get("error") or str(exc),
                 )
@@ -171,7 +171,7 @@ async def run_balance_sheet_review(
             raise HTTPException(status_code=500, detail="Run record missing after pipeline completion")
         resp = _run_record_response(record)
         return BalanceSheetRunResponse(
-            run_id=record.run_id,
+            run_id=record.id,
             status=record.status,
             summary=resp.get("summary"),
             findings=resp.get("findings"),
@@ -1326,12 +1326,16 @@ def _read_blob_storage_key(key: str) -> tuple[bytes, str | None, str] | None:
     except ImportError as exc:
         raise RuntimeError("azure-storage-blob is required to read blob snapshots/artifacts.") from exc
 
-    account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL", "").strip()
+    account_url = (
+        os.getenv("AZURE_STORAGE_ACCOUNT_URL", "").strip()
+        or os.getenv("AZURE_STORAGE_BLOB_URL", "").strip()
+    )
     if not account_url:
         account_name = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "").strip()
         if not account_name:
             raise RuntimeError(
-                "AZURE_STORAGE_ACCOUNT_URL or AZURE_STORAGE_ACCOUNT_NAME is required."
+                "AZURE_STORAGE_ACCOUNT_URL, AZURE_STORAGE_BLOB_URL, or "
+                "AZURE_STORAGE_ACCOUNT_NAME is required."
             )
         account_url = f"https://{account_name}.blob.core.windows.net"
 

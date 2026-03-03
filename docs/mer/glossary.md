@@ -21,7 +21,7 @@
 | **HITL** | Human-In-The-Loop — a design pattern where the system pauses for human input before proceeding. Used for plan approval and missing evidence requests. |
 | **MCP** | Model Context Protocol — an open protocol for AI tool invocation. The MCP server exposes domain-specific tools (finance, HR, etc.) that agents can call. |
 | **FastMCP** | A Python SDK for building MCP servers. Used by the MACAE MCP server. |
-| **Agent** | A specialized AI component with a specific role (e.g., ConnectorAgent, RulesAgent). Each agent has a system prompt and can invoke MCP tools. |
+| **Agent** | A specialized AI component with a specific role (e.g., ReviewAgent, ProxyAgent). Each agent has a system prompt and can invoke MCP tools. |
 | **Team** | A configured set of agents that work together on a specific domain task. Defined in JSON team config files under `data/agent_teams/`. |
 | **Orchestrator** | The backend component that manages the execution of a plan — creating, sequencing, and streaming agent execution. |
 | **Plan** | A generated list of steps to accomplish a user's task. Plans require human approval before execution. |

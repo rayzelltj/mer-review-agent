@@ -1,14 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { Spinner } from '@fluentui/react-components';
 import { getApiUrl, getAuthToken, setApiUrl, setEnvData, toBoolean } from '@/api/config';
 import { setStoredReviewClientId } from '@/services/QboReviewContextService';
 import { redirectToAadLogin } from '@/utils/authSession';
 
-const FETCH_TIMEOUT_MS = 15_000;
-
 const QboConnectPage: React.FC = () => {
   const [message, setMessage] = useState('Preparing QBO authorization...');
-  const [isLoading, setIsLoading] = useState(true);
 
   const resolveApiBaseUrl = async (): Promise<string | null> => {
     let apiUrl = getApiUrl();
@@ -56,16 +52,12 @@ const QboConnectPage: React.FC = () => {
 
       const target = `${baseUrl}/api/qbo/connect/prepare?client_id=${encodeURIComponent(clientId)}`;
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
         const response = await fetch(target, {
           method: 'GET',
           headers: {
             Authorization: `Bearer ${token}`,
           },
-          signal: controller.signal,
         });
-        clearTimeout(timeoutId);
         if (response.status === 401) {
           redirectToAadLogin();
           return;
@@ -86,24 +78,14 @@ const QboConnectPage: React.FC = () => {
 
         window.location.replace(authorizationUrl);
       } catch (error) {
-        const msg = (error as Error).name === 'AbortError'
-          ? 'Request timed out. The backend may be starting up — please try again in a moment.'
-          : `Unable to start QBO authorization: ${(error as Error).message}`;
-        setMessage(msg);
-      } finally {
-        setIsLoading(false);
+        setMessage(`Unable to start QBO authorization: ${(error as Error).message}`);
       }
     };
 
     startOauth();
   }, []);
 
-  return (
-    <div style={{ padding: '24px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
-      {isLoading && <Spinner size="medium" label={message} />}
-      {!isLoading && <p>{message}</p>}
-    </div>
-  );
+  return <div style={{ padding: '24px' }}>{message}</div>;
 };
 
 export default QboConnectPage;

@@ -326,6 +326,8 @@ const PlanPage: React.FC = () => {
             const line = PlanDataService.simplifyHumanClarification(streamingMessage.data.content);
             setShowBufferingText(true);
             setStreamingMessageBuffer(prev => prev + line);
+            // Dismiss the "Processing..." spinner as soon as streaming content arrives
+            setWaitingForPlan(false);
             //scrollToBottom();
 
         });
@@ -534,6 +536,9 @@ const PlanPage: React.FC = () => {
             const agentMessageData = agentMessage.data as AgentMessageData;
             if (agentMessageData) {
                 agentMessageData.content = PlanDataService.simplifyHumanClarification(agentMessageData?.content);
+
+                // Dismiss the "Processing..." spinner as soon as agent output arrives
+                setWaitingForPlan(false);
 
                 // Dedup: build a stable key and silently drop messages we have already seen
                 // (covers WS reconnect storms, double-sends, and duplicate run_id emissions).

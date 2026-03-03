@@ -28,6 +28,8 @@ const HomePage: React.FC = () => {
     const [isLoadingTeam, setIsLoadingTeam] = useState<boolean>(true);
     const [reloadLeftList, setReloadLeftList] = useState<boolean>(true);
     const [selectedQboClientId, setSelectedQboClientId] = useState<string>(() => getStoredReviewClientId());
+    const [initTeamRetryCount, setInitTeamRetryCount] = useState<number>(0);
+    const MAX_INIT_RETRIES = 2;
 
     useEffect(() => {
         const params = new URLSearchParams(window.location.search || "");
@@ -116,6 +118,19 @@ const HomePage: React.FC = () => {
             } catch (error) {
                 console.error('Error initializing team from backend:', error);
                 const message = error instanceof Error ? error.message : 'Team initialization failed.';
+
+                // Auto-retry on timeout or network errors (backend cold start)
+                if (initTeamRetryCount < MAX_INIT_RETRIES) {
+                    const isTimeout = message.includes('timed out') || message.includes('AbortError');
+                    const isNetwork = message.includes('fetch') || message.includes('network') || message.includes('Failed to fetch');
+                    if (isTimeout || isNetwork) {
+                        console.log(`init_team retry ${initTeamRetryCount + 1}/${MAX_INIT_RETRIES}...`);
+                        setInitTeamRetryCount(prev => prev + 1);
+                        showToast(`Server is starting up — retrying (${initTeamRetryCount + 1}/${MAX_INIT_RETRIES})...`, "info");
+                        return; // useEffect will re-run because initTeamRetryCount changed
+                    }
+                }
+
                 showToast(`${message} You can still upload a custom team configuration.`, "info");
 
                 // Don't block the user - allow them to upload custom teams
@@ -126,7 +141,7 @@ const HomePage: React.FC = () => {
         };
 
         initTeam();
-    }, []);
+    }, [initTeamRetryCount]);
 
     /**
     * Handle new task creation from the "New task" button

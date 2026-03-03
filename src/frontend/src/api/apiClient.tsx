@@ -29,8 +29,11 @@ const buildUrl = (url: string, params?: Record<string, any>): string => {
     return queryString ? `${url}?${queryString}` : url;
 };
 
+// Default request timeout (ms). init_team can take 30-60s on cold start.
+const DEFAULT_TIMEOUT_MS = 90_000;
+
 // Fetch with Authentication Headers
-const fetchWithAuth = async (url: string, method: string = "GET", body: BodyInit | null = null) => {
+const fetchWithAuth = async (url: string, method: string = "GET", body: BodyInit | null = null, timeoutMs: number = DEFAULT_TIMEOUT_MS) => {
     const authHeaders = headerBuilder(); // Get authentication headers
 
     const headers: Record<string, string> = {
@@ -51,11 +54,17 @@ const fetchWithAuth = async (url: string, method: string = "GET", body: BodyInit
         body: body || undefined,
     };
 
+    // Attach AbortController for request timeout
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    options.signal = controller.signal;
+
     try {
         const apiUrl = getApiUrl();
         const finalUrl = `${apiUrl}${url}`;
         // Log the request details
         const response = await fetch(finalUrl, options);
+        clearTimeout(timer);
 
         const contentType = response.headers.get('content-type') || '';
         const isJson = contentType.includes('application/json');
@@ -79,6 +88,15 @@ const fetchWithAuth = async (url: string, method: string = "GET", body: BodyInit
 
         return responseData;
     } catch (error) {
+        clearTimeout(timer);
+        if ((error as DOMException)?.name === 'AbortError') {
+            throw new APIClientError(
+                `Request timed out after ${timeoutMs / 1000}s. The server may be starting up — please try again.`,
+                0,
+                null,
+                ''
+            );
+        }
         console.info('API Error:', (error as Error).message);
         throw error;
     }

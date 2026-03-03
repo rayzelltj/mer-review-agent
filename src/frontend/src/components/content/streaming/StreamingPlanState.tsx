@@ -45,7 +45,7 @@ const renderThinkingState = (waitingForPlan: boolean) => {
                         fontSize: '14px'
                     }}>
                         <Spinner size="small" />
-                        <span>Creating your plan...</span>
+                        <span>Processing your request...</span>
                     </div>
                 </div>
             </div>

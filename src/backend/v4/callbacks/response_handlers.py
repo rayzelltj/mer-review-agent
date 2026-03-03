@@ -77,17 +77,31 @@ _INTERNAL_NAME_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in _INTERNAL_NAME_MAP) + r")\b"
 )
 
+# Pattern to strip internal routing instructions like:
+# "Transferred to ProxyAgent, adopt the persona immediately."
+# "Transferred to AccountingAgent, adopt the persona immediately."
+_TRANSFER_RE = re.compile(
+    r"Transferred\s+to\s+\w+(?:Agent|Manager)\s*[,.]?\s*(?:adopt\s+the\s+persona\s+immediately\s*[.]?\s*)?",
+    re.IGNORECASE,
+)
+
 
 def sanitize_for_display(text: str) -> str:
     """Replace internal agent/tool names with user-friendly equivalents.
 
     This is a best-effort sanitizer. It catches the most common leakage patterns
-    (agent names used as nouns in prose) without risking false positives on
-    unrelated content.
+    (agent names used as nouns in prose, internal transfer instructions) without
+    risking false positives on unrelated content.
     """
     if not text:
         return text
-    return _INTERNAL_NAME_RE.sub(lambda m: _INTERNAL_NAME_MAP[m.group(0)], text)
+    # Strip internal routing/transfer messages first
+    text = _TRANSFER_RE.sub("", text)
+    # Replace internal agent names with user-friendly labels
+    text = _INTERNAL_NAME_RE.sub(lambda m: _INTERNAL_NAME_MAP[m.group(0)], text)
+    # Clean up any resulting double-spaces or leading/trailing whitespace
+    text = re.sub(r"  +", " ", text).strip()
+    return text
 
 
 def _is_orchestrator_agent(agent_name: str) -> bool:

@@ -343,3 +343,47 @@ class TestOutputGate:
             )
 
         assert WebsocketMessageType.AGENT_TOOL_MESSAGE in sent_types
+
+
+class TestSanitizeForDisplay:
+    """Tests for sanitize_for_display output sanitization."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_v4_settings(self, monkeypatch):
+        import sys
+
+        mock_settings = MagicMock()
+        mock_settings.connection_config = MagicMock()
+        monkeypatch.delitem(sys.modules, "v4.callbacks.response_handlers", raising=False)
+        monkeypatch.delitem(sys.modules, "v4.config.settings", raising=False)
+        monkeypatch.setitem(sys.modules, "v4.config.settings", mock_settings)
+
+    def test_strips_transfer_messages(self):
+        """Internal transfer routing messages are stripped from output."""
+        from v4.callbacks.response_handlers import sanitize_for_display
+
+        text = "Transferred to ProxyAgent, adopt the persona immediately. Please confirm the data."
+        result = sanitize_for_display(text)
+        assert "Transferred" not in result
+        assert "adopt the persona" not in result
+        assert "confirm the data" in result
+
+    def test_strips_transfer_without_comma(self):
+        from v4.callbacks.response_handlers import sanitize_for_display
+
+        text = "Transferred to AccountingAgent. Run the review now."
+        result = sanitize_for_display(text)
+        assert "Transferred" not in result
+        assert "Run the review now" in result
+
+    def test_replaces_agent_names(self):
+        from v4.callbacks.response_handlers import sanitize_for_display
+
+        assert "Accounting Analyst" in sanitize_for_display("AccountingAgent found an issue")
+        assert "Assistant" in sanitize_for_display("ProxyAgent relayed the message")
+
+    def test_handles_empty_and_none(self):
+        from v4.callbacks.response_handlers import sanitize_for_display
+
+        assert sanitize_for_display("") == ""
+        assert sanitize_for_display(None) is None

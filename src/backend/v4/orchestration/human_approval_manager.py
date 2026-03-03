@@ -47,30 +47,52 @@ class HumanApprovalMagenticManager(StandardMagenticManager):
 
 IMPORTANT: Never ask the user for information or clarification until all agents on the team have been asked first.
 
-EXAMPLE: If the user request involves product information, first ask all agents on the team to provide the information.
-Do not ask the user unless all agents have been consulted and the information is still missing.
+Plan steps should always include a bullet point, followed by an agent name, followed by a description of the action to be taken. If a step involves multiple actions, separate them into distinct steps with an agent included in each step. The first plan step must always be a MagenticManager orchestration step that states it will coordinate the team. Every plan step MUST start with the assigned agent name in bold.
 
-Plan steps should always include a bullet point, followed by an agent name, followed by a description of the action
-to be taken. If a step involves multiple actions, separate them into distinct steps with an agent included in each step.
-If the step is taken by an agent that is not part of the team, such as the MagenticManager, please always list the MagenticManager as the agent for that step. At any time, if more information is needed from the user, use the ProxyAgent to request this information.
-The first plan step must always be a MagenticManager orchestration step that states it will coordinate the team.
-Every plan step — including steps 2, 3, and all subsequent steps — MUST start with the assigned agent name in bold (e.g. **ReviewAgent**, **ProxyAgent**). Never omit the agent name from any step.
+## WORKFLOW TEMPLATES — Select based on user intent:
 
-BALANCE SHEET REVIEW — PIPELINE FLOW (when a full review is requested):
-  **ReviewAgent** → calls check_qbo_connection, then get_or_create_balance_sheet_review (idempotent — reuses existing run if one exists, otherwise creates one). Returns structured JSON with run_id, findings, balance_sheet_rows, hitl_requests.
+### TEMPLATE 1: FULL_REVIEW
+Triggered by: "Run balance sheet review", "Review client X for period Y"
+1. **MagenticManager** — Coordinate balance sheet review workflow
+2. **AccountingAgent** — Check QBO connection, run or retrieve review, investigate findings, log evidence
+3. **MagenticManager** — Compile final report from AccountingAgent results
 
-CRITICAL — SINGLE INVOCATION RULE:
-  ReviewAgent must be called EXACTLY ONCE per balance sheet review request. After ReviewAgent returns its JSON response, the task is COMPLETE. Do NOT call ReviewAgent a second time. Proceed directly to generating the final answer from the data ReviewAgent already returned. The JSON contains all balance_sheet_rows, findings, and hitl_requests needed for the final answer.
+### TEMPLATE 2: INVESTIGATE
+Triggered by: "Why did X fail?", "Investigate variance in Y", "What caused Z?"
+1. **MagenticManager** — Coordinate investigation workflow
+2. **AccountingAgent** — Load prior run, form hypotheses, gather evidence, reach conclusion
+3. **MagenticManager** — Present investigation findings
 
-FLEXIBLE FLOW — NOT every query requires a full review run. Route based on user intent:
-  - "Is QBO connected?" or "check QBO status" → **ReviewAgent** (check_qbo_connection) → final answer
-  - "Run balance sheet review for client X" → **ReviewAgent** (get_or_create_balance_sheet_review) → final answer
-  - "What were the findings from run <run_id>?" → **ReviewAgent** (get_balance_sheet_review) → final answer
-  - "Why did cash fail?" or follow-up questions → **ReviewAgent** (get_balance_sheet_review with prior run_id) → final answer
+### TEMPLATE 3: DATA_QUERY
+Triggered by: "Show me AR aging", "What's the trial balance?", "List accounts"
+1. **MagenticManager** — Coordinate data query
+2. **AccountingAgent** — Call appropriate QBO data tool, format response
+3. **MagenticManager** — Present data
 
-If ReviewAgent reports QBO disconnected or unauthorized, terminate the workflow immediately after providing the connect URL through ProxyAgent, and do not attempt the review.
-If ReviewAgent reports a transient tool or network failure, retry the same step up to 2 times before escalating to ProxyAgent.
-For follow-up questions about a previous review, ReviewAgent uses the same run_id from context and calls get_balance_sheet_review — do NOT trigger a new run unless the user explicitly requests a fresh review.
+### TEMPLATE 4: FOLLOW_UP
+Triggered by: Follow-up questions in same session about a prior review
+1. **MagenticManager** — Coordinate follow-up
+2. **AccountingAgent** — Load prior run, answer from existing data or drill deeper
+3. **MagenticManager** — Present answer
+
+### TEMPLATE 5: CORRECTION
+Triggered by: "That's wrong", "Actually it should be", "Ignore X in future"
+1. **MagenticManager** — Coordinate correction storage
+2. **AccountingAgent** — Parse correction, validate, store via store_correction tool
+3. **MagenticManager** — Confirm correction saved
+
+### TEMPLATE 6: EXPLAIN
+Triggered by: "Explain X", "What does this rule check?", "Why is this important?"
+1. **MagenticManager** — Coordinate explanation
+2. **AccountingAgent** — Retrieve relevant context, explain in accounting terms
+3. **MagenticManager** — Present explanation
+
+## CRITICAL RULES
+- AccountingAgent is called AT MOST TWICE per workflow (once for primary task, once for follow-up if needed)
+- If AccountingAgent reports QBO disconnected, terminate immediately with connect URL
+- For transient failures, retry up to 2 times before escalating via ProxyAgent
+- For follow-ups, AccountingAgent uses existing run_id — do NOT trigger a new review
+- ProxyAgent is used ONLY when human input is explicitly needed (escalation, ambiguous correction, missing info)
 """
 
         final_append = """

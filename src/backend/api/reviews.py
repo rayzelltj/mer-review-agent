@@ -101,6 +101,30 @@ class SubmitEvidenceRequest(BaseModel):
     suggested_source: str = "Drive"
 
 
+class EvidenceLedgerEntryRequest(BaseModel):
+    """Request body for adding an evidence ledger entry."""
+
+    step_type: str = Field(..., description="hypothesis|tool_call|evidence|conclusion|escalation|correction_applied")
+    content: str = Field(..., min_length=1)
+    tool_name: str | None = None
+    tool_input_summary: str | None = None
+    tool_output_summary: str | None = None
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
+    parent_entry_id: str | None = None
+
+
+class CorrectionRequest(BaseModel):
+    """Request body for creating a correction."""
+
+    client_id: str = Field(..., min_length=1)
+    user_correction: str = Field(..., min_length=1)
+    correction_type: str = Field(..., description="classification|threshold|ignore|procedure|general")
+    rule_id: str | None = None
+    account_ref: str | None = None
+    original_output: str = ""
+    reasoning: str = ""
+
+
 def _authenticated_user_id(http_request: Request) -> str | None:
     authenticated_user = get_authenticated_user_details(request_headers=http_request.headers)
     user_id = str(authenticated_user.get("user_principal_id") or "").strip()
@@ -1409,3 +1433,177 @@ def _guess_content_type(path_like: str) -> str:
     if suffix == ".pdf":
         return "application/pdf"
     return "application/octet-stream"
+
+
+# ---------------------------------------------------------------------------
+# Evidence Ledger endpoints
+# ---------------------------------------------------------------------------
+
+def _get_evidence_ledger_container():
+    """Get the Cosmos container client for evidence ledger operations."""
+    from common.database.cosmos_util import get_cosmos_container_client
+    return get_cosmos_container_client()
+
+
+@router.post("/balance-sheet/{run_id}/evidence-ledger")
+async def add_evidence_entry(run_id: str, entry: EvidenceLedgerEntryRequest) -> dict:
+    """Add a reasoning step to the evidence ledger for a balance sheet review run."""
+    from common.models.evidence_ledger import EvidenceLedgerEntry, StepType
+
+    # Validate step_type
+    valid_types = {st.value for st in StepType}
+    if entry.step_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid step_type '{entry.step_type}'. Must be one of: {', '.join(sorted(valid_types))}",
+        )
+
+    ledger_entry = EvidenceLedgerEntry(
+        run_id=run_id,
+        agent="AccountingAgent",
+        step_type=entry.step_type,
+        content=entry.content,
+        tool_name=entry.tool_name,
+        tool_input_summary=entry.tool_input_summary,
+        tool_output_summary=entry.tool_output_summary[:500] if entry.tool_output_summary else None,
+        confidence=entry.confidence,
+        parent_entry_id=entry.parent_entry_id,
+    )
+
+    container = _get_evidence_ledger_container()
+
+    # Try to find existing ledger for this run, or create a new one
+    query = (
+        "SELECT * FROM c WHERE c.data_type='evidence_ledger' AND c.run_id=@run_id"
+    )
+    params = [{"name": "@run_id", "value": run_id}]
+    items = list(
+        container.query_items(
+            query=query, parameters=params, enable_cross_partition_query=True,
+        )
+    )
+
+    if items:
+        doc = items[0]
+        doc["entries"].append(ledger_entry.to_dict())
+        doc["entry_count"] = len(doc["entries"])
+        container.upsert_item(doc)
+    else:
+        # Create new ledger document
+        from common.models.evidence_ledger import EvidenceLedger
+
+        ledger = EvidenceLedger(run_id=run_id)
+        ledger.add_entry(ledger_entry)
+        session_id = f"evidence::{run_id}"
+        doc = ledger.to_cosmos_doc(session_id=session_id)
+        container.upsert_item(doc)
+
+    return {
+        "status": "ok",
+        "entry_id": ledger_entry.entry_id,
+        "run_id": run_id,
+        "entry_count": doc["entry_count"],
+    }
+
+
+@router.get("/balance-sheet/{run_id}/evidence-ledger")
+async def get_evidence_ledger_endpoint(
+    run_id: str,
+    summary: bool = Query(False, description="If true, return only conclusions and escalations"),
+) -> dict:
+    """Retrieve the evidence ledger for a balance sheet review run."""
+    container = _get_evidence_ledger_container()
+
+    query = (
+        "SELECT * FROM c WHERE c.data_type='evidence_ledger' AND c.run_id=@run_id"
+    )
+    params = [{"name": "@run_id", "value": run_id}]
+    items = list(
+        container.query_items(
+            query=query, parameters=params, enable_cross_partition_query=True,
+        )
+    )
+
+    if not items:
+        return {
+            "run_id": run_id,
+            "entry_count": 0,
+            "entries": [],
+        }
+
+    doc = items[0]
+    entries = doc.get("entries", [])
+
+    if summary:
+        entries = [
+            e for e in entries
+            if e.get("step_type") in ("conclusion", "escalation")
+        ]
+
+    return {
+        "run_id": run_id,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Correction endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/corrections")
+async def create_correction(correction: CorrectionRequest) -> dict:
+    """Store a user correction for a specific client."""
+    from common.database.correction_store import save_correction
+
+    valid_types = {"classification", "threshold", "ignore", "procedure", "general"}
+    if correction.correction_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid correction_type '{correction.correction_type}'. Must be one of: {', '.join(sorted(valid_types))}",
+        )
+
+    doc = save_correction(
+        client_id=correction.client_id,
+        user_correction=correction.user_correction,
+        correction_type=correction.correction_type,
+        rule_id=correction.rule_id,
+        account_ref=correction.account_ref,
+        original_output=correction.original_output,
+        reasoning=correction.reasoning,
+    )
+    return {"status": "ok", "correction_id": doc["id"], "client_id": doc["client_id"]}
+
+
+@router.get("/corrections")
+async def list_corrections(
+    client_id: str = Query(..., min_length=1),
+    rule_id: str | None = Query(None),
+    active_only: bool = Query(True),
+    max_results: int = Query(10, ge=1, le=50),
+) -> dict:
+    """List corrections for a client, optionally filtered by rule."""
+    from common.database.correction_store import get_corrections
+
+    corrections = get_corrections(
+        client_id=client_id,
+        rule_id=rule_id,
+        active_only=active_only,
+        max_results=max_results,
+    )
+    return {
+        "client_id": client_id,
+        "count": len(corrections),
+        "corrections": corrections,
+    }
+
+
+@router.delete("/corrections/{correction_id}")
+async def remove_correction(correction_id: str) -> dict:
+    """Soft-delete a correction."""
+    from common.database.correction_store import deactivate_correction
+
+    success = deactivate_correction(correction_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Correction {correction_id} not found or already deactivated")
+    return {"status": "ok", "correction_id": correction_id, "active": False}

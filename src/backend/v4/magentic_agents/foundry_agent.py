@@ -115,9 +115,9 @@ class FoundryAgentTemplate(AzureAgentBase):
         if not tools:
             return "none"
         force_required = os.getenv("MCP_TOOL_CHOICE_REQUIRED", "").strip().lower()
-        if force_required in {"0", "false", "no", "off"}:
-            return "auto"
-        return "required"
+        if force_required in {"1", "true", "yes", "on"}:
+            return "required"
+        return "auto"
 
     # -------------------------
     # Azure Search helper

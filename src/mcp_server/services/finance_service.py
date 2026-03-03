@@ -1269,6 +1269,147 @@ class FinanceService(MCPToolBase):
             except Exception as e:
                 return format_error_response(str(e), context="submitting evidence request")
 
+        # -------------------------------------------------------------------
+        # Evidence Ledger tools
+        # -------------------------------------------------------------------
+
+        @mcp.tool(tags={self.domain.value})
+        def log_evidence_entry(
+            run_id: str,
+            step_type: str,
+            content: str,
+            tool_name: str | None = None,
+            tool_input_summary: str | None = None,
+            tool_output_summary: str | None = None,
+            confidence: float | None = None,
+            parent_entry_id: str | None = None,
+        ) -> str:
+            """Log a reasoning step to the evidence ledger for a balance sheet review run.
+            Used by the AccountingAgent to record hypotheses, tool calls, evidence,
+            conclusions, and escalations during investigation.
+            step_type must be one of: hypothesis, tool_call, evidence, conclusion, escalation, correction_applied.
+            """
+            try:
+                body: dict = {
+                    "step_type": step_type,
+                    "content": content,
+                }
+                if tool_name is not None:
+                    body["tool_name"] = tool_name
+                if tool_input_summary is not None:
+                    body["tool_input_summary"] = tool_input_summary
+                if tool_output_summary is not None:
+                    body["tool_output_summary"] = tool_output_summary
+                if confidence is not None:
+                    body["confidence"] = confidence
+                if parent_entry_id is not None:
+                    body["parent_entry_id"] = parent_entry_id
+
+                payload = _request_json(
+                    "POST",
+                    f"/api/reviews/balance-sheet/{run_id}/evidence-ledger",
+                    json=body,
+                )
+                return format_success_response("Evidence Entry Logged", payload)
+            except Exception as e:
+                return format_error_response(str(e), context="logging evidence entry")
+
+        @mcp.tool(tags={self.domain.value})
+        def get_evidence_ledger(run_id: str) -> str:
+            """Retrieve the full evidence ledger (audit trail) for a review run.
+            Returns all reasoning steps: hypotheses, tool calls, evidence, conclusions, escalations.
+            """
+            try:
+                payload = _request_json(
+                    "GET",
+                    f"/api/reviews/balance-sheet/{run_id}/evidence-ledger",
+                )
+                return format_success_response("Evidence Ledger", payload)
+            except Exception as e:
+                return format_error_response(str(e), context="retrieving evidence ledger")
+
+        @mcp.tool(tags={self.domain.value})
+        def get_evidence_summary(run_id: str) -> str:
+            """Get a summarized evidence ledger (conclusions and escalations only) for a review run.
+            Useful for quick overview of investigation outcomes without full audit trail detail.
+            """
+            try:
+                payload = _request_json(
+                    "GET",
+                    f"/api/reviews/balance-sheet/{run_id}/evidence-ledger?summary=true",
+                )
+                return format_success_response("Evidence Summary", payload)
+            except Exception as e:
+                return format_error_response(str(e), context="retrieving evidence summary")
+
+        # -------------------------------------------------------------------
+        # Correction Memory tools
+        # -------------------------------------------------------------------
+
+        @mcp.tool(tags={self.domain.value})
+        def store_correction(
+            client_id: str,
+            user_correction: str,
+            correction_type: str,
+            rule_id: str | None = None,
+            account_ref: str | None = None,
+            original_output: str = "",
+            reasoning: str = "",
+        ) -> str:
+            """Store a user correction for a specific client. Corrections are retrieved
+            automatically in future reviews to provide context. Types: classification,
+            threshold, ignore, procedure, general."""
+            try:
+                body: dict = {
+                    "client_id": client_id,
+                    "user_correction": user_correction,
+                    "correction_type": correction_type,
+                }
+                if rule_id is not None:
+                    body["rule_id"] = rule_id
+                if account_ref is not None:
+                    body["account_ref"] = account_ref
+                if original_output:
+                    body["original_output"] = original_output
+                if reasoning:
+                    body["reasoning"] = reasoning
+
+                payload = _request_json("POST", "/api/reviews/corrections", json=body)
+                return format_success_response("Correction Stored", payload)
+            except Exception as e:
+                return format_error_response(str(e), context="storing correction")
+
+        @mcp.tool(tags={self.domain.value})
+        def retrieve_corrections(
+            client_id: str,
+            rule_id: str | None = None,
+            max_results: int = 5,
+        ) -> str:
+            """Retrieve stored corrections for a client. Used before generating
+            explanations to incorporate prior feedback. Call this as the FIRST step
+            of any review workflow to load client context."""
+            try:
+                params = f"client_id={quote(client_id)}&max_results={max_results}"
+                if rule_id:
+                    params += f"&rule_id={quote(rule_id)}"
+                payload = _request_json("GET", f"/api/reviews/corrections?{params}")
+                return format_success_response("Corrections Retrieved", payload)
+            except Exception as e:
+                return format_error_response(str(e), context="retrieving corrections")
+
+        @mcp.tool(tags={self.domain.value})
+        def deactivate_correction(correction_id: str) -> str:
+            """Deactivate a correction that is no longer applicable.
+            This soft-deletes the correction so it won't appear in future reviews."""
+            try:
+                payload = _request_json(
+                    "DELETE",
+                    f"/api/reviews/corrections/{quote(correction_id)}",
+                )
+                return format_success_response("Correction Deactivated", payload)
+            except Exception as e:
+                return format_error_response(str(e), context="deactivating correction")
+
     @property
     def tool_count(self) -> int:
-        return 33
+        return 39

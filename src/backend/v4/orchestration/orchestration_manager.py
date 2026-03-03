@@ -30,6 +30,8 @@ from v4.common.services.team_service import TeamService
 from v4.callbacks.response_handlers import (
     agent_response_callback,
     streaming_agent_response_callback,
+    sanitize_for_display,
+    clean_citations,
 )
 from v4.config.settings import connection_config, orchestration_config, run_control_config
 from v4.models.messages import WebsocketMessageType
@@ -419,9 +421,13 @@ class OrchestrationManager:
                 if prior_period:
                     context_lines.append(f"- Period end date: {prior_period}")
                 context_lines.extend([
-                    f"To answer follow-up questions, use get_balance_sheet_review with run_id={prior_run_id}.",
-                    f"For QBO data queries (AR aging, AP aging, trial balance, etc.), use client_id={prior_client_id} and the relevant date.",
-                    "Do NOT start a new review unless the user explicitly asks for one.",
+                    "",
+                    "ROUTING INSTRUCTIONS FOR THIS FOLLOW-UP:",
+                    "- Route this question to AccountingAgent. Do NOT use ProxyAgent for follow-ups about review results.",
+                    f"- AccountingAgent should call get_balance_sheet_review with run_id={prior_run_id} to retrieve the full results.",
+                    f"- For QBO data queries (AR aging, AP aging, trial balance, etc.), use client_id={prior_client_id} and the relevant date.",
+                    "- Do NOT start a new review unless the user explicitly asks for one.",
+                    "- Answer the follow-up question thoroughly with specific numbers and explanations from the review data.",
                     "",
                     f"USER FOLLOW-UP QUESTION: {task_text}",
                 ])
@@ -543,6 +549,10 @@ class OrchestrationManager:
             # Capture run_id from final output for follow-up context
             if final_text:
                 _try_capture_run_context(final_text, user_id, session_id, task_text)
+
+            # Sanitize before sending to UI — strip internal agent names, transfer
+            # instructions, and citation markers so the user sees clean output.
+            final_text = sanitize_for_display(clean_citations(final_text))
 
             await connection_config.send_status_update_async(
                 {

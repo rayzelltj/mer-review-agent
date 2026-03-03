@@ -214,17 +214,21 @@ class TestOutputGate:
             "GroupChatManager",
             "ProxyAgent",
             "PROXYAGENT",
-            "AccountingAgent",
-            "accountingagent",
-            "ReviewAgent",
-            "reviewagent",
         ]:
             assert _is_orchestrator_agent(name), f"{name} should pass gate"
 
     def test_sub_agent_names_fail_gate(self):
-        """Balance-sheet sub-agent names do NOT pass the output gate."""
+        """Balance-sheet sub-agent names do NOT pass the output gate.
+        AccountingAgent and ReviewAgent are intentionally excluded from the
+        orchestrator gate so their per-turn messages stay internal (only the
+        final compiled answer is shown to users).
+        """
         from v4.callbacks.response_handlers import _is_orchestrator_agent
         for name in [
+            "AccountingAgent",
+            "accountingagent",
+            "ReviewAgent",
+            "reviewagent",
             "ConnectorAgent",
             "NormalizationAgent",
             "RulesAgent",

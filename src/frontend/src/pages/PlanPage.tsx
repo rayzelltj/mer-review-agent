@@ -67,6 +67,8 @@ const PlanPage: React.FC = () => {
     // Decoupled from the URL planId so follow-up submissions can reconnect the
     // WebSocket to a new plan without navigating away (no page remount).
     const [activePlanId, setActivePlanId] = useState<string | undefined>(planId);
+    /** Activity log of tool calls — rendered as a collapsible "what's happening" indicator. */
+    const [toolActivityLog, setToolActivityLog] = useState<{ label: string; timestamp: number }[]>([]);
     const formatErrorMessage = useCallback((content: string): string => {
         // Split content by newlines and add proper indentation
         const lines = content.split('\n');
@@ -240,6 +242,7 @@ const PlanPage: React.FC = () => {
         setStreamingMessageBuffer("");
         setShowBufferingText(false);
         setAgentMessages([]);
+        setToolActivityLog([]);
     }, [
         setInput,
         setPlanData,
@@ -345,7 +348,7 @@ const PlanPage: React.FC = () => {
                 return;
             }
             const agentMessageData = {
-                agent: AgentType.GROUP_CHAT_MANAGER,
+                agent: "Assistant" as AgentType,
                 agent_type: AgentMessageType.AI_AGENT,
                 timestamp: clarificationMessage.timestamp || Date.now(),
                 steps: [],   // intentionally always empty
@@ -367,16 +370,21 @@ const PlanPage: React.FC = () => {
 
         return () => unsubscribe();
     }, [scrollToBottom, planData, processAgentMessage]);
-    //WebsocketMessageType.AGENT_TOOL_MESSAGE
+    //WebsocketMessageType.AGENT_TOOL_MESSAGE — track tool activity for the activity indicator
     useEffect(() => {
         const unsubscribe = webSocketService.on(WebsocketMessageType.AGENT_TOOL_MESSAGE, (toolMessage: any) => {
             console.log('📋 Tool Message', toolMessage);
-            // scrollToBottom()
-
+            const labels: string[] = toolMessage?.data?.friendly_labels || [];
+            if (labels.length > 0) {
+                setToolActivityLog(prev => [
+                    ...prev,
+                    ...labels.map(label => ({ label, timestamp: Date.now() })),
+                ]);
+            }
         });
 
         return () => unsubscribe();
-    }, [scrollToBottom]);
+    }, []);
 
 
     //WebsocketMessageType.FINAL_RESULT_MESSAGE
@@ -389,12 +397,12 @@ const PlanPage: React.FC = () => {
                 return;
             }
             const agentMessageData = {
-                agent: AgentType.GROUP_CHAT_MANAGER,
+                agent: "Assistant" as AgentType,
                 agent_type: AgentMessageType.AI_AGENT,
                 timestamp: Date.now(),
                 steps: [],   // intentionally always empty
                 next_steps: [],  // intentionally always empty
-                content: "🎉🎉 " + (finalMessage.data?.content || ''),
+                content: finalMessage.data?.content || '',
                 raw_data: finalMessage,
             } as AgentMessageData;
 
@@ -1219,7 +1227,7 @@ const PlanPage: React.FC = () => {
                                 processingApproval={processingApproval}
                                 handleApprovePlan={handleApprovePlan}
                                 handleRejectPlan={handleRejectPlan}
-
+                                toolActivityLog={toolActivityLog}
                             />
                         </>
                     )}

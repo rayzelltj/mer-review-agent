@@ -314,6 +314,18 @@ export const clearAgentIconAssignments = (): void => {
 export const getAgentDisplayName = (agentName: string): string => {
     if (!agentName) return 'Assistant';
 
+    // Map internal orchestration / framework names to a single user-facing label
+    const internalNames = [
+        'group_chat_manager', 'groupchatmanager',
+        'humanapprovalmagenticmanager', 'standardmagenticmanager',
+        'magenticmanager', 'magentic_manager',
+        'proxyagent', 'proxy_agent',
+        'assistant',
+    ];
+    if (internalNames.includes(agentName.toLowerCase().replace(/\s+/g, ''))) {
+        return 'Assistant';
+    }
+
     // Clean and format the name
     let cleanName = TaskService.cleanTextToSpaces(agentName);
 

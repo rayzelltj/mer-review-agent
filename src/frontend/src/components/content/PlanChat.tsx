@@ -25,7 +25,7 @@ interface SimplifiedPlanChatProps extends PlanChatProps {
   handleRejectPlan: () => Promise<void>;
   processingApproval: boolean;
   inputPlaceholder?: string;
-
+  toolActivityLog?: { label: string; timestamp: number }[];
 }
 
 const PlanChat: React.FC<SimplifiedPlanChatProps> = ({
@@ -48,7 +48,8 @@ const PlanChat: React.FC<SimplifiedPlanChatProps> = ({
   handleApprovePlan,
   handleRejectPlan,
   processingApproval,
-  inputPlaceholder
+  inputPlaceholder,
+  toolActivityLog,
 }) => {
   // States
 
@@ -87,6 +88,35 @@ const PlanChat: React.FC<SimplifiedPlanChatProps> = ({
         {renderAgentMessages(agentMessages)}
 
         {showProcessingPlanSpinner && renderPlanExecutionMessage()}
+
+        {/* Activity indicator — shows tool calls the agent is performing */}
+        {toolActivityLog && toolActivityLog.length > 0 && showProcessingPlanSpinner && (
+          <div style={{
+            maxWidth: '800px',
+            margin: '0 auto 16px auto',
+            padding: '0 24px',
+          }}>
+            <details open style={{
+              backgroundColor: 'var(--colorNeutralBackground2)',
+              borderRadius: '8px',
+              padding: '8px 12px',
+              fontSize: '13px',
+              color: 'var(--colorNeutralForeground2)',
+            }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: '4px' }}>
+                Working on it... ({toolActivityLog.length} {toolActivityLog.length === 1 ? 'step' : 'steps'})
+              </summary>
+              <ul style={{ margin: '4px 0 0 0', paddingLeft: '20px', listStyleType: 'none' }}>
+                {toolActivityLog.map((entry, idx) => (
+                  <li key={idx} style={{ padding: '2px 0', opacity: idx === toolActivityLog.length - 1 ? 1 : 0.6 }}>
+                    {idx === toolActivityLog.length - 1 ? '▸ ' : '✓ '}{entry.label}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          </div>
+        )}
+
         {/* Streaming plan updates */}
         {showBufferingText && (
           <StreamingBufferMessage

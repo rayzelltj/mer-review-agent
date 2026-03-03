@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 # HITLAgent) are intentionally excluded: they must return structured JSON
 # to the orchestrator, not prose to the end-user.
 #
-# AccountingAgent is the primary analyst — its messages ARE user-facing:
-# investigation results, data query answers, evidence summaries.
+# AccountingAgent is NOT included here — its per-turn messages are intermediate
+# work products.  Only the orchestrator's compiled final answer (via
+# FINAL_RESULT_MESSAGE) is shown to the user, achieving single-voice output.
 ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
     {
         "magenticmanager",
@@ -52,11 +53,63 @@ ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
         "standardmagenticmanager",
         "humanapprovalmagenticmanager",
         "groupchatmanager",
-        "proxyagent",         # ProxyAgent relays the user-facing summary
-        "accountingagent",    # Primary analyst — emits review results, data answers, evidence
-        "reviewagent",        # Legacy name alias for AccountingAgent
+        "proxyagent",         # ProxyAgent relays user-facing clarification requests
     }
 )
+
+# User-friendly labels for MCP tool names shown in the activity indicator.
+# Any tool not listed here is auto-formatted (underscores → spaces, title-case).
+_TOOL_FRIENDLY_NAMES: dict[str, str] = {
+    "qbo_connection_status": "Checking QBO connection",
+    "get_or_create_balance_sheet_review": "Running balance sheet review pipeline",
+    "run_balance_sheet_review": "Starting balance sheet review",
+    "get_balance_sheet_review": "Loading review results",
+    "start_balance_sheet_review": "Starting balance sheet review",
+    "wait_for_balance_sheet_review": "Waiting for review to complete",
+    "qbo_get_trial_balance": "Fetching trial balance from QBO",
+    "qbo_get_balance_sheet": "Fetching balance sheet from QBO",
+    "qbo_get_profit_and_loss": "Fetching P&L from QBO",
+    "qbo_get_cash_flow": "Fetching cash flow statement from QBO",
+    "qbo_get_gl_detail": "Fetching general ledger detail from QBO",
+    "qbo_get_transactions_by_account": "Fetching account transactions from QBO",
+    "qbo_get_transaction": "Fetching transaction detail from QBO",
+    "qbo_list_accounts": "Fetching chart of accounts from QBO",
+    "qbo_get_ar_aging": "Fetching AR aging from QBO",
+    "qbo_get_ap_aging": "Fetching AP aging from QBO",
+    "qbo_get_open_invoices": "Fetching open invoices from QBO",
+    "qbo_get_open_bills": "Fetching open bills from QBO",
+    "qbo_get_bank_reconciliation_status": "Checking bank reconciliation status",
+    "qbo_get_sales_tax_liability": "Fetching sales tax liability from QBO",
+    "qbo_get_sales_tax_returns": "Fetching sales tax returns from QBO",
+    "qbo_get_payroll_liabilities": "Fetching payroll liabilities from QBO",
+    "drive_connection_status": "Checking Google Drive connection",
+    "drive_list_files": "Listing files from Google Drive",
+    "drive_get_file": "Retrieving file from Google Drive",
+    "drive_get_evidence_manifest": "Loading evidence requirements",
+    "list_snapshots": "Listing data snapshots",
+    "get_snapshot": "Retrieving snapshot",
+    "get_artifact": "Retrieving artifact",
+    "bs_fetch_data": "Fetching raw balance sheet data from QBO",
+    "bs_normalize_data": "Normalizing balance sheet data",
+    "bs_list_rules": "Loading available review rules",
+    "bs_run_rules": "Running review rules",
+    "bs_get_findings": "Loading review findings",
+    "bs_submit_evidence_request": "Submitting evidence for review",
+    "log_evidence_entry": "Recording reasoning step",
+    "get_evidence_ledger": "Loading audit trail",
+    "get_evidence_summary": "Loading evidence summary",
+    "store_correction": "Saving correction",
+    "retrieve_corrections": "Loading prior corrections for this client",
+    "deactivate_correction": "Removing outdated correction",
+}
+
+
+def friendly_tool_name(tool_name: str) -> str:
+    """Return a user-friendly label for a tool call."""
+    if tool_name in _TOOL_FRIENDLY_NAMES:
+        return _TOOL_FRIENDLY_NAMES[tool_name]
+    # Auto-format: underscores → spaces, title-case
+    return tool_name.replace("_", " ").replace("-", " ").title()
 
 # Internal names that must never appear in user-facing message text.
 _INTERNAL_NAME_MAP: dict[str, str] = {
@@ -238,14 +291,19 @@ async def streaming_agent_response_callback(
 
         cleaned = sanitize_for_display(clean_citations(chunk_text or ""))
 
-        # Tool-call messages: always forward (show spinner / activity) for ALL agents
+        # Tool-call messages: always forward (show activity indicator) for ALL agents
         contents = getattr(update, "contents", []) or []
         tool_calls = _extract_tool_calls_from_contents(contents)
         if tool_calls:
             tool_message = AgentToolMessage(agent_name=agent_id)
             tool_message.tool_calls.extend(tool_calls)
+            # Attach friendly labels so the UI can display human-readable activity steps
+            tool_payload = tool_message.to_dict()
+            tool_payload["friendly_labels"] = [
+                friendly_tool_name(tc.tool_name) for tc in tool_calls
+            ]
             await connection_config.send_status_update_async(
-                tool_message,
+                tool_payload,
                 user_id,
                 message_type=WebsocketMessageType.AGENT_TOOL_MESSAGE,
             )

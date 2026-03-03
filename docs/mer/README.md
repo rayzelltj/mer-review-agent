@@ -37,7 +37,9 @@
 | 13 | [API Reference](api-reference.md) | All REST endpoints with request/response schemas, status codes, and usage notes |
 | 14 | [Error Handling](error-handling.md) | Error codes, retry strategies, exception hierarchy, user-facing messages |
 | 15 | [Operational Runbook](runbook.md) | Troubleshooting decision trees, operational procedures, emergency playbooks |
-| 16 | [Agent Team Evolution Proposal](agent-team-evolution-proposal.md) | v2 architecture: 6-agent accounting reasoning system (AnalystAgent, InvestigatorAgent, DataAgent, MemoryAgent, PrepAgent, ProxyAgent) |
+| 16 | [Agent Team Evolution Proposal](agent-team-evolution-proposal.md) | Initial v2 proposal (SUPERSEDED — see docs 17-18 below) |
+| 17 | [Architecture Decision Record](architecture-decision-record.md) | 10 ADRs governing v2 agent evolution: merged agents, constrained planning, evidence ledger, correction memory, context budgeting, escalation model |
+| 18 | [V2 Implementation Spec](v2-implementation-spec.md) | Approved implementation blueprint: 5 phases, 3 agents, 8 new MCP tools, full system prompts, cost projections, risk register, testing strategy |
 
 ---
 

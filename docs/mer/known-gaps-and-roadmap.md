@@ -97,6 +97,18 @@
 | Performance/load testing suite | Testing |
 | VNet integration for AI Search | Security |
 
+### V2 Agent Evolution (Approved — see [v2-implementation-spec.md](v2-implementation-spec.md))
+
+| Phase | Item | Status | Timeline |
+|---|---|---|---|
+| 0 | Change `tool_choice` to `"auto"`, expand system prompt | ⚠️ Ready | 1 day |
+| 1 | AccountingAgent + Evidence Ledger | ⚠️ Spec complete | 2-3 weeks |
+| 2 | Correction Memory (per-client learning) | ⚠️ Spec complete | 2 weeks |
+| 3 | Data Query Mode + PrepAgent (MER narratives) | ⚠️ Spec complete | 3-4 weeks |
+| 4 | RAG Knowledge Base (policies, prior MERs) | ⚠️ Spec complete | 2-3 weeks |
+
+Architecture decisions: [architecture-decision-record.md](architecture-decision-record.md) (10 ADRs)
+
 ---
 
 ## Priority Next Steps (Recommended)

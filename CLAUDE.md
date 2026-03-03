@@ -12,7 +12,7 @@ Before making ANY code change, read and internalize these docs in order:
 
 1. `docs/architecture/project-spec.md` — platform-wide product & technical spec
 2. `docs/architecture/mer-review-agent-spec.md` — MER-specific product intent & MVP roadmap
-3. `docs/mer/README.md` — index of 15 MER-specific docs (system overview, architecture, data flow, rules engine, integrations, API reference, error handling, runbook, etc.)
+3. `docs/mer/README.md` — index of 18 MER-specific docs (system overview, architecture, data flow, rules engine, integrations, API reference, error handling, runbook, etc.)
 4. `docs/mer/system-overview.md` — what the MER Review Agent does and does not do
 5. `docs/mer/architecture.md` — components, agent roles, orchestration flow
 6. `docs/mer/api-reference.md` — all REST endpoints with request/response schemas
@@ -20,6 +20,8 @@ Before making ANY code change, read and internalize these docs in order:
 8. `docs/mer/known-gaps-and-roadmap.md` — limitations, tech debt, priority next steps
 9. `docs/rules/STATUS.md` — rules implementation checklist
 10. `docs/rules/balance_sheet/` — per-rule specification (22 files)
+11. `docs/mer/v2-implementation-spec.md` — **V2 agent evolution**: 5-phase implementation blueprint (AccountingAgent, Evidence Ledger, Correction Memory, PrepAgent, RAG)
+12. `docs/mer/architecture-decision-record.md` — 10 ADRs for v2 evolution (merged agents, constrained planning, context budgeting, escalation model)
 
 ---
 
@@ -31,7 +33,7 @@ src/backend/           → FastAPI + Python 3.11+ + uv (port :8000)
 src/mcp_server/        → FastMCP tool server (port :9000)
 data/agent_teams/      → JSON team configurations (6 teams)
 data/datasets/         → CSV/JSON data files for non-MER teams
-docs/mer/              → 15 MER-specific documentation files
+docs/mer/              → 18 MER-specific documentation files
 docs/architecture/     → Platform-wide architecture docs
 docs/rules/            → Rules engine status + 22 per-rule specs
 infra/                 → Bicep IaC for Azure deployment

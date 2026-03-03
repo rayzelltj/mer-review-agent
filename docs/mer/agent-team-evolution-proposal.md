@@ -1,8 +1,9 @@
 # Agent Team Evolution Proposal
 
-> **Status:** PROPOSAL — not yet implemented  
+> **Status:** SUPERSEDED by [v2-implementation-spec.md](v2-implementation-spec.md) and [architecture-decision-record.md](architecture-decision-record.md)  
 > **Author:** Architecture Review (2026-03-02)  
 > **Goal:** Evolve from deterministic MER reviewer → autonomous accounting analyst  
+> **Note:** This was the initial proposal. The reviewed & approved specification is in [v2-implementation-spec.md](v2-implementation-spec.md). Key differences: 3 agents instead of 6 (ADR-001), constrained planning instead of free-form (ADR-002), corrections surfaced not applied (ADR-005).  
 
 ---
 

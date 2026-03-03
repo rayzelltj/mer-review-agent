@@ -89,12 +89,7 @@ if connection_string:
     try:
         from azure.monitor.opentelemetry import configure_azure_monitor
         from opentelemetry.sdk.resources import Resource
-    except ImportError as exc:
-        logging.warning(
-            "Azure Monitor exporter unavailable; skipping Application Insights: %s",
-            exc,
-        )
-    else:
+
         resource = Resource.create(
             {
                 "service.name": "macae-backend",
@@ -115,6 +110,16 @@ if connection_string:
         )
         _ENABLE_OTEL = True
         logging.info("Azure Monitor OpenTelemetry configured")
+    except ImportError as exc:
+        logging.warning(
+            "Azure Monitor exporter unavailable; skipping Application Insights: %s",
+            exc,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Failed to configure Azure Monitor; continuing without telemetry: %s",
+            exc,
+        )
 else:
     logging.warning(
         "No Application Insights Instrumentation Key found. Skipping configuration"

@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 # Sub-agents (ConnectorAgent, NormalizationAgent, RulesAgent, ReportAgent,
 # HITLAgent) are intentionally excluded: they must return structured JSON
 # to the orchestrator, not prose to the end-user.
+#
+# AccountingAgent is the primary analyst — its messages ARE user-facing:
+# investigation results, data query answers, evidence summaries.
 ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
     {
         "magenticmanager",
@@ -50,6 +53,8 @@ ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
         "humanapprovalmagenticmanager",
         "groupchatmanager",
         "proxyagent",         # ProxyAgent relays the user-facing summary
+        "accountingagent",    # Primary analyst — emits review results, data answers, evidence
+        "reviewagent",        # Legacy name alias for AccountingAgent
     }
 )
 

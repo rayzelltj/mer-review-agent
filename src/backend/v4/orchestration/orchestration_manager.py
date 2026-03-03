@@ -37,20 +37,58 @@ from v4.orchestration.human_approval_manager import HumanApprovalMagenticManager
 from v4.magentic_agents.magentic_agent_factory import MagenticAgentFactory
 
 
-_RUN_ID_PATTERN = re.compile(r"Run ID:\s*([a-f0-9-]+)", re.IGNORECASE)
+_RUN_ID_PATTERN = re.compile(
+    r"""
+    (?:Run\s*ID[:\s]+)                    # "Run ID: ..." or "Run ID ..."
+    ([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})  # standard UUID
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Fallback: matches "run_id": "..." in JSON output the agent may reproduce verbatim
+_RUN_ID_JSON_PATTERN = re.compile(
+    r'"run_id"\s*:\s*"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})"',
+    re.IGNORECASE,
+)
+
+# Capture client_id and period from "Balance sheet review complete for {client_id} period {period}"
+_CLIENT_PERIOD_PATTERN = re.compile(
+    r"(?:review\s+complete\s+for|review\s+for)\s+(\S+)\s+period\s+(\S+)",
+    re.IGNORECASE,
+)
 
 
 def _try_capture_run_context(
     text: str, user_id: str, session_id: str, initial_goal: str
 ) -> None:
-    """Extract a balance-sheet run_id from agent/tool output and cache it for follow-ups."""
-    match = _RUN_ID_PATTERN.search(text)
+    """Extract a balance-sheet run_id from agent/tool output and cache it for follow-ups.
+
+    Tries multiple patterns: the prose "Run ID: <uuid>" format emitted by MCP tools,
+    and the JSON "run_id": "<uuid>" format from raw tool output. First match wins.
+    Also captures client_id and period_end if present.
+    """
+    match = _RUN_ID_PATTERN.search(text) or _RUN_ID_JSON_PATTERN.search(text)
     if match:
-        orchestration_config.workflow_last_run_context[user_id] = {
-            "run_id": match.group(1),
+        captured = match.group(1)
+        ctx: dict[str, str] = {
+            "run_id": captured,
             "session_id": session_id,
             "initial_goal": initial_goal,
         }
+        # Try to capture client_id and period from tool output
+        cp_match = _CLIENT_PERIOD_PATTERN.search(text)
+        if cp_match:
+            ctx["client_id"] = cp_match.group(1)
+            ctx["period_end"] = cp_match.group(2).rstrip(".")
+        orchestration_config.workflow_last_run_context[user_id] = ctx
+        OrchestrationManager.logger.info(
+            "Captured run context run_id=%s client=%s period=%s session=%s user=%s",
+            captured,
+            ctx.get("client_id", "?"),
+            ctx.get("period_end", "?"),
+            session_id,
+            user_id,
+        )
 
 
 class OrchestrationManager:
@@ -368,17 +406,30 @@ class OrchestrationManager:
             if prior_ctx and prior_ctx.get("session_id") == session_id:
                 prior_run_id = prior_ctx["run_id"]
                 original_request = prior_ctx.get("initial_goal", "")
-                task_text = (
-                    f"CONTEXT FROM PREVIOUS RUN IN THIS SESSION:\n"
-                    f"- Previous balance sheet review run_id: {prior_run_id}\n"
-                    f"- Original request: {original_request}\n"
-                    f"To answer follow-up questions, use get_balance_sheet_review with run_id={prior_run_id}.\n"
-                    f"Do NOT start a new review unless the user explicitly asks for one.\n\n"
-                    f"USER FOLLOW-UP QUESTION: {task_text}"
-                )
+                prior_client_id = prior_ctx.get("client_id", "")
+                prior_period = prior_ctx.get("period_end", "")
+
+                context_lines = [
+                    "CONTEXT FROM PREVIOUS RUN IN THIS SESSION:",
+                    f"- Previous balance sheet review run_id: {prior_run_id}",
+                    f"- Original request: {original_request}",
+                ]
+                if prior_client_id:
+                    context_lines.append(f"- Client ID (QBO realm): {prior_client_id}")
+                if prior_period:
+                    context_lines.append(f"- Period end date: {prior_period}")
+                context_lines.extend([
+                    f"To answer follow-up questions, use get_balance_sheet_review with run_id={prior_run_id}.",
+                    f"For QBO data queries (AR aging, AP aging, trial balance, etc.), use client_id={prior_client_id} and the relevant date.",
+                    "Do NOT start a new review unless the user explicitly asks for one.",
+                    "",
+                    f"USER FOLLOW-UP QUESTION: {task_text}",
+                ])
+                task_text = "\n".join(context_lines)
                 self.logger.info(
-                    "Enriched follow-up task with prior run context run_id=%s user=%s",
+                    "Enriched follow-up task with prior run context run_id=%s client=%s user=%s",
                     prior_run_id,
+                    prior_client_id,
                     user_id,
                 )
 

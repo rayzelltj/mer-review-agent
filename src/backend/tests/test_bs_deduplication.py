@@ -214,6 +214,10 @@ class TestOutputGate:
             "GroupChatManager",
             "ProxyAgent",
             "PROXYAGENT",
+            "AccountingAgent",
+            "accountingagent",
+            "ReviewAgent",
+            "reviewagent",
         ]:
             assert _is_orchestrator_agent(name), f"{name} should pass gate"
 

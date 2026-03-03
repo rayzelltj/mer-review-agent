@@ -50,7 +50,14 @@ RG="${RG:-RG-Automation_Engine-001}"
 ACR_NAME="${ACR_NAME:-acrprodmvpwrf6y}"
 ACR_LOGIN_SERVER="${ACR_LOGIN_SERVER:-${ACR_NAME}.azurecr.io}"
 CONTAINER_APP_NAME="${CONTAINER_APP_NAME:-ca-prodmvpwrf6y}"
-CONTAINER_NAME="${CONTAINER_NAME:-backend}"
+# Auto-detect the container name inside the Container App (avoid adding a
+# duplicate container when the name doesn't match the existing one).
+if [[ -z "${CONTAINER_NAME:-}" ]]; then
+  CONTAINER_NAME=$(az containerapp show \
+    --name "${CONTAINER_APP_NAME}" --resource-group "${RG}" \
+    --query "properties.template.containers[0].name" -o tsv 2>/dev/null || echo "")
+  CONTAINER_NAME="${CONTAINER_NAME:-${CONTAINER_APP_NAME}}"
+fi
 FRONTEND_APP_NAME="${FRONTEND_APP_NAME:-app-prodmvpwrf6y}"
 BACKEND_TAG="${BACKEND_TAG:-prod-$(date -u +%Y%m%d-%H%M)}"
 FRONTEND_TAG="${FRONTEND_TAG:-${BACKEND_TAG}}"

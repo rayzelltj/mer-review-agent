@@ -395,7 +395,7 @@ class OrchestrationManager:
                 session_id,
                 run_id,
             )
-            _ORCHESTRATION_TIMEOUT_S = 600  # 10 minutes — generous safety margin for multi-step orchestration
+            _ORCHESTRATION_TIMEOUT_S = 300  # 5 minutes — allows multi-step orchestration (BS run ~30s + LLM ~20s per cycle)
 
             async def _consume_stream() -> None:
                 nonlocal final_text, final_output

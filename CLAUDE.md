@@ -156,7 +156,7 @@ These are the verified issues from code audit. This is your primary work backlog
 - **Files:** `src/backend/v4/orchestration/orchestration_manager.py`, `src/frontend/src/pages/PlanPage.tsx`, `src/frontend/src/pages/HomePage.tsx`
 
 #### 3. Chat Output Contains Code-Like Text
-- **Symptom:** Users see "MagenticManager", "bs_submit_evidence_request", "ReviewAgent", raw JSON, Python repr strings.
+- **Symptom:** Users see "MagenticManager", "bs_submit_evidence_request", "ConnectorAgent", raw JSON, Python repr strings.
 - **Causes:**
   - `response_handlers.py` sends raw `agent_name` field (internal names) in WebSocket payloads.
   - Plan prompts in `lifecycle.py` explicitly instruct LLM to include agent names in plan steps.
@@ -181,7 +181,7 @@ These are the verified issues from code audit. This is your primary work backlog
   - Agent cold start: creating Azure AI agents on every orchestration run.
   - MCP tool polling: `bs_wait_for_review` polls up to 120s default / 600s max.
   - Max 20 orchestration rounds with no stall detection.
-  - ReviewAgent runs synchronous monolith pipeline (~25-45s) with no streaming progress.
+  - Sequential agent execution (ConnectorAgent → Normalization → Rules → Report → HITL).
 - **Files:** `src/backend/v4/orchestration/orchestration_manager.py`, `src/mcp_server/services/finance_service.py`
 
 #### 6. Limited Question Flexibility
@@ -351,9 +351,11 @@ User submits "Run balance sheet review for Client X, period 2026-01-31"
   ├─ User approves → POST /api/v4/plan_approval
   │
   ├─ Agent execution sequence:
-  │   ├─ ReviewAgent → checks QBO connection, then calls run_balance_sheet_review
-  │   │   (synchronous: fetch → normalize → rules → report in one API call)
-  │   └─ ProxyAgent → relays clarification questions to user (if needed)
+  │   ├─ ConnectorAgent → checks QBO, creates review run (POST /api/reviews/balance-sheet/run)
+  │   ├─ NormalizationAgent → fetches snapshots (POST /api/reviews/balance-sheet/snapshots)
+  │   ├─ RulesAgent → extracts findings from run
+  │   ├─ ReportAgent → builds executive summary with balance_sheet_rows
+  │   └─ HITLAgent → collects missing evidence requests
   │
   └─ Final result → WebSocket final_result_message → UI renders report
 ```

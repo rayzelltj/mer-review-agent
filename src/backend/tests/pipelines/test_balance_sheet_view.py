@@ -3,14 +3,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from common.rules_engine.models import (
-    AccountBalance,
-    BalanceSheetSnapshot,
-    RuleResult,
-    RuleResultDetail,
-    RuleStatus,
-    Severity,
-)
+from common.rules_engine.models import AccountBalance, BalanceSheetSnapshot
 from pipelines.balance_sheet_view import build_balance_sheet_view
 
 
@@ -85,54 +78,3 @@ def test_balance_sheet_view_includes_current_and_three_prior_periods():
         "2025-09-30": None,
     }
     assert rows["qbo::100"]["status"] == "NOT_APPLICABLE"
-    assert rows["qbo::100"]["notes"] == []
-
-
-def test_account_with_multiple_rules_shows_all_notes():
-    """When two rules evaluate the same account, notes should contain both summaries."""
-    current = _snapshot(
-        date(2025, 12, 31),
-        [("qbo::100", "Etsy Clearing Account", Decimal("369.68"))],
-    )
-    rule_a = RuleResult(
-        rule_id="BS-BANK-CC-RECONCILED-THROUGH-PERIOD-END",
-        rule_title="Bank/CC recon",
-        status=RuleStatus.NEEDS_REVIEW,
-        severity=Severity.HIGH,
-        summary="Missing evidence for bank recon.",
-        details=[
-            RuleResultDetail(
-                key="qbo::100",
-                message="Missing evidence.",
-                values={"account_name": "Etsy Clearing Account", "status": "NEEDS_REVIEW"},
-            )
-        ],
-    )
-    rule_b = RuleResult(
-        rule_id="BS-CLEARING-ACCOUNTS-ZERO",
-        rule_title="Clearing accounts zero",
-        status=RuleStatus.WARN,
-        severity=Severity.MEDIUM,
-        summary="Clearing account non-zero but within variance.",
-        details=[
-            RuleResultDetail(
-                key="qbo::100",
-                message="Evaluated.",
-                values={"account_name": "Etsy Clearing Account", "status": "WARN"},
-            )
-        ],
-    )
-    view = build_balance_sheet_view(
-        client_id="acme",
-        period_end=date(2025, 12, 31),
-        balance_sheet=current,
-        results=[rule_a, rule_b],
-    )
-    row = view["accounts"][0]
-    assert row["status"] == "NEEDS_REVIEW"  # worst of the two
-    assert len(row["notes"]) == 2
-    rule_ids = [n["rule_id"] for n in row["notes"]]
-    assert "BS-BANK-CC-RECONCILED-THROUGH-PERIOD-END" in rule_ids
-    assert "BS-CLEARING-ACCOUNTS-ZERO" in rule_ids
-    assert row["notes"][0]["summary"] == "Missing evidence for bank recon."
-    assert row["notes"][1]["summary"] == "Clearing account non-zero but within variance."

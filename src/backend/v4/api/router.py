@@ -361,13 +361,6 @@ async def process_request(
         _preferred_user_auth_token(authenticated_user),
     )
 
-    # Propagate refreshed token to cached agent wrappers (no recreation needed)
-    if token_changed:
-        new_token = orchestration_config.get_user_auth_token(user_id)
-        for wrapper in orchestration_config.agent_wrappers.get(user_id, []):
-            if hasattr(wrapper, "user_auth_token"):
-                wrapper.user_auth_token = new_token
-
     if not input_task.session_id:
         input_task.session_id = str(uuid.uuid4())
 
@@ -431,7 +424,7 @@ async def process_request(
             await OrchestrationManager.get_current_or_new_orchestration(
                 user_id=user_id,
                 team_config=team,
-                team_switched=False,  # Token refresh does not require agent recreation
+                team_switched=token_changed,
                 team_service=team_service,
             )
 

@@ -6,17 +6,7 @@
       "Bash(az monitor:*)",
       "Bash(uv run:*)",
       "Bash(git:*)",
-      "Bash(bash:*)",
-      "Bash(az account:*)",
-      "Bash(az group:*)",
-      "Bash(az resource:*)",
-      "Bash(az cognitiveservices:*)",
-      "Bash(az cosmosdb:*)",
-      "Bash(az identity:*)",
-      "Bash(az:*)",
-      "Bash(curl:*)",
-      "Bash(find:*)",
-      "Bash(grep:*)"
+      "Bash(bash:*)"
     ]
   }
 }

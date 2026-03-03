@@ -34,11 +34,6 @@ async def serve_index():
     return FileResponse(INDEX_HTML)
 
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
-
-
 @app.get("/config")
 async def get_config():
     backend_url = os.getenv("BACKEND_API_URL", "http://localhost:8000")

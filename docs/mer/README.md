@@ -1,6 +1,6 @@
 # MER Review Agent — Documentation Index
 
-> **Last updated:** 2026-03-02
+> **Last updated:** 2025-02-20
 > **Maintainer:** Engineering team
 > **Status:** Living documentation — update as the codebase evolves
 
@@ -37,7 +37,6 @@
 | 13 | [API Reference](api-reference.md) | All REST endpoints with request/response schemas, status codes, and usage notes |
 | 14 | [Error Handling](error-handling.md) | Error codes, retry strategies, exception hierarchy, user-facing messages |
 | 15 | [Operational Runbook](runbook.md) | Troubleshooting decision trees, operational procedures, emergency playbooks |
-| 16 | [Agent Team Evolution Proposal](agent-team-evolution-proposal.md) | v2 architecture: 6-agent accounting reasoning system (AnalystAgent, InvestigatorAgent, DataAgent, MemoryAgent, PrepAgent, ProxyAgent) |
 
 ---
 

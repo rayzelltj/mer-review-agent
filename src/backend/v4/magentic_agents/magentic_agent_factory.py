@@ -72,8 +72,12 @@ class MagenticAgentFactory:
         deployment_name = getattr(agent_obj, "deployment_name", None)
 
         if not deployment_name and agent_obj.name.lower() == "proxyagent":
-            self.logger.info("Creating ProxyAgent")
-            return ProxyAgent(user_id=user_id)
+            agent_desc = getattr(agent_obj, "description", "")
+            self.logger.info("Creating ProxyAgent (description=%s)", agent_desc[:80] if agent_desc else "default")
+            proxy_kwargs: dict = {"user_id": user_id}
+            if agent_desc:
+                proxy_kwargs["description"] = agent_desc
+            return ProxyAgent(**proxy_kwargs)
 
         # Validate supported models
         supported_models = json.loads(config.SUPPORTED_MODELS)

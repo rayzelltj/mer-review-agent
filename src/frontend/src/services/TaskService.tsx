@@ -183,7 +183,8 @@ export class TaskService {
   static async createPlan(
     description: string,
     teamId?: string,
-    sessionId?: string
+    sessionId?: string,
+    conversationContext?: string[]
   ): Promise<InputTaskResponse> {
     const resolvedSessionId = sessionId || this.generateSessionId();
 
@@ -191,9 +192,38 @@ export class TaskService {
       session_id: resolvedSessionId,
       description: description,
       team_id: teamId,
+      ...(conversationContext && conversationContext.length > 0
+        ? { conversation_context: conversationContext }
+        : {}),
     };
 
     return apiService.createPlan(inputTask);
+  }
+
+  /**
+   * Submit a follow-up via the direct fast-path endpoint.
+   * Falls back to createPlan if the direct endpoint fails.
+   */
+  static async submitFollowUp(
+    description: string,
+    sessionId: string,
+    conversationContext?: string[]
+  ): Promise<InputTaskResponse> {
+    const inputTask: InputTask = {
+      session_id: sessionId,
+      description: description,
+      ...(conversationContext && conversationContext.length > 0
+        ? { conversation_context: conversationContext }
+        : {}),
+    };
+
+    try {
+      return await apiService.directFollowUp(inputTask);
+    } catch {
+      // Fall back to full orchestration if direct endpoint fails
+      console.warn('Direct follow-up failed, falling back to full orchestration');
+      return apiService.createPlan(inputTask);
+    }
   }
 }
 

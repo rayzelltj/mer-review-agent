@@ -17,6 +17,7 @@ import {
 // Constants for endpoints
 const API_ENDPOINTS = {
     PROCESS_REQUEST: '/v4/process_request',
+    DIRECT_FOLLOW_UP: '/v4/direct',
     RUN_STATUS: '/v4/run_status',
     CANCEL_RUN: '/v4/cancel_run',
     PLAN_STATUS: '/v4/plan_status',
@@ -116,6 +117,14 @@ export class APIService {
 
     async createPlan(inputTask: InputTask): Promise<InputTaskResponse> {
         return apiClient.post(API_ENDPOINTS.PROCESS_REQUEST, inputTask);
+    }
+
+    /**
+     * Submit a follow-up question via the direct fast-path endpoint.
+     * Bypasses Magentic orchestration for ~70% faster follow-up responses.
+     */
+    async directFollowUp(inputTask: InputTask): Promise<InputTaskResponse> {
+        return apiClient.post(API_ENDPOINTS.DIRECT_FOLLOW_UP, inputTask);
     }
 
     async getRunStatus(): Promise<{

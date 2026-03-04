@@ -250,6 +250,7 @@ class InputTask(BaseModel):
     """Message representing the initial input task from the user."""
     session_id: str
     description: str
+    conversation_context: Optional[List[str]] = None  # Recent messages for follow-up context
 
 
 class UserLanguage(BaseModel):

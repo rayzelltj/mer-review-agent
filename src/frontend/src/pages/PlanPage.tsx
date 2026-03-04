@@ -953,10 +953,27 @@ const PlanPage: React.FC = () => {
                 if (!hasClarificationRequest && isCompleted) {
                     const followUpSessionId = planData.plan.session_id;
                     const followUpTeamId = planData.team?.team_id || planData.plan.team_id;
-                    const response = await TaskService.createPlan(
+
+                    // Build conversation context from recent messages so the backend
+                    // agent has memory of what was discussed in this session.
+                    const recentContext: string[] = [];
+                    const messagesToInclude = agentMessages.slice(-8); // Last 8 messages
+                    for (const msg of messagesToInclude) {
+                        const role = msg.agent === 'human' ? 'User' : 'Assistant';
+                        const content = String(msg.content || msg.raw_data || '').trim();
+                        if (content) {
+                            // Truncate individual messages to avoid token explosion
+                            const truncated = content.length > 1500
+                                ? content.substring(0, 1500) + '...'
+                                : content;
+                            recentContext.push(`[${role}]: ${truncated}`);
+                        }
+                    }
+
+                    const response = await TaskService.submitFollowUp(
                         chatInput,
-                        followUpTeamId,
                         followUpSessionId,
+                        recentContext.length > 0 ? recentContext : undefined,
                     );
 
                     dismissToast(id);

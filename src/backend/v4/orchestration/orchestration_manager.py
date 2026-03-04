@@ -21,6 +21,10 @@ from agent_framework import (
 
 from common.config.app_config import config
 from common.database.database_factory import DatabaseFactory
+from common.database.conversation_store import (
+    save_session_context,
+    get_session_context,
+)
 from common.models.messages_af import PlanStatus, TeamConfiguration
 from common.telemetry import traced_phase
 
@@ -72,6 +76,7 @@ def _try_capture_run_context(
     match = _RUN_ID_PATTERN.search(text) or _RUN_ID_JSON_PATTERN.search(text)
     if match:
         captured = match.group(1)
+        existing = orchestration_config.workflow_last_run_context.get(user_id) or {}
         ctx: dict[str, str] = {
             "run_id": captured,
             "session_id": session_id,
@@ -82,6 +87,9 @@ def _try_capture_run_context(
         if cp_match:
             ctx["client_id"] = cp_match.group(1)
             ctx["period_end"] = cp_match.group(2).rstrip(".")
+        # Preserve any existing review_summary if not overwriting
+        if "review_summary" in existing and existing.get("run_id") == captured:
+            ctx["review_summary"] = existing["review_summary"]
         orchestration_config.workflow_last_run_context[user_id] = ctx
         OrchestrationManager.logger.info(
             "Captured run context run_id=%s client=%s period=%s session=%s user=%s",
@@ -90,6 +98,46 @@ def _try_capture_run_context(
             ctx.get("period_end", "?"),
             session_id,
             user_id,
+        )
+
+
+def _capture_review_summary(final_text: str, user_id: str) -> None:
+    """Store a condensed version of the final review output for follow-up context.
+
+    Persists both in-memory (for fast same-container follow-ups) and to Cosmos
+    (for cross-restart durability). The Cosmos write is fire-and-forget.
+    """
+    if not final_text or len(final_text) < 100:
+        return
+    existing = orchestration_config.workflow_last_run_context.get(user_id)
+    if not existing or not existing.get("run_id"):
+        return
+    # Store up to 6000 chars of the final answer as review summary context.
+    # This gives the agent enough data to answer most follow-ups directly.
+    summary = final_text[:6000]
+    existing["review_summary"] = summary
+    orchestration_config.workflow_last_run_context[user_id] = existing
+    OrchestrationManager.logger.info(
+        "Stored review summary (%d chars) for user=%s run_id=%s",
+        len(summary),
+        user_id,
+        existing.get("run_id", "?"),
+    )
+    # Persist to Cosmos for cross-restart durability
+    try:
+        save_session_context(
+            user_id=user_id,
+            session_id=existing.get("session_id", ""),
+            run_id=existing.get("run_id", ""),
+            initial_goal=existing.get("initial_goal", ""),
+            client_id=existing.get("client_id", ""),
+            period_end=existing.get("period_end", ""),
+            review_summary=summary,
+        )
+    except Exception:
+        OrchestrationManager.logger.warning(
+            "Failed to persist session context to Cosmos for user=%s", user_id,
+            exc_info=True,
         )
 
 
@@ -405,38 +453,77 @@ class OrchestrationManager:
         # Inject prior run context for follow-up questions in the same session
         if not reset_executor_state:
             prior_ctx = orchestration_config.workflow_last_run_context.get(user_id)
+            # Fall back to Cosmos if in-memory context is empty (e.g. after restart)
+            if (not prior_ctx or prior_ctx.get("session_id") != session_id) and session_id:
+                cosmos_ctx = get_session_context(user_id, session_id)
+                if cosmos_ctx and cosmos_ctx.get("run_id"):
+                    prior_ctx = {
+                        "run_id": cosmos_ctx["run_id"],
+                        "session_id": cosmos_ctx.get("original_session_id", session_id),
+                        "initial_goal": cosmos_ctx.get("initial_goal", ""),
+                        "client_id": cosmos_ctx.get("client_id", ""),
+                        "period_end": cosmos_ctx.get("period_end", ""),
+                        "review_summary": cosmos_ctx.get("review_summary", ""),
+                    }
+                    # Re-hydrate in-memory cache
+                    orchestration_config.workflow_last_run_context[user_id] = prior_ctx
+                    self.logger.info(
+                        "Re-hydrated session context from Cosmos user=%s session=%s run_id=%s",
+                        user_id, session_id, prior_ctx["run_id"],
+                    )
             if prior_ctx and prior_ctx.get("session_id") == session_id:
                 prior_run_id = prior_ctx["run_id"]
                 original_request = prior_ctx.get("initial_goal", "")
                 prior_client_id = prior_ctx.get("client_id", "")
                 prior_period = prior_ctx.get("period_end", "")
+                review_summary = prior_ctx.get("review_summary", "")
 
                 context_lines = [
-                    "CONTEXT FROM PREVIOUS RUN IN THIS SESSION:",
-                    f"- Previous balance sheet review run_id: {prior_run_id}",
+                    "=== FOLLOW-UP CONTEXT (same session) ===",
+                    "",
+                    "PRIOR REVIEW DATA:",
+                    f"- Balance sheet review run_id: {prior_run_id}",
                     f"- Original request: {original_request}",
                 ]
                 if prior_client_id:
                     context_lines.append(f"- Client ID (QBO realm): {prior_client_id}")
                 if prior_period:
                     context_lines.append(f"- Period end date: {prior_period}")
+
+                # Include conversation context from frontend (recent messages)
+                conv_ctx = getattr(input_task, "conversation_context", None) or []
+                if conv_ctx:
+                    context_lines.append("")
+                    context_lines.append("RECENT CONVERSATION HISTORY:")
+                    for msg in conv_ctx[-8:]:  # Last 8 messages max
+                        context_lines.append(f"  {msg}")
+
+                # Include the review summary so the agent can answer directly
+                if review_summary:
+                    context_lines.append("")
+                    context_lines.append("PREVIOUS REVIEW RESULTS (summary):")
+                    context_lines.append(review_summary)
+
                 context_lines.extend([
                     "",
-                    "ROUTING INSTRUCTIONS FOR THIS FOLLOW-UP:",
-                    "- Route this question to AccountingAgent. Do NOT use ProxyAgent for follow-ups about review results.",
-                    f"- AccountingAgent should call get_balance_sheet_review with run_id={prior_run_id} to retrieve the full results.",
-                    f"- For QBO data queries (AR aging, AP aging, trial balance, etc.), use client_id={prior_client_id} and the relevant date.",
-                    "- Do NOT start a new review unless the user explicitly asks for one.",
-                    "- Answer the follow-up question thoroughly with specific numbers and explanations from the review data.",
+                    "=== ROUTING INSTRUCTIONS ===",
+                    "THIS IS A FOLLOW-UP QUESTION. Use TEMPLATE 4: FOLLOW_UP.",
+                    "1. Route DIRECTLY to AccountingAgent. NEVER route to ProxyAgent.",
+                    "2. AccountingAgent: Answer from the review data above if possible. Only call tools if the answer cannot be derived from the context.",
+                    f"3. If you need fresh data, use run_id={prior_run_id} or client_id={prior_client_id}.",
+                    "4. Do NOT start a new review. Do NOT ask the user for clarification unless genuinely ambiguous.",
+                    "5. After AccountingAgent responds, go DIRECTLY to final answer. No other agents needed.",
                     "",
                     f"USER FOLLOW-UP QUESTION: {task_text}",
                 ])
                 task_text = "\n".join(context_lines)
                 self.logger.info(
-                    "Enriched follow-up task with prior run context run_id=%s client=%s user=%s",
+                    "Enriched follow-up task with prior run context run_id=%s client=%s user=%s has_summary=%s has_conv_ctx=%s",
                     prior_run_id,
                     prior_client_id,
                     user_id,
+                    bool(review_summary),
+                    bool(conv_ctx),
                 )
 
         self.logger.debug("Task: %s", task_text)
@@ -549,6 +636,7 @@ class OrchestrationManager:
             # Capture run_id from final output for follow-up context
             if final_text:
                 _try_capture_run_context(final_text, user_id, session_id, task_text)
+                _capture_review_summary(final_text, user_id)
 
             # Sanitize before sending to UI — strip internal agent names, transfer
             # instructions, and citation markers so the user sees clean output.
@@ -645,3 +733,270 @@ class OrchestrationManager:
         finally:
             await run_control_config.release_run(user_id=user_id, run_id=run_id)
             self.logger.info("Released run lock user=%s run_id=%s", user_id, run_id)
+
+    # ---------------------------
+    # Direct follow-up (fast path)
+    # ---------------------------
+    async def run_direct_followup(
+        self,
+        user_id: str,
+        input_task,
+        plan_id: str,
+        run_id: str,
+    ) -> None:
+        """Execute a follow-up question by calling AccountingAgent directly.
+
+        Bypasses the full Magentic orchestration loop (plan generation, routing,
+        progress ledger, final-answer compilation) and invokes the cached
+        AccountingAgent wrapper's ``invoke()`` method. This reduces a follow-up
+        from ~4 LLM calls to exactly 1.
+
+        Falls back to full orchestration if no cached agent is available.
+        """
+        self.logger.info(
+            "Starting DIRECT follow-up run_id=%s plan_id=%s user=%s",
+            run_id, plan_id, user_id,
+        )
+
+        # --- Find cached AccountingAgent wrapper ---
+        wrappers = orchestration_config.agent_wrappers.get(user_id, [])
+        accounting_agent = None
+        for w in wrappers:
+            name = getattr(w, "agent_name", None) or getattr(w, "name", "")
+            if name.lower() == "accountingagent":
+                accounting_agent = w
+                break
+
+        if accounting_agent is None:
+            self.logger.warning(
+                "No cached AccountingAgent for user=%s; falling back to full orchestration.",
+                user_id,
+            )
+            return await self.run_orchestration(
+                user_id=user_id,
+                input_task=input_task,
+                plan_id=plan_id,
+                run_id=run_id,
+            )
+
+        # --- Build enriched prompt ---
+        session_id = str(getattr(input_task, "session_id", "") or "")
+        task_text = getattr(input_task, "description", str(input_task))
+
+        # Load prior context (in-memory first, then Cosmos)
+        prior_ctx = orchestration_config.workflow_last_run_context.get(user_id)
+        if (not prior_ctx or prior_ctx.get("session_id") != session_id) and session_id:
+            cosmos_ctx = get_session_context(user_id, session_id)
+            if cosmos_ctx and cosmos_ctx.get("run_id"):
+                prior_ctx = {
+                    "run_id": cosmos_ctx["run_id"],
+                    "session_id": cosmos_ctx.get("original_session_id", session_id),
+                    "initial_goal": cosmos_ctx.get("initial_goal", ""),
+                    "client_id": cosmos_ctx.get("client_id", ""),
+                    "period_end": cosmos_ctx.get("period_end", ""),
+                    "review_summary": cosmos_ctx.get("review_summary", ""),
+                }
+                orchestration_config.workflow_last_run_context[user_id] = prior_ctx
+                self.logger.info(
+                    "Re-hydrated context from Cosmos for direct follow-up user=%s run_id=%s",
+                    user_id, prior_ctx["run_id"],
+                )
+
+        if prior_ctx and prior_ctx.get("session_id") == session_id:
+            prior_run_id = prior_ctx["run_id"]
+            context_lines = [
+                "=== FOLLOW-UP CONTEXT (same session) ===",
+                "",
+                "PRIOR REVIEW DATA:",
+                f"- Balance sheet review run_id: {prior_run_id}",
+                f"- Original request: {prior_ctx.get('initial_goal', '')}",
+            ]
+            if prior_ctx.get("client_id"):
+                context_lines.append(f"- Client ID (QBO realm): {prior_ctx['client_id']}")
+            if prior_ctx.get("period_end"):
+                context_lines.append(f"- Period end date: {prior_ctx['period_end']}")
+
+            conv_ctx = getattr(input_task, "conversation_context", None) or []
+            if conv_ctx:
+                context_lines.append("")
+                context_lines.append("RECENT CONVERSATION HISTORY:")
+                for msg in conv_ctx[-8:]:
+                    context_lines.append(f"  {msg}")
+
+            review_summary = prior_ctx.get("review_summary", "")
+            if review_summary:
+                context_lines.append("")
+                context_lines.append("PREVIOUS REVIEW RESULTS (summary):")
+                context_lines.append(review_summary)
+
+            context_lines.extend([
+                "",
+                "=== INSTRUCTIONS ===",
+                "Answer this follow-up question using the context above.",
+                "Only call tools if the answer cannot be derived from the provided context.",
+                f"If you need fresh data, use run_id={prior_run_id}.",
+                "",
+                f"USER QUESTION: {task_text}",
+            ])
+            task_text = "\n".join(context_lines)
+
+        self.logger.info(
+            "Direct follow-up prompt built (%d chars) user=%s", len(task_text), user_id,
+        )
+
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        final_text = ""
+
+        try:
+            start_ts = time.perf_counter()
+            _DIRECT_TIMEOUT_S = 180  # 3 minutes — generous for single-agent call
+
+            collected_chunks: list[str] = []
+
+            async def _run_agent():
+                nonlocal final_text
+                async for update in accounting_agent.invoke(task_text):
+                    await run_control_config.refresh_ttl(user_id=user_id, run_id=run_id)
+
+                    # Extract text from streaming update
+                    chunk_text = getattr(update, "text", None)
+                    if not chunk_text:
+                        contents = getattr(update, "contents", []) or []
+                        parts = []
+                        for item in contents:
+                            txt = getattr(item, "text", None)
+                            if txt:
+                                parts.append(str(txt))
+                        chunk_text = "".join(parts) if parts else ""
+
+                    if chunk_text:
+                        cleaned = sanitize_for_display(clean_citations(chunk_text))
+                        if cleaned:
+                            collected_chunks.append(cleaned)
+                            # Stream directly to UI (bypass output gate)
+                            await connection_config.send_status_update_async(
+                                {
+                                    "agent_name": "AccountingAgent",
+                                    "content": cleaned,
+                                    "is_final": False,
+                                },
+                                user_id,
+                                message_type=WebsocketMessageType.AGENT_MESSAGE_STREAMING,
+                            )
+
+                    # Forward tool-call events for activity indicators
+                    contents = getattr(update, "contents", []) or []
+                    for item in contents:
+                        if getattr(item, "content_type", None) == "function_call" or hasattr(item, "function_name"):
+                            tool_name = getattr(item, "function_name", None) or getattr(item, "name", "tool_call")
+                            await connection_config.send_status_update_async(
+                                {
+                                    "agent_name": "AccountingAgent",
+                                    "tool_calls": [{"tool_name": str(tool_name)}],
+                                },
+                                user_id,
+                                message_type=WebsocketMessageType.AGENT_TOOL_MESSAGE,
+                            )
+
+                final_text = "".join(collected_chunks)
+
+            try:
+                await asyncio.wait_for(_run_agent(), timeout=_DIRECT_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "Direct follow-up timed out after %ds user=%s run_id=%s",
+                    _DIRECT_TIMEOUT_S, user_id, run_id,
+                )
+                final_text = "The follow-up timed out. Please try again."
+
+            elapsed = time.perf_counter() - start_ts
+            self.logger.info(
+                "Direct follow-up completed user=%s run_id=%s duration_s=%.2f len=%d",
+                user_id, run_id, elapsed, len(final_text),
+            )
+
+            # Capture context from output
+            if final_text:
+                _try_capture_run_context(final_text, user_id, session_id, task_text)
+                _capture_review_summary(final_text, user_id)
+
+            final_text = sanitize_for_display(clean_citations(final_text))
+
+            # Send final result
+            await connection_config.send_status_update_async(
+                {
+                    "content": final_text,
+                    "status": "completed",
+                    "timestamp": asyncio.get_event_loop().time(),
+                    "plan_id": plan_id,
+                    "run_id": run_id,
+                },
+                user_id,
+                message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
+            )
+
+            plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+            if plan:
+                plan.overall_status = PlanStatus.completed
+                plan.streaming_message = final_text
+                await memory_store.update_plan(plan)
+
+        except asyncio.CancelledError:
+            self.logger.info(
+                "Direct follow-up cancelled user=%s run_id=%s", user_id, run_id,
+            )
+            try:
+                plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+                if plan and plan.overall_status != PlanStatus.canceled:
+                    plan.overall_status = PlanStatus.canceled
+                    plan.streaming_message = "Run cancelled by user."
+                    await memory_store.update_plan(plan)
+            except Exception:
+                pass
+            try:
+                await connection_config.send_status_update_async(
+                    {
+                        "content": "Run cancelled by user.",
+                        "status": "canceled",
+                        "timestamp": asyncio.get_event_loop().time(),
+                        "plan_id": plan_id,
+                        "run_id": run_id,
+                    },
+                    user_id,
+                    message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
+                )
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            self.logger.error(
+                "Direct follow-up error: %s", e, exc_info=True,
+            )
+            try:
+                await connection_config.send_status_update_async(
+                    {
+                        "content": f"Error during follow-up: {str(e)}",
+                        "status": "error",
+                        "timestamp": asyncio.get_event_loop().time(),
+                        "plan_id": plan_id,
+                        "run_id": run_id,
+                    },
+                    user_id,
+                    message_type=WebsocketMessageType.FINAL_RESULT_MESSAGE,
+                )
+            except Exception:
+                pass
+            try:
+                plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+                if plan:
+                    plan.overall_status = PlanStatus.failed
+                    plan.streaming_message = f"Error: {str(e)}"
+                    await memory_store.update_plan(plan)
+            except Exception:
+                pass
+            raise
+        finally:
+            await run_control_config.release_run(user_id=user_id, run_id=run_id)
+            self.logger.info(
+                "Released run lock (direct) user=%s run_id=%s", user_id, run_id,
+            )

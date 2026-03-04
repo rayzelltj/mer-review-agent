@@ -53,7 +53,10 @@ ORCHESTRATOR_AGENT_NAMES: frozenset[str] = frozenset(
         "standardmagenticmanager",
         "humanapprovalmagenticmanager",
         "groupchatmanager",
-        "proxyagent",         # ProxyAgent relays user-facing clarification requests
+        # ProxyAgent is NOT in this set.  Clarification requests are sent via
+        # USER_CLARIFICATION_REQUEST (proxy_agent.py), not AGENT_MESSAGE.
+        # Keeping ProxyAgent out of the gate prevents orchestration routing
+        # instructions ("Transferred to ProxyAgent...") from leaking to the UI.
     }
 )
 
@@ -130,10 +133,18 @@ _INTERNAL_NAME_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in _INTERNAL_NAME_MAP) + r")\b"
 )
 
-# Pattern to strip internal routing instructions like:
-# "Transferred to ProxyAgent, adopt the persona immediately."
-# "Transferred to AccountingAgent, adopt the persona immediately."
-_TRANSFER_RE = re.compile(
+# Pattern to detect messages that START with internal routing instructions.
+# When the orchestrator transfers to an agent, it emits text like:
+#   "Transferred to ProxyAgent, adopt the persona immediately. <instructions>"
+# The ENTIRE message is an internal routing instruction and must be suppressed.
+_TRANSFER_START_RE = re.compile(
+    r"^\s*Transferred\s+to\s+\w+(?:Agent|Manager)",
+    re.IGNORECASE,
+)
+
+# Pattern to strip inline transfer fragments that appear MID-message (rare but
+# possible when the orchestrator inserts a transfer note inside a longer reply).
+_TRANSFER_INLINE_RE = re.compile(
     r"Transferred\s+to\s+\w+(?:Agent|Manager)\s*[,.]?\s*(?:adopt\s+the\s+persona\s+immediately\s*[.]?\s*)?",
     re.IGNORECASE,
 )
@@ -148,8 +159,14 @@ def sanitize_for_display(text: str) -> str:
     """
     if not text:
         return text
-    # Strip internal routing/transfer messages first
-    text = _TRANSFER_RE.sub("", text)
+
+    # If the message STARTS with a transfer instruction, the entire message is
+    # an internal routing directive — suppress it completely.
+    if _TRANSFER_START_RE.match(text):
+        return ""
+
+    # Strip inline transfer fragments (mid-message occurrences)
+    text = _TRANSFER_INLINE_RE.sub("", text)
     # Replace internal agent names with user-friendly labels
     text = _INTERNAL_NAME_RE.sub(lambda m: _INTERNAL_NAME_MAP[m.group(0)], text)
     # Clean up any resulting double-spaces or leading/trailing whitespace
@@ -230,6 +247,11 @@ async def agent_response_callback(
         logger.debug("No user_id provided; skipping websocket send for final message.")
         return
 
+    # Skip entirely empty messages (e.g. transfer instructions that got suppressed)
+    if not text:
+        logger.debug("output_gate: empty text after sanitization for %s — suppressed", agent_name)
+        return
+
     # ----- Output gate -----
     is_orchestrator = _is_orchestrator_agent(agent_name)
     ws_type = (
@@ -290,6 +312,9 @@ async def streaming_agent_response_callback(
             chunk_text = "".join(collected) if collected else ""
 
         cleaned = sanitize_for_display(clean_citations(chunk_text or ""))
+
+        # If the entire chunk was a transfer instruction, it is now empty — skip text
+        # output but still process tool-call events below.
 
         # Tool-call messages: always forward (show activity indicator) for ALL agents
         contents = getattr(update, "contents", []) or []

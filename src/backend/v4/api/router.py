@@ -519,6 +519,150 @@ async def process_request(
         ) from e
 
 
+@app_v4.post("/direct")
+async def direct_follow_up(input_task: InputTask, request: Request):
+    """Fast-path endpoint for follow-up questions.
+
+    Bypasses Magentic orchestration (plan generation, routing, progress ledger)
+    and calls AccountingAgent's invoke() directly — a single LLM call instead
+    of 3-4.  Falls back to full orchestration if no cached agent exists.
+
+    Uses the same response schema as ``process_request`` so the frontend can
+    reuse its WebSocket flow.
+    """
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="no user found")
+
+    token_changed = orchestration_config.set_user_auth_token(
+        user_id,
+        _preferred_user_auth_token(authenticated_user),
+    )
+    if token_changed:
+        new_token = orchestration_config.get_user_auth_token(user_id)
+        for wrapper in orchestration_config.agent_wrappers.get(user_id, []):
+            if hasattr(wrapper, "user_auth_token"):
+                wrapper.user_auth_token = new_token
+
+    if not input_task.session_id:
+        input_task.session_id = str(uuid.uuid4())
+
+    plan_id = str(uuid.uuid4())
+    run_id = plan_id
+
+    acquired, active_state = await run_control_config.acquire_run(
+        user_id=user_id,
+        session_id=input_task.session_id,
+        run_id=run_id,
+        plan_id=plan_id,
+        process_id=plan_id,
+    )
+    if not acquired:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Workflow is already running for this user.",
+                "run_id": active_state.run_id,
+                "plan_id": active_state.plan_id,
+                "session_id": active_state.session_id,
+                "started_at": active_state.started_at,
+                "expires_at": active_state.expires_at,
+            },
+        )
+
+    try:
+        with tracer.start_as_current_span(
+            "orchestration.direct_follow_up",
+            attributes={
+                "user.id": user_id,
+                "plan.id": plan_id,
+                "run.id": run_id,
+                "session.id": input_task.session_id,
+            },
+        ):
+            memory_store = await DatabaseFactory.get_database(user_id=user_id)
+
+            # Look up team for audit trail —  don't fail if missing
+            current_team = await memory_store.get_current_team(user_id=user_id)
+            team_id = current_team.team_id if current_team else None
+
+            # Create a plan record for audit trail
+            plan = Plan(
+                id=plan_id,
+                plan_id=plan_id,
+                user_id=user_id,
+                session_id=input_task.session_id,
+                team_id=team_id,
+                initial_goal=input_task.description,
+                overall_status=PlanStatus.in_progress,
+            )
+            await memory_store.add_plan(plan)
+
+            track_event_if_configured(
+                "DirectFollowUp",
+                {
+                    "status": "started",
+                    "plan_id": plan_id,
+                    "session_id": input_task.session_id,
+                    "user_id": user_id,
+                    "run_id": run_id,
+                },
+            )
+
+            async def run_direct_task():
+                try:
+                    await OrchestrationManager().run_direct_followup(
+                        user_id=user_id,
+                        input_task=input_task,
+                        plan_id=plan_id,
+                        run_id=run_id,
+                    )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "Direct follow-up cancelled user=%s run_id=%s", user_id, run_id,
+                    )
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Direct follow-up failed user=%s run_id=%s", user_id, run_id,
+                    )
+
+            task = asyncio.create_task(
+                run_direct_task(),
+                name=f"direct:{run_id}",
+            )
+            await run_control_config.register_task(
+                user_id=user_id,
+                run_id=run_id,
+                task=task,
+            )
+
+            return {
+                "status": "Request started successfully",
+                "session_id": input_task.session_id,
+                "plan_id": plan_id,
+                "run_id": run_id,
+            }
+
+    except HTTPException:
+        await run_control_config.release_run(user_id=user_id, run_id=run_id)
+        raise
+    except Exception as e:
+        await run_control_config.release_run(user_id=user_id, run_id=run_id)
+        track_event_if_configured(
+            "DirectFollowUpFailed",
+            {
+                "session_id": input_task.session_id,
+                "error": str(e),
+                "run_id": run_id,
+            },
+        )
+        raise HTTPException(
+            status_code=400, detail=f"Error starting direct follow-up: {e}"
+        ) from e
+
+
 @app_v4.get("/run_status")
 async def get_run_status(request: Request):
     authenticated_user = get_authenticated_user_details(request_headers=request.headers)

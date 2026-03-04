@@ -212,16 +212,15 @@ class TestOutputGate:
             "StandardMagenticManager",
             "HumanApprovalMagenticManager",
             "GroupChatManager",
-            "ProxyAgent",
-            "PROXYAGENT",
         ]:
             assert _is_orchestrator_agent(name), f"{name} should pass gate"
 
     def test_sub_agent_names_fail_gate(self):
         """Balance-sheet sub-agent names do NOT pass the output gate.
-        AccountingAgent and ReviewAgent are intentionally excluded from the
-        orchestrator gate so their per-turn messages stay internal (only the
-        final compiled answer is shown to users).
+        AccountingAgent, ReviewAgent, and ProxyAgent are intentionally excluded
+        from the orchestrator gate so their per-turn messages stay internal
+        (only the final compiled answer is shown to users).  ProxyAgent sends
+        clarification requests via USER_CLARIFICATION_REQUEST, not AGENT_MESSAGE.
         """
         from v4.callbacks.response_handlers import _is_orchestrator_agent
         for name in [
@@ -229,6 +228,9 @@ class TestOutputGate:
             "accountingagent",
             "ReviewAgent",
             "reviewagent",
+            "ProxyAgent",
+            "proxyagent",
+            "PROXYAGENT",
             "ConnectorAgent",
             "NormalizationAgent",
             "RulesAgent",
@@ -362,23 +364,32 @@ class TestSanitizeForDisplay:
         monkeypatch.delitem(sys.modules, "v4.config.settings", raising=False)
         monkeypatch.setitem(sys.modules, "v4.config.settings", mock_settings)
 
-    def test_strips_transfer_messages(self):
-        """Internal transfer routing messages are stripped from output."""
+    def test_suppresses_transfer_messages_at_start(self):
+        """Messages that START with 'Transferred to X' are fully suppressed."""
         from v4.callbacks.response_handlers import sanitize_for_display
 
         text = "Transferred to ProxyAgent, adopt the persona immediately. Please confirm the data."
         result = sanitize_for_display(text)
-        assert "Transferred" not in result
-        assert "adopt the persona" not in result
-        assert "confirm the data" in result
+        assert result == ""
 
-    def test_strips_transfer_without_comma(self):
+    def test_suppresses_transfer_without_comma(self):
+        """Messages starting with 'Transferred to X.' are fully suppressed."""
         from v4.callbacks.response_handlers import sanitize_for_display
 
         text = "Transferred to AccountingAgent. Run the review now."
         result = sanitize_for_display(text)
+        assert result == ""
+
+    def test_strips_inline_transfer_fragment(self):
+        """Transfer text appearing MID-message is stripped but surrounding text kept."""
+        from v4.callbacks.response_handlers import sanitize_for_display
+
+        text = "Here is the data. Transferred to AccountingAgent, adopt the persona immediately. Now processing."
+        result = sanitize_for_display(text)
         assert "Transferred" not in result
-        assert "Run the review now" in result
+        assert "adopt the persona" not in result
+        assert "Here is the data" in result
+        assert "Now processing" in result
 
     def test_replaces_agent_names(self):
         from v4.callbacks.response_handlers import sanitize_for_display
